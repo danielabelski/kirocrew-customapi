@@ -15,6 +15,7 @@ import SegmentedControl from '../components/SegmentedControl'
 import { api } from '../api/client'
 import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input } from '../components/ui'
 import ErrorNotice from '../components/ErrorNotice'
+import Clickable from '../components/Clickable'
 import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
 import { publishNoticeKey } from '../components/PublishHub'
@@ -22,7 +23,7 @@ import { useIsMobile } from '../hooks/useIsMobile'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import ArtifactFolderDeleteDialog from '../components/ArtifactFolderDeleteDialog'
-import { DndDraggable, DndDroppable } from '../components/dnd'
+import { DndActiveProbe, DndDraggable, DndDroppable } from '../components/dnd'
 import { useArtifactFolders, useInvalidateArtifactFolders, useMoveArtifactToFolder, type MoveArtifactOptions } from '../hooks/useArtifactFolders'
 import useMoveUndo from '../hooks/useMoveUndo'
 import MoveUndoBar from '../components/MoveUndoBar'
@@ -31,10 +32,14 @@ import { useDndSensors } from '../hooks/useDndSensors'
 import { childFolders, isDescendantFolder, folderSubtreeStats, folderBreadcrumb } from '../utils/artifactFolderTree'
 import { compareText } from '../i18n/format'
 import { useCloudDeploymentEnabled } from '../hooks/useCloudDeploymentEnabled'
+import { usePreviewFlag } from '../hooks/usePreviewFlag'
+import { PREVIEW_ARTIFACT_DEPLOY } from '../utils/previewFlags'
 import { markJustCreatedBlank } from '../lib/blankHandoff'
 import { IMPORT_ACCEPT, IMPORTABLE_EXT_LIST, MAX_IMPORT_BYTES, planFileImport, wasContentRedacted, type ImportPlan, type ImportRejection } from '../lib/artifactImport'
+import { haptic } from '../lib/haptic'
 import type { Artifact, ArtifactFolder, PublishProviderDescriptor, RemoteArtifact, SessionDoc } from '../types'
 import { KIND_BADGE, isoToTs, docFileType, FolderColorSwatches, FolderGlyph, FolderNameInput, FolderMenu, SessionDocStar, LibraryTable, LibraryTree } from '../components/library/LibraryTable'
+import SessionDocPreview from '../components/library/SessionDocPreview'
 import type { SortKey, SortState, LibraryDrag, FolderActions } from '../components/library/LibraryTable'
 import { WidgetThumb, ContentThumb, ImageThumb, WebAppThumb } from '../components/library/ArtifactThumbs'
 import { useColumnCount } from '../hooks/useColumnCount'
@@ -177,15 +182,15 @@ function FolderMiniThumb({ a }: { a: Artifact }) {
   const content = full?.content || ''
   return (
     <div className="h-[84px] rounded-md border border-border overflow-hidden bg-bg-elevated pointer-events-none" title={a.name}>
-      {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} mini /> : a.kind === 'image' ? <ImageThumb a={a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} />}
+      {a.kind === 'webapp' ? <WebAppThumb art={full ?? a} mini /> : a.kind === 'image' ? <ImageThumb a={a} /> : hasPreview ? <WidgetThumb content={content} slug={a.slug} /> : <ContentThumb content={content} kind={a.kind} mini />}
     </div>
   )
 }
 
 /** Gallery folder card: click to enter, draggable (nest via drop on another
  * folder card / breadcrumb), droppable (receives artifacts and folders).
- * Carries the same mr-3/mb-3 gutters the masonry cards use so folder cards
- * line up column-for-column with the gallery below. */
+ * Carries the same mb-3 row gap the masonry cards use; the column gutter is
+ * the FolderCardGrid's `gap-x-3`, so the card must NOT add an `mr-3` of its own. */
 function FolderCard({ folder, folders, previewArtifacts, actions }: {
   folder: ArtifactFolder
   folders: ArtifactFolder[]
@@ -208,7 +213,7 @@ function FolderCard({ folder, folders, previewArtifacts, actions }: {
               tabIndex={0}
               onKeyDown={(e) => { if (!renaming && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); actions.onOpen(folder.id) } }}
               aria-label={i18nT('pages.artifactsPage.open_folder', { name: folder.name })}
-              className={`group mr-3 mb-3 rounded-lg border bg-card p-3 cursor-pointer transition-all hover:border-border-strong hover:shadow-md ${
+              className={`group mb-3 rounded-lg border bg-card p-3 cursor-pointer transition-all hover:border-border-strong hover:shadow-md ${
                 isOver ? 'border-accent ring-2 ring-accent/40 bg-accent/5' : 'border-border'
               }`}
               style={{
@@ -256,17 +261,25 @@ function FolderCard({ folder, folders, previewArtifacts, actions }: {
   )
 }
 
-/** Grid for folder cards using the same measurement + gutter scheme as
- * LibraryMasonry (-mr-3 container, cards carry mr-3/mb-3, identical 300px
- * min column width) so folder cards align column-for-column with the
- * masonry gallery below. */
+/** Width of one card gutter (`mr-3` on the masonry cards, `gap-x-3` here). */
+const CARD_GUTTER_PX = 12
+
+/** Grid for folder cards, sized to align column-for-column with the masonry
+ * gallery below (same 300px column pitch, same gutter).
+ *
+ * The gutter is a grid `gap`, NOT the masonry's `-mr-3` wrapper + per-card
+ * `mr-3` scheme. That scheme makes the wrapper one gutter WIDER than its
+ * parent, which is harmless in a padded page column but is 12px of scrollable
+ * overflow inside a scroll container — and once the gallery virtualizes this
+ * grid lives inside the capped, `overflow-y-auto` folder region (which makes
+ * its overflow-x `auto` too), so the wrapper painted a horizontal scrollbar
+ * under the folder cards. The gutter is passed to the column count so both
+ * grids still divide the same width and never disagree at a boundary. */
 function FolderCardGrid({ children }: { children: React.ReactNode }) {
-  const [ref, cols] = useColumnCount(300)
+  const [ref, cols] = useColumnCount(300, CARD_GUTTER_PX)
   return (
-    <div ref={ref} className="-mr-3">
-      <div className="grid" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
-        {children}
-      </div>
+    <div ref={ref} className="grid gap-x-3" style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}>
+      {children}
     </div>
   )
 }
@@ -611,6 +624,7 @@ function LibraryMasonry({
   cols,
   widthRef,
   scrollerRef,
+  fillPage,
   onOpen,
   onDelete,
   deletingSlug,
@@ -630,6 +644,8 @@ function LibraryMasonry({
    *  virtualizer takes `externalScrollerRef` and reads it when it needs it, so
    *  nothing has to re-render just because the element appeared. */
   scrollerRef: React.RefObject<HTMLDivElement | null>
+  /** Fill the remaining page height only when no remote sections need the page axis. */
+  fillPage: boolean
   onOpen: (slug: string) => void
   onDelete: (a: Artifact) => void
   deletingSlug: string | null
@@ -653,17 +669,16 @@ function LibraryMasonry({
   // and below the gallery reachable by scrolling, and it is free here because at
   // one column the two layouts render the same thing.
   const asList = virtualized && cols === 1
-  // The masonry owns the axis only when it is actually a masonry. This must stay
-  // in lockstep with the page's own `galleryOwnsScroll`.
+  // Multi-column masonry always needs its own viewport. It fills the page only
+  // when there are no remote sections; otherwise it is a bounded section inside
+  // the scrolling page. A one-column list uses the page's external scroller.
   const masonryOwnsScroll = virtualized && cols > 1
   return (
     // -mr-3 offsets each card's own mr-3 so the trailing column's gutter
     // doesn't add page width; cards carry mr-3 (gutter) + mb-3 (row gap).
-    //
-    // Only the masonry needs to fill the page's content column (`flex-1
-    // min-h-0`, which is what lets a flex child shrink to its parent instead of
-    // its content). A list scrolling inside the page column is content-sized.
-    <div ref={widthRef} className={masonryOwnsScroll ? '-mr-3 flex-1 min-h-0' : '-mr-3'}>
+    <div ref={widthRef} data-testid="artifacts-gallery" className={masonryOwnsScroll
+      ? (fillPage ? '-mr-3 flex-1 min-h-0' : '-mr-3 h-[60vh]')
+      : '-mr-3'}>
       {asList ? (
         <LibraryList entries={entries} context={context} scrollerRef={scrollerRef} />
       ) : masonryOwnsScroll ? (
@@ -673,10 +688,8 @@ function LibraryMasonry({
           data={entries}
           context={context}
           ItemContent={GridCard}
-          // 100% of the flex-sized parent, NOT a viewport fraction: a `72vh`
-          // box does not know how much room the toolbar and folder rows above
-          // it already took, so it overflowed the page column and forced a
-          // second scroller into existence.
+          // The parent supplies either the remaining page height or a bounded
+          // section height when remote lists need to scroll past the gallery.
           style={{ height: '100%' }}
         />
       ) : (
@@ -717,7 +730,7 @@ function MasonryGridItem({ data, context, index }: { data: GridEntry; context: L
 const SESSION_DOCS_COLLAPSED = 5
 const SESSION_DOCS_COLLAPSE_KEY = 'mc-artifacts-session-docs-collapsed'
 
-function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }: {
+function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath, onPreview }: {
   docs: SessionDoc[]
   /** True while the session-docs query is in flight — renders a fixed-height
    *  skeleton so the section does not pop in and shift the gallery under the
@@ -725,6 +738,8 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
   pending: boolean
   onMaterialize: (path: string, sessionKey?: string) => void
   materializingPath: string | null
+  /** Row click opens the read-only preview (the star stays the save gesture). */
+  onPreview: (d: SessionDoc) => void
 }) {
   const [expanded, setExpanded] = useState(false)
   // Persisted: a user who never intends to save these docs can put the section
@@ -764,7 +779,7 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
           type="button"
           onClick={toggleCollapsed}
           aria-expanded={!collapsed}
-          className="flex items-center gap-2 bg-transparent border-none p-0 cursor-pointer text-inherit font-inherit"
+          className="flex items-center gap-2 bg-transparent border-none p-0 cursor-pointer text-inherit"
         >
           {collapsed ? <ChevronRight size={14} className="shrink-0 text-muted" /> : <ChevronDown size={14} className="shrink-0 text-muted" />}
           {i18nT('pages.artifactsPage.from_your_chats')}
@@ -782,17 +797,24 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
       <div
         ref={listRef}
         tabIndex={-1}
-        className={`flex flex-col gap-0.5 outline-none ${expanded ? 'max-h-[40vh] overflow-y-auto' : ''}`}
+        className={`flex flex-col gap-0.5 outline-hidden ${expanded ? 'max-h-[40vh] overflow-y-auto' : ''}`}
       >
         {visible.map((d) => (
-          <div key={d.path} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg">
+          // Click opens a read-only preview — a READ, no registration, no side
+          // effects. Promotion into the library stays on the explicit star
+          // (which stops propagation so starring never also opens the preview).
+          <Clickable
+            key={d.path}
+            onClick={() => onPreview(d)}
+            className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-bg-hover transition-colors"
+          >
             <SessionDocStar d={d} busy={materializingPath === d.path} onMaterialize={handleMaterialize} />
             <FileText size={13} className="text-ok shrink-0" />
             <span className="text-sm text-text-strong font-medium truncate min-w-0 max-w-[280px]">{d.name}</span>
             <span className="text-[11px] text-muted truncate min-w-0 flex-1">{d.path}</span>
             <span className="text-[12px] text-muted truncate min-w-0 max-w-[180px]" title={d.session_title}>{d.session_title}</span>
             <span className="text-[12px] text-muted whitespace-nowrap shrink-0">{_timeAgo(isoToTs(d.updated_at))}</span>
-          </div>
+          </Clickable>
         ))}
       </div>
       {/* OUTSIDE the scrollable list on purpose: inside it, "Show less" sat
@@ -822,6 +844,10 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // deployment — otherwise the option is visible and only explains itself after
   // a click.
   const cloudDeployEnabled = useCloudDeploymentEnabled()
+  // Artifact Deploy is a Feature Preview: the route stays reachable, but the
+  // product does not offer it until the operator opts in, because every door
+  // leads to spending in a real AWS account and to content on the open internet.
+  const deployPreview = usePreviewFlag(PREVIEW_ARTIFACT_DEPLOY)
   const [filter, setFilter] = useState('')
   const isMobile = useIsMobile()
   const [tagFilter, setTagFilter] = useState('')
@@ -1150,7 +1176,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     }
   }, [deletingFolder, folders, scopeFolderId, openFolder, invalidateFolders])
 
-  const { data, isLoading, error } = useQuery<{ artifacts: Artifact[] }>({
+  const { data, isLoading, error, refetch } = useQuery<{ artifacts: Artifact[] }>({
     queryKey: ['artifacts', { tag: tagFilter, kind: kindFilter }],
     queryFn: () =>
       api.artifacts({
@@ -1253,13 +1279,20 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     const o = e.over?.data.current as { type?: string; folderId?: string } | undefined
     setOverFolderId(o?.type === 'folder-drop' ? (o.folderId ?? '') : null)
   }, [])
+  // The one place the drag mirror is torn down: end, cancel and the
+  // reconciler below all go through it so none can leave a piece behind.
+  const resetLibraryDrag = useCallback(() => {
+    setActiveDrag(null)
+    setOverFolderId(null)
+  }, [])
   const handleDragStart = useCallback((e: DragStartEvent) => {
+    // Past the sensor's hold/distance constraint: the card is really picked up.
+    haptic('medium')
     const d = e.active.data.current as LibraryDrag | undefined
     if (d?.type === 'artifact' || d?.type === 'folder') setActiveDrag(d)
   }, [])
   const handleDragEnd = useCallback((e: DragEndEvent) => {
-    setActiveDrag(null)
-    setOverFolderId(null)
+    resetLibraryDrag()
     const a = e.active.data.current as LibraryDrag | undefined
     const o = e.over?.data.current as { type?: string; folderId?: string } | undefined
     if (!a || o?.type !== 'folder-drop') return
@@ -1270,6 +1303,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       // folder the artifact already sits in arms (and moves, and dismisses)
       // nothing.
       if ((a.folderId || '') === target) return
+      // Past the guards: the move really arms, so the drop seats here and a
+      // same-folder release is felt as nothing, like a release over empty space.
+      haptic('light')
       dismissFolderMove()
       armArtifactMove({
         itemKey: a.slug,
@@ -1290,6 +1326,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     const dragged = folders.find(f => f.id === a.id)
     if (!dragged) return
     if ((dragged.parent_id || '') === target) return
+    haptic('light')
     dismissArtifactMove()
     armFolderMove({
       itemKey: a.id,
@@ -1299,8 +1336,24 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
       toFolderColor: dest?.color,
       itemTitle: dragged.name,
     })
-  }, [folders, armArtifactMove, armFolderMove, dismissArtifactMove, dismissFolderMove])
-  const handleDragCancel = useCallback(() => { setActiveDrag(null); setOverFolderId(null) }, [])
+  }, [folders, armArtifactMove, armFolderMove, dismissArtifactMove, dismissFolderMove, resetLibraryDrag])
+  const handleDragCancel = resetLibraryDrag
+  // Which DndContexts hold an active drag, as reported by DndActiveProbe. A
+  // ref, not state: the probe writes it from a layout effect and the
+  // reconciler reads it from a passive effect in the same commit.
+  const dndActiveContexts = useRef(new Set<string>())
+  const reportDndActive = useCallback((id: string, active: boolean) => {
+    if (active) dndActiveContexts.current.add(id)
+    else dndActiveContexts.current.delete(id)
+  }, [])
+  // Reconcile the mirror with dnd-kit's store after every commit: a live
+  // mirror with no context reporting a drag is a gesture whose end dnd-kit
+  // never delivered. Deliberately dependency-free, and two ref reads wide.
+  useEffect(() => {
+    if (activeDrag === null && overFolderId === null) return
+    if (dndActiveContexts.current.size > 0) return
+    resetLibraryDrag()
+  })
 
   const allTags = useMemo(() => {
     const s = new Set<string>()
@@ -1321,9 +1374,18 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     () =>
       (providersData?.providers || []).filter(
         (p) =>
-          p.discovery_model.list_mine ||
-          p.discovery_model.list_shared_with_me ||
-          p.discovery_model.list_public,
+          // `available: false` means the provider's tooling is not installed on
+          // this machine, so every browse request it could make fails. The
+          // publish picker still lists such a provider — publishing installs the
+          // tooling on first use, so hiding the destination there would make it
+          // undiscoverable — but browsing has no equivalent: there is nothing to
+          // list and no action in this section that would install anything, so
+          // its only possible rendering is an error card. Omitted by older
+          // gateways, hence the explicit `!== false` rather than a truthy test.
+          p.available !== false &&
+          (p.discovery_model.list_mine ||
+            p.discovery_model.list_shared_with_me ||
+            p.discovery_model.list_public),
       ),
     [providersData],
   )
@@ -1427,14 +1489,38 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
     collisionNoticeRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
     collisionNoticeRef.current?.focus?.()
   }, [collisionNotice])
+  // Read-only preview of an unsaved session doc (row click). Lives at the page
+  // so all three views (gallery / table / tree) share one modal instance.
+  const [previewDoc, setPreviewDoc] = useState<SessionDoc | null>(null)
+  const handlePreviewDoc = useCallback((d: SessionDoc) => setPreviewDoc(d), [])
+  // A successful save's ONLY other effects are removals — the row unmounts,
+  // the preview closes — so without this notice the save is indistinguishable
+  // from the document vanishing. Transient by design: it acknowledges, then
+  // gets out of the way (the new card in the library above is the durable
+  // evidence). role="status" on the render makes it a polite live region.
+  const [savedNotice, setSavedNotice] = useState<{ name: string } | null>(null)
+  useEffect(() => {
+    if (!savedNotice) return
+    const t = setTimeout(() => setSavedNotice(null), 6_000)
+    return () => clearTimeout(t)
+  }, [savedNotice])
   const materializeMut = useMutation({
     mutationFn: ({ path, sessionKey }: { path: string; sessionKey?: string }) => api.materializeArtifact(path, sessionKey),
-    onSuccess: (data) => {
+    onSuccess: (data, vars) => {
       // Only a colliding promote may replace the notice: clearing it here would
       // wipe an unread warning when the next document promotes cleanly.
       if (data?.slug_collided_with) {
         setCollisionNotice({ slug: data.slug, collidedWith: data.slug_collided_with })
+      } else {
+        // The collision banner already says "your document was saved as …",
+        // so the plain acknowledgment only renders for the clean case —
+        // both at once would announce the same save twice.
+        setSavedNotice({ name: vars.path.split(/[\\/]/).pop() || vars.path })
       }
+      // A materialize started from the preview modal finishes the modal's job:
+      // the document is now a real artifact (its row unmounts), so close the
+      // preview rather than leave it showing a doc that no longer exists.
+      setPreviewDoc((prev) => (prev && prev.path === vars.path ? null : prev))
       qc.invalidateQueries({ queryKey: ['artifacts'] })
       qc.invalidateQueries({ queryKey: ['artifact-session-docs'] })
     },
@@ -1504,35 +1590,18 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // Hooks must run before the `isLoading` early return below, so the scroll
   // wiring lives here rather than beside the JSX it feeds.
   //
-  // The virtualized gallery brings its OWN vertical scroller. Two same-axis
-  // scrollers on one page is a defect: whichever one the finger lands in decides
-  // whether anything moves, and the page-level one has only ~113px of travel
-  // once the gallery is on screen, so a swipe that lands there stops dead after
-  // a few pixels and reads as "this card does not scroll". Measured at 390px with
-  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
-  // 608px tall over 12485px. So exactly one element owns the axis; below the
-  // threshold the gallery is content-sized and the page column scrolls, as before.
-  // Measured here, not inside the gallery, because two independent measurements
-  // of the same width could disagree at a boundary and leave the page holding an
-  // axis the gallery also thinks it owns. `galleryWidthRef` is attached to the
-  // gallery's own column-defining wrapper so the number still describes the
-  // element that lays the columns out.
+  // Measure once so the gallery and page use the same column count. Small
+  // galleries are content-sized; one-column LibraryList uses the page scroller.
   const [galleryWidthRef, cols] = useColumnCount(300)
-  // Scroll ownership. A virtualized MASONRY can only own a scroller of its own,
-  // so the page column has to stop scrolling and hand the axis over — otherwise
-  // both scroll on the same axis and the page column has only ~113px of travel
-  // once the gallery is on screen, so a swipe that lands there stops dead after
-  // a few pixels and reads as "this card does not scroll". Measured at 390px with
-  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
-  // 608px tall over 12485px.
-  //
-  // At ONE column there is no masonry to preserve, so the gallery renders as a
-  // list windowed against this column (`LibraryList`) and the page column KEEPS
-  // the axis. That is the narrow case, and it is the one where handing the axis over
-  // hurt: it is what forced the pre-gallery region to be capped into a scroller
-  // of its own and the chrome to hide on scroll, and it is what left sections
-  // rendered after the gallery unreachable.
+  // Without remote sections, multi-column masonry fills the remaining page
+  // height and owns the axis. That mode must not add a nearly travel-free outer
+  // scroller where a swipe would stop after a few pixels.
+  // Remote lists are independent content below the saved gallery. Keep them
+  // in normal page flow rather than shrinking them into a height-locked column.
+  // Use provider capability, not asynchronously loaded rows, so pending, empty,
+  // filtered, and failed remote reads all keep the same scroll ownership.
   const galleryOwnsScroll = view === 'grid' && gridEntries.length >= VIRTUALIZE_AT && cols > 1
+    && discoveryProviders.length === 0
   // Hide-on-scroll for the page's own chrome. At 390x844 the title, subtitle,
   // heading row and filter rows pin 317px — 38% of the viewport — above a 527px
   // gallery. This is only reachable when the masonry owns the axis (so, several
@@ -1652,6 +1721,15 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           </div>
         ))}
 
+        {savedNotice && (
+          <div className="mb-4 bg-ok-subtle border border-ok/20 rounded-lg p-3 flex items-center gap-3 animate-rise" role="status">
+            <Star size={16} className="text-ok shrink-0" aria-hidden="true" />
+            <div className="flex-1 min-w-0 text-sm text-ok break-words">
+              {i18nT('pages.artifactsPage.saved_to_library_notice', { name: savedNotice.name })}
+            </div>
+            <Btn aria-label={i18nT('app.dismiss')} onClick={() => setSavedNotice(null)} className="text-ok/60 hover:text-ok shrink-0"><X className="lucide-inline" /></Btn>
+          </div>
+        )}
         {collisionNotice && (
           <div ref={collisionNoticeRef} tabIndex={-1} className="mb-4 bg-warn-subtle border border-warn/20 rounded-lg p-3 flex items-start gap-3 animate-rise" role="status">
             <span className="text-warn text-lg shrink-0"><AlertTriangle className="lucide-inline" aria-hidden="true" /></span>
@@ -1746,7 +1824,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                     * behind a tap without costing anything: keeping it visible
                     * is what forced the filter row to wrap and left a lone
                     * right-floated button on a line of its own. */}
-                  {isMobile && cloudDeployEnabled && (
+                  {isMobile && cloudDeployEnabled && deployPreview && (
                     <>
                       <DropdownMenuSeparator />
                       <DropdownMenuItem onSelect={() => navigate('/deploy')}>
@@ -1824,7 +1902,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 />
               </div>
             </div>
-            {cloudDeployEnabled && !isMobile && (
+            {cloudDeployEnabled && !isMobile && deployPreview && (
               <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
                 <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
               </Btn>
@@ -1851,6 +1929,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             onDragEnd={handleDragEnd}
             onDragCancel={handleDragCancel}
           >
+            <DndActiveProbe report={reportDndActive} />
             {/* Everything between the chrome and the gallery is capped and
               * scrolls itself once the gallery owns the page's scroll axis.
               *
@@ -1878,7 +1957,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             {view === 'grid' && (subfolders.length > 0 || (creatingFolder && !filtersActive)) && (
               <FolderCardGrid>
                 {creatingFolder && !filtersActive && (
-                  <div className="mr-3 mb-3 rounded-lg border border-accent bg-card p-3" style={newFolderColor ? { borderLeft: `3px solid ${newFolderColor}` } : undefined}>
+                  <div className="mb-3 rounded-lg border border-accent bg-card p-3" style={newFolderColor ? { borderLeft: `3px solid ${newFolderColor}` } : undefined}>
                     <div className="h-[84px] rounded-md border border-dashed border-border flex items-center justify-center text-muted mb-2.5">
                       <FolderPlus size={22} className="opacity-50" />
                     </div>
@@ -1939,12 +2018,31 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                   pending={sessionDocsQ.isPending}
                   onMaterialize={handleMaterialize}
                   materializingPath={materializingPath}
+                  onPreview={handlePreviewDoc}
                 />
               </CollapsibleChrome>
             )}
             </div>
 
-            {gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
+            {errMessage && artifacts.length === 0 ? (
+              /* The list query FAILED with nothing cached — the library's
+                 contents are unknown, not absent. Rendered in EVERY view mode
+                 (grid, table, filtered or not): the persisted-Table lane must
+                 not show an empty tree over intact artifacts, which is the
+                 exact misread #10867 describes. The error itself (message +
+                 agent hand-off) is already on screen in the page-level
+                 <ErrorNotice> banner above (errors-use-error-notice); this
+                 placeholder exists so the gallery does not claim "No
+                 artifacts yet" about a library it never read. Retry heals
+                 every read that fails under the same trigger: the list, the
+                 tag options, and the folder list. */
+              <EmptyState
+                testId="artifacts-error-state"
+                icon={<AlertTriangle className="lucide-inline" />}
+                title={i18nT('pages.artifactsPage.couldn_t_load_your_artifacts')}
+                action={<Btn onClick={() => { void refetch(); void allTagsQ.refetch(); void qc.invalidateQueries({ queryKey: ['artifact-folders'] }) }}>{i18nT('pages.artifactsPage.retry')}</Btn>}
+              />
+            ) : gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
               (artifacts.length === 0 && folders.length === 0) ? (
                 <EmptyState
                   icon={<Bookmark className="lucide-inline" />}
@@ -1968,6 +2066,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 cols={cols}
                 widthRef={galleryWidthRef}
                 scrollerRef={chromeHostRef}
+                fillPage={galleryOwnsScroll}
                 onOpen={handleOpen}
                 onDelete={handleDelete}
                 deletingSlug={deleteMut.isPending ? (deleteMut.variables as string) : null}
@@ -1986,6 +2085,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 pinningSlug={pinningSlug}
                 sessionDocs={pinnedOnly || tagFilter ? [] : sessionDocs}
                 onMaterialize={pinnedOnly ? undefined : handleMaterialize}
+                onPreviewDoc={handlePreviewDoc}
                 materializingPath={materializingPath}
               />
             ) : (
@@ -2006,6 +2106,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 dragActive={!!activeDrag}
                 sessionDocs={pinnedOnly || tagFilter ? [] : sessionDocs}
                 onMaterialize={pinnedOnly ? undefined : handleMaterialize}
+                onPreviewDoc={handlePreviewDoc}
                 materializingPath={materializingPath}
               />
             )}
@@ -2034,6 +2135,16 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             folders={folders}
             onConfirm={confirmDeleteFolder}
             onClose={() => setDeletingFolder(null)}
+          />
+
+          {/* Read-only preview of an unsaved session document (row click in any
+            * view). The header star materializes it; on success the modal
+            * closes via materializeMut.onSuccess. */}
+          <SessionDocPreview
+            doc={previewDoc}
+            onClose={() => setPreviewDoc(null)}
+            onMaterialize={handleMaterialize}
+            materializingPath={materializingPath}
           />
 
         {/* Remote browse — one section per discovery-capable registered
@@ -2083,8 +2194,8 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
 
 
 /** Browse one publish provider's remote artifacts (provider-routed; vendor
- * copy comes from the provider's own display_name). Renders nothing while
- * loading/failed so the library page never blocks on a remote. */
+ * copy comes from the provider's own display_name). Loading stays quiet so a
+ * remote cannot block the library; failures use a bounded inline notice. */
 function RemoteBrowseSection({ provider, onForked, onCloned }: {
   provider: PublishProviderDescriptor
   onForked: (slug: string) => void
@@ -2125,18 +2236,26 @@ function RemoteBrowseSection({ provider, onForked, onCloned }: {
   // Your Artifacts above, so listing them here too would be a duplicate.
   const notLocal = items.filter(a => !a.local_slug)
   if (isLoading && !notLocal.length) return null
-  // A failed provider browse must not make the whole section vanish — say so,
-  // and offer the retry. The filter box holds a query, not a draft, so the
-  // hand-off is safe.
+  // Remote discovery is optional to the local library, but its failure must
+  // remain actionable without recreating the full-width provider card.
   if (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
     return (
-      <Card className="mt-4">
-        <CardTitle>{i18nT('pages.artifactsPage.on')} {provider.display_name}</CardTitle>
-        <div className="flex items-start gap-2">
-          <ErrorNotice message={error instanceof Error ? error.message : String(error)} askAgent className="flex-1" />
-          <Btn onClick={() => refetch()} className="shrink-0">{i18nT('pages.artifactsPage.retry')}</Btn>
-        </div>
-      </Card>
+      <div className="mt-3 flex max-w-lg items-start gap-2">
+        <ErrorNotice
+          variant="inline"
+          title={provider.display_name}
+          message={errorMessage}
+          askAgent
+          className="min-w-0 flex-1"
+          messageClassName="line-clamp-2"
+          messageTooltip={errorMessage}
+          testId={`remote-browse-error-${provider.name}`}
+        />
+        <Btn onClick={() => refetch()} className="shrink-0">
+          {i18nT('pages.artifactsPage.retry')}
+        </Btn>
+      </div>
     )
   }
   if (!notLocal.length && !search) return null

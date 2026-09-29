@@ -49,7 +49,7 @@ _TTL_RE = re.compile(TTL_PATTERN)
 # (also matches https://.../?token=...&foo=bar).
 _TOKEN_RE = re.compile(r"[?&]token=([^\s&]+)")
 
-# Bare KiroCrew-token / JWT shape, used to scrub a token that reached stdout
+# Bare Kiro Crew token / JWT shape, for scrubbing a token that reached stdout
 # outside a URL before a stdout tail is put into an exception message.
 #
 # The segment count is `{1,4}` REPEATED, not a fixed `head.payload.sig` triple:
@@ -77,8 +77,8 @@ _OUTPUT_TAIL_CHARS = 300
 _OUTPUT_SCAN_CHARS = _OUTPUT_TAIL_CHARS * 8
 
 # Stand-in for the run touching the scan window's left edge: the slice may have
-# cut it out of the middle of a secret, leaving a suffix the token patterns can
-# no longer recognise.
+# cut it out of the middle of a secret, leaving a suffix the token patterns
+# cannot recognise.
 #
 # The floor is deliberately LOW rather than set to the window-minus-tail
 # "reachability" distance. A clipped fragment 2000+ chars from the end looks
@@ -102,6 +102,24 @@ class TokenMintError(Exception):
     """Raised when minting a remote token fails."""
 
 
+class HopRetiredError(TokenMintError):
+    """The crew holding our hop says that hop is not ours to ride.
+
+    Separate from every other mint failure because the two call for OPPOSITE
+    handling. A transport error -- a timeout, a refused connection, a malformed
+    reply -- means try again, and the refresh loop's deliberate non-terminal retry
+    exists for exactly that. This means the hop is gone: the parent still answers,
+    and what it answers is that the crew is not connected there, or not there at
+    all. Retrying cannot recover it, and the forward we still hold is pointed at a
+    port the parent is now free to give to a different crew, which is how one
+    crew's bearer token reaches another crew's gateway.
+
+    So this one is terminal for the forward, and a bare ``False`` could not say so:
+    the caller would have to infer "gone" from "failed" and would tear down a
+    working chain on a network blip.
+    """
+
+
 def _validate_ttl(ttl: str) -> str:
     """Return *ttl* if it matches the accepted ``<int>[hm]`` form, else raise."""
     if not _TTL_RE.match(ttl):
@@ -115,7 +133,7 @@ def _validate_ttl(ttl: str) -> str:
 def ttl_to_seconds(ttl: str) -> int:
     """Convert a validated ``<int>[hm]`` ttl string to seconds.
 
-    Used to schedule proactive token refresh before the cap. Raises
+    Schedules proactive token refresh before the cap. Raises
     :class:`TokenMintError` for a malformed ttl.
     """
     ttl = _validate_ttl(ttl)
@@ -203,6 +221,27 @@ def build_candidate_command(
             "  fi;",
             "done;",
             f'echo "kirocrew binary not found in any of: {", ".join(candidates)}" >&2;',
+            'echo "candidate diagnosis:" >&2;',
+            f"for b in {expanded}; do",
+            '  if [ -L "$b" ]; then',
+            '    __t=$(readlink -f "$b" 2>/dev/null);',
+            '    if [ -z "$__t" ] || [ ! -e "$__t" ]; then',
+            '      echo "  $b: DANGLING symlink -> $(readlink "$b" 2>/dev/null) (target missing)" >&2;',
+            "    else",
+            '      echo "  $b: symlink -> $__t (not executable)" >&2;',
+            "    fi;",
+            '  elif [ ! -e "$b" ]; then',
+            '    echo "  $b: absent" >&2;',
+            "  else",
+            '    echo "  $b: present, NOT executable" >&2;',
+            "  fi;",
+            '  case "$b" in',
+            "    */.venv/bin/*)",
+            '      __v="${b%/bin/*}";',
+            '      if [ -x "$__v/bin/python" ]; then echo "    $__v/bin/python present" >&2; else echo "    $__v/bin/python MISSING" >&2; fi;',
+            "      ;;",
+            "  esac;",
+            "done;",
             "exit 127",
         ]
     )
@@ -333,11 +372,16 @@ def _build_ssh_argv(
     prompt; ``ConnectTimeout`` bounds the TCP connect (and, on OpenSSH >= 8.6,
     the banner/KEX exchange — which is where a slow ProxyCommand spends its
     time, so the mint passes its own configurable budget here instead of the
-    10s fail-fast default). ``ssh_host`` is validated by the caller
+    10s fail-fast default). ``-n`` redirects ssh's own stdin from the null
+    device: every caller here runs a remote command and none of them writes the
+    child's stdin, and an inherited console-less stdin keeps the channel open
+    after the remote command exits (notably through a ``ProxyCommand``), so ssh
+    waits for an EOF that never arrives. ``ssh_host`` is validated by the caller
     (registry / tunnel manager) before reaching here.
     """
     return [
         "ssh",
+        "-n",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -364,7 +408,7 @@ def _redacted_output_tail(stdout: str, limit: int = _OUTPUT_TAIL_CHARS) -> str:
     non-zero exit) could still put a live credential in it. The generic
     credential/exfil redactors run FIRST: the exfiltration-URL pass keys on the
     token-bearing URL shape, so scrubbing the token value first would disarm it
-    and let a suspicious destination survive (#9014). The token-specific
+    and let a suspicious destination survive. The token-specific
     ``_TOKEN_RE`` / ``_JWT_RE`` substitutions run AFTER as belt-and-suspenders
     for token shapes the generic passes miss. The result is truncated to the
     last *limit* chars (the tail, because the reason is the last thing printed).

@@ -43,6 +43,13 @@ API. ``src/kiro_crew/docs/*.md`` is packaged and read at runtime, and specific
 filenames are hardcoded in Python and TypeScript. Renaming one of those without
 updating its consumers breaks a shipped feature rather than a link.
 
+The seventh keeps bare invariant IDs honest. An Autopilot source comment such as
+``# S4:`` or ``(S2)`` must name a row in
+``docs/system-specs/modules/autopilot.md``; a harness comment such as ``# H6:``
+or ``(H13)`` must name a row in ``docs/system-specs/modules/harness-parity.md``.
+Otherwise a comment can claim an enforcement contract its owning spec never
+defines.
+
 The fact checks, and why they need a baseline
 --------------------------------------------
 The checks above hold at zero, so they fail outright. A second family asks a
@@ -103,10 +110,19 @@ from pathlib import Path
 # Documentation roots, each with the index file that must reach every doc in it.
 # ``docs/`` is repo-only contributor/architecture material; ``src/kiro_crew/docs/``
 # is PACKAGED end-user material (see MANIFEST.in) and is read at runtime.
+#
+# ``src/kiro_crew/apps/builtins/`` is the third kind: thousands of lines of
+# spec-grade markdown that ship INSIDE a builtin app -- its README, its agent
+# briefs and prompts, and its SKILL.md files, which an agent loads verbatim at
+# runtime. A stale path or a dead link there misroutes the agent rather than a
+# human reader, so it is link- and fact-checked, and it is listed in
+# :data:`UNCURATED_PREFIXES` because an app's markdown is curated by its own
+# manifest rather than by a documentation index.
 DOC_ROOTS: tuple[str, ...] = (
     "docs",
     "src/kiro_crew/docs",
     "website/docs",
+    "src/kiro_crew/apps/builtins",
 )
 
 # Per-directory index filenames, in priority order. A directory is "indexed" by
@@ -144,6 +160,12 @@ UNCURATED_PREFIXES: tuple[str, ...] = (
     # skill definition rather than documentation, so a leaf skill directory gets no
     # index of its own.
     "docs/app-kit/examples/",
+    # A builtin app's markdown is app PAYLOAD: `app.json` names the skills and
+    # agent prompts it ships, and the app's own README is the entry a reader
+    # opens. Requiring an index in `skills/<name>/` or `agents/context/` would
+    # add a file the app never loads, so reachability and the index requirement
+    # are off here while every link and every cited path is still checked.
+    "src/kiro_crew/apps/builtins/",
 )
 
 # Directories that legitimately hold docs without their own index: a vendored
@@ -345,7 +367,7 @@ _UNRESOLVABLE_REF_OK: frozenset[str] = frozenset(
         # `config/defaults.json`, which resolves.
         "agents/defaults.json",
         #
-        # -- FOREIGN homes. `onboarding_import.py` reads other tools' config dirs
+        # -- FOREIGN homes. The `onboarding_sources/` adapters read other tools' config dirs
         #    to offer an import, so naming their layout is the point.
         #
         # Antigravity / Gemini (`~/.gemini`, `_GEMINI_CONFIG_RELATIVE_PATHS`).
@@ -416,6 +438,18 @@ _CODE_REF_IGNORE_PATH_PARTS: tuple[str, ...] = (
 _CITATION_MARKER_RE = re.compile(
     r"(?:^\s*[#*]|//|/\*|\"\"\"|'''|`|\bSee\b|\bSpec\b|\bDesign\b|\bdocs?:)",
 )
+
+_AUTOPILOT_INVARIANT_DOC = "docs/system-specs/modules/autopilot.md"
+_AUTOPILOT_INVARIANT_ROW_RE = re.compile(r"^\s*\|\s*(S[1-9][0-9]*)\s*\|", re.MULTILINE)
+_AUTOPILOT_INVARIANT_CITE_RE = re.compile(
+    r"(?:^\s*(?:#|//|/\*)\s*(S[1-9][0-9]*)\s*:" r"|(?:#|//|/\*|\"\"\"|''').*?\((S[1-9][0-9]*)\))"
+)
+_HARNESS_INVARIANT_DOC = "docs/system-specs/modules/harness-parity.md"
+_HARNESS_INVARIANT_ROW_RE = re.compile(r"^\s*\|\s*(H[1-9][0-9]*)\s*\|", re.MULTILINE)
+_HARNESS_INVARIANT_CITE_RE = re.compile(
+    r"(?:^\s*(?:#|//|/\*)\s*(H[1-9][0-9]*)\s*:" r"|(?:#|//|/\*|\"\"\"|''').*?\((H[1-9][0-9]*)\))"
+)
+_INVARIANT_SOURCE_SUFFIXES = frozenset({".py", ".ts", ".tsx", ".js", ".mjs", ".sh"})
 
 
 # Hand-maintained "when did this change" preambles in a doc's PROSE. Git already
@@ -522,7 +556,11 @@ _COUPLING_SCAN_ROOT = "website/src"
 _COUPLING_SUFFIXES: frozenset[str] = frozenset({".ts", ".tsx"})
 _STRING_LITERAL_RE = re.compile(r"""(['"`])((?:(?!\1).)*)\1""")
 _TS_COMMENT_LINE_RE = re.compile(r"^\s*(?://|/\*|\*)")
-_MD_NAME_RE = re.compile(r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.md)")
+# The trailing guard is load-bearing: without it the pattern matches `apps.md`
+# inside an i18n key such as `apps.mdNotebook.sort.nameAZ`, which named every
+# md-notebook module as a consumer of the packaged `apps.md`. A real filename is
+# never followed by another identifier character.
+_MD_NAME_RE = re.compile(r"(?<![A-Za-z0-9._-])([A-Za-z0-9][A-Za-z0-9._-]*\.md)(?![A-Za-z0-9])")
 # A filename every directory has, so a match cannot be attributed to the packaged
 # copy: the hits are a user's project README in the file explorer, not this doc.
 _COUPLING_AMBIGUOUS_NAMES: frozenset[str] = frozenset({"README.md"})
@@ -666,6 +704,8 @@ class Findings:
     missing_index: list[str] = field(default_factory=list)
     changelog_preamble: list[str] = field(default_factory=list)
     conflict_markers: list[str] = field(default_factory=list)
+    unknown_autopilot_invariants: list[str] = field(default_factory=list)
+    unknown_harness_invariants: list[str] = field(default_factory=list)
     # Fact checks, behind the baseline. ``facts`` fails the run; ``advisories``
     # is the report-only half (dead identifiers, unless --strict-identifiers).
     facts: list[FactFinding] = field(default_factory=list)
@@ -682,6 +722,8 @@ class Findings:
             + len(self.missing_index)
             + len(self.changelog_preamble)
             + len(self.conflict_markers)
+            + len(self.unknown_autopilot_invariants)
+            + len(self.unknown_harness_invariants)
             + len(self.facts)
         )
 
@@ -1130,6 +1172,61 @@ def check_code_citations(root: Path, findings: Findings) -> None:
                         ):
                             continue
                         findings.phantom_refs.append(f"{rel_path}:{lineno} -> {ref}")
+
+
+def _check_invariant_citations(
+    root: Path,
+    *,
+    invariant_doc_path: str,
+    row_pattern: re.Pattern[str],
+    cite_pattern: re.Pattern[str],
+    target: list[str],
+) -> None:
+    """Append source-comment IDs absent from one owning invariant table."""
+    invariant_doc = root / invariant_doc_path
+    if not _is_regular_file(invariant_doc):
+        return
+    try:
+        declared = set(row_pattern.findall(_read(invariant_doc)))
+    except OSError:
+        return
+    source_root = root / "src"
+    if not source_root.is_dir():
+        return
+    for dirpath, dirnames, filenames in os.walk(source_root):
+        _prune(root, dirpath, dirnames)
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            if path.suffix not in _INVARIANT_SOURCE_SUFFIXES:
+                continue
+            try:
+                lines = _read(path).splitlines()
+            except OSError:
+                continue
+            rel_path = _rel(path, root)
+            for lineno, line in enumerate(lines, start=1):
+                for match in cite_pattern.finditer(line):
+                    invariant_id = match.group(1) or match.group(2)
+                    if invariant_id not in declared:
+                        target.append(f"{rel_path}:{lineno} -> {invariant_id}")
+
+
+def check_invariant_citations(root: Path, findings: Findings) -> None:
+    """Every bare S/H source-comment ID must exist in its owning table."""
+    _check_invariant_citations(
+        root,
+        invariant_doc_path=_AUTOPILOT_INVARIANT_DOC,
+        row_pattern=_AUTOPILOT_INVARIANT_ROW_RE,
+        cite_pattern=_AUTOPILOT_INVARIANT_CITE_RE,
+        target=findings.unknown_autopilot_invariants,
+    )
+    _check_invariant_citations(
+        root,
+        invariant_doc_path=_HARNESS_INVARIANT_DOC,
+        row_pattern=_HARNESS_INVARIANT_ROW_RE,
+        cite_pattern=_HARNESS_INVARIANT_CITE_RE,
+        target=findings.unknown_harness_invariants,
+    )
 
 
 def check_source_citations(root: Path, docs: list[Path], findings: Findings) -> None:
@@ -1690,6 +1787,7 @@ def run(root: Path, *, strict_identifiers: bool = False) -> Findings:
     check_changelog_preambles(root, docs, findings)
     check_conflict_markers(root, docs + entry_points, findings)
     check_code_citations(root, findings)
+    check_invariant_citations(root, findings)
     check_source_citations(root, docs, findings)
     check_code_coupled_docs(root, findings)
     # The fact checks cover the entry points as well: README.md and AGENTS.md cite
@@ -1742,6 +1840,16 @@ def _report(findings: Findings, doc_count: int, stale_baseline: list[tuple[str, 
         "documentation paths cited from code that do not exist",
         findings.phantom_refs,
         "write the missing doc, or correct the citation",
+    )
+    _emit(
+        "Autopilot invariant IDs cited from source but absent from its table",
+        findings.unknown_autopilot_invariants,
+        f"add the invariant to {_AUTOPILOT_INVARIANT_DOC}, or correct the bare S-id",
+    )
+    _emit(
+        "Harness invariant IDs cited from source but absent from its table",
+        findings.unknown_harness_invariants,
+        f"add the invariant to {_HARNESS_INVARIANT_DOC}, or correct the bare H-id",
     )
     _emit(
         "source paths cited from a module spec that do not exist",
@@ -1834,6 +1942,13 @@ def _self_test() -> int:
             (root / "docs" / "README.md").write_text("# Docs\n\n- [Ok](ok.md)\n", encoding="utf-8")
             (root / "docs" / "ok.md").write_text("# Ok\n\nBody.\n", encoding="utf-8")
             expected = build(root)
+            if expected is None:
+                # The planter could not create its defect on this host (an
+                # unprivileged Windows shell cannot make a symlink). That is a
+                # gap in what THIS run proved, said out loud -- not a check
+                # that failed to fire, which is what a FAIL here would claim.
+                print(f"  skip {label}: host cannot plant this defect")
+                return
             findings = run(root)
             got = getattr(findings, expected)
             if got:
@@ -1917,6 +2032,24 @@ def _self_test() -> int:
         )
         return "phantom_refs"
 
+    def plant_unknown_autopilot_invariant(root: Path) -> str:
+        spec = root / _AUTOPILOT_INVARIANT_DOC
+        spec.parent.mkdir(parents=True)
+        spec.write_text("| ID | Rule |\n|---|---|\n| S1 | One |\n", encoding="utf-8")
+        source = root / "src" / "kiro_crew"
+        source.mkdir(parents=True)
+        (source / "worker.py").write_text("# S9: missing invariant\n", encoding="utf-8")
+        return "unknown_autopilot_invariants"
+
+    def plant_unknown_harness_invariant(root: Path) -> str:
+        spec = root / _HARNESS_INVARIANT_DOC
+        spec.parent.mkdir(parents=True)
+        spec.write_text("| Id | Rule |\n|---|---|\n| H1 | One |\n", encoding="utf-8")
+        source = root / "src" / "kiro_crew"
+        source.mkdir(parents=True)
+        (source / "harness.py").write_text("# H99: missing invariant\n", encoding="utf-8")
+        return "unknown_harness_invariants"
+
     def plant_phantom_source_path(root: Path) -> str:
         # A module spec naming a file that exists nowhere -- the case the class
         # reports. The doc has to sit in the scoped tree to be checked at all.
@@ -1934,7 +2067,7 @@ def _self_test() -> int:
         )
         return "phantom_source_paths"
 
-    def plant_citation_of_a_symlinked_file(root: Path) -> str:
+    def plant_citation_of_a_symlinked_file(root: Path) -> str | None:
         # A symlink is an arbitrary read primitive in a tree a fork PR controls, so
         # it is never indexed -- which makes a citation naming it UNRESOLVABLE, and
         # in a module spec that is a finding. Pointed at a real file in-tree, so
@@ -1945,7 +2078,10 @@ def _self_test() -> int:
         try:
             (pkg / "linked.py").symlink_to(pkg / "real.py")
         except (OSError, NotImplementedError):  # pragma: no cover - Windows
-            return "phantom_source_paths"
+            # No link, no defect: returning the check name here would make
+            # the probe report a check that "did not fire" on a tree that
+            # never contained what it looks for.
+            return None
         spec_dir = root / "docs" / "system-specs" / "modules"
         spec_dir.mkdir(parents=True)
         (root / "docs" / "README.md").write_text(
@@ -2279,6 +2415,19 @@ def _self_test() -> int:
             encoding="utf-8",
         )
 
+    def allow_coupling_named_only_inside_a_longer_token(root: Path) -> None:
+        # ``apps.mdNotebook.sort.nameAZ`` is an i18n key, not a reference to the
+        # packaged ``apps.md``. Without the regex's trailing guard every module
+        # using that key namespace read as a consumer of the doc.
+        packaged = root / "src" / "kiro_crew" / "docs"
+        packaged.mkdir(parents=True)
+        (packaged / "apps.md").write_text("# Apps\n", encoding="utf-8")
+        page = root / "website" / "src" / "apps"
+        page.mkdir(parents=True)
+        (page / "labels.ts").write_text(
+            "export const s = i18nT('apps.mdNotebook.sort.nameAZ')\n", encoding="utf-8"
+        )
+
     def allow_coupling_named_only_in_a_test(root: Path) -> None:
         packaged = root / "src" / "kiro_crew" / "docs"
         packaged.mkdir(parents=True)
@@ -2360,6 +2509,8 @@ def _self_test() -> int:
     probe("line zero", plant_line_zero)
     probe("line RANGE ending past EOF", plant_stale_line_range)
     probe("phantom spec citation", plant_phantom_ref)
+    probe("unknown Autopilot invariant citation", plant_unknown_autopilot_invariant)
+    probe("unknown harness invariant citation", plant_unknown_harness_invariant)
     probe("code-coupled doc missing", plant_coupling)
 
     # Code-markup immunity is an inverse assertion (nothing should fire).
@@ -2424,6 +2575,11 @@ def _self_test() -> int:
         "packaged doc named only in a test",
         CHECK_COUPLING_COMPLETENESS,
         allow_coupling_named_only_in_a_test,
+    )
+    fact_immunity_probe(
+        "packaged doc name inside a longer token",
+        CHECK_COUPLING_COMPLETENESS,
+        allow_coupling_named_only_inside_a_longer_token,
     )
     fact_probe("dead identifier", CHECK_DEAD_IDENTIFIER, plant_dead_identifier)
     fact_immunity_probe("live identifier", CHECK_DEAD_IDENTIFIER, allow_live_identifier)

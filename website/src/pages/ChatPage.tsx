@@ -1,74 +1,89 @@
-import { Fragment, useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
+import { Fragment, Suspense, lazy, useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import { useLocation, useNavigate, useNavigationType, useSearchParams } from 'react-router-dom'
 import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useModelsDegraded } from '../providers/modelListHealth'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useShellSlot } from '../hooks/useShellSlot'
+import { useMobileNavRail } from '../components/MobileNavRailContext'
 import { useVisualViewport } from '../hooks/useVisualViewport'
-import { useImeGuard } from '../hooks/useImeGuard'
+import { useAnchoredTriggerRect } from '../hooks/useAnchoredTriggerRect'
+import { useFolderSortMode } from '../hooks/useFolderSortMode'
 import { useRailWidth } from '../hooks/useRailWidth'
 import { SETTINGS_DEFAULT_MODEL_ID } from '../hooks/useSettingHighlight'
 import { settingsPath } from '../components/settingsPath'
+import { KIRO_SIGN_IN_PATH } from './developer/kiroSignInLink'
 import { isTouchDevice } from '../utils/isTouchDevice'
+import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { toApiDecision } from '../utils/approvalDecision'
-import { isBrowseCommand } from '../utils/browseCommand'
 import { isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 import { mergeRenderers, resolveRenderer, type MessageRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
 import { createTranscriptRenderers } from './chat/transcriptRenderers'
-// Re-exported so the symbol `ChatPage` exported before this extraction stays
-// importable from here; the implementation lives in `utils/browseCommand` so a
-// pure test need not pull ChatPage's module graph.
-export { isBrowseCommand }
+import { featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from './chat/transcriptRenderers'
 import { useDrawerSwipe, animateDrawer, registerDrawerTargets, takeOverDrawer, safeAreaLeft } from '../hooks/useDrawerSwipe'
-import { shouldReplaceSessionUrl, popMaySwitchSession } from '../utils/sessionUrlHistory'
 import type { ResizeInfo } from '../utils/resizeImage'
-import { useAppSelector, useAppDispatch, store } from '../store'
+import { useAppSelector, useAppDispatch, useAppStore, store } from '../store'
 import { useConnected } from '../hooks/useConnected'
 import { usePlanActionMutation, isPlanAction } from '../hooks/usePlanActionMutation'
 import { useQueuedMessageActions, queuedSendStash } from '../hooks/useQueuedMessageActions'
 import { useChatPopouts } from '../hooks/useChatPopouts'
 import {
-  switchSlot, createSlot, deleteSlot, fetchHistory, loadOlderMessages, abortActiveOlderFetch, isSupersededPagingRejection,
-  appendMessage, appendSlotMessage, endLocalTurn, resumeFromHistory, clearUnresumableResume, forkSlot,
+  switchSlot, createSlot, deleteSlot, loadOlderMessages, abortActiveOlderFetch, isSupersededPagingRejection, clearSwitchSlotGone, switchSlotNoticeCopy,
+  appendMessage, appendSlotMessage, endLocalTurn, clearUnresumableResume, clearUndeletableHistory, forkSlot,
   setSlotRunning, startLocalTurn, syncSlotRunningFromServer, setPendingInput, setAgentSwitchNotice, resolveByApprovalId, clearPendingPermissions,
-  selectComposerBusy,
+  selectComposerBusy, selectSendConfirmed,
   selectContinuable,
   selectTurnInterrupted,
+  selectTrailingSendUnconfirmed,
   setVoiceAudio,
   toggleActivity, openActivityPanel, openActivityToTab,
   selectSubagent,
-  setActiveSlot, truncateAfterIndex, replaceMessages,
-  requestStop, pendingQuestionFor, captureStatelessCard, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion, ageFolderSuggestion,
-  retireStatelessQuestion, capturePendingAskId, confirmOptimisticSend, resolveOptimisticSteer,
+  truncateAfterIndex, replaceMessages,
+  requestStop, pendingQuestionFor, clearFollowupCard, dismissFollowupItem, clearFolderSuggestion, ageFolderSuggestion,
+  capturePendingAskId, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer,
   requestSlotReveal,
+  refreshSlot,
   mcpAppKey,
+  selectAutomationForSlot,
+  sseAutomation,
 } from '../store/chatSlice'
 import { confirmedDelivered } from '../utils/sendDelivery'
 import { sendTurn } from '../chat-core/transport/sendTurn'
+import { applySteerReceipt } from '../chat-core/transport/steerReceipt'
+import { useSelectionQuoteAsk } from '../chat-core/composer/selectionActions'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
-import { onTerminalReady, sendToTerminalSession, getTerminalShell, getTerminalFenceShells } from '../utils/terminalRegistry'
-import { runInTerminalText } from '../utils/fenceShell'
-import { addTab as addDockTerminal } from '../hooks/useBottomTerminal'
+import { onTerminalReady, sendToTerminalSession, sendRawToTerminalSession, getTerminalShell, getTerminalFenceShells } from '../utils/terminalRegistry'
+import { runInTerminalText, RUN_IN_TERMINAL_READY_DEADLINE_MS, RUN_IN_TERMINAL_OPENING_GRACE_MS } from '../utils/fenceShell'
+import { addTab as addDockTerminal, removeTab as removeDockTerminal, hasTab as hasDockTerminal } from '../hooks/useBottomTerminal'
+import { isPopoutOpen as isTerminalPopoutOpen } from '../utils/terminalPopout'
+import { disposeTerminalSession, useDeleteTerminalSession } from '../components/CliPanel'
 import { interceptSlashCommand, isInterceptedSlashCommand } from './chat/ChatInput'
-import { sseSlotTitle, triggerRefresh, updateSlot } from '../store/dashboardSlice'
-import { performSlotSwitch } from '../lib/slotSwitch'
+import { triggerRefresh, updateSlot, slotIsRemoteBound, sseSlotTitle } from '../store/dashboardSlice'
+import { inFlightSlotSwitchOutcome, performSlotSwitch, stagedSlotSwitchTarget } from '../lib/slotSwitch'
+import { appendFollowUpOption, removeFollowUpOption, type OwnedSuffix } from '../lib/followUpToggle'
+import { drainPendingChunks } from '../lib/pendingChunkDrain'
 import { performAgentSlotSwitch } from '../lib/agentSwitch'
 import { api } from '../api/client'
 import { resolveAskAfterSend } from '../lib/resolveAskAfterSend'
 import type { PlanStepInput } from '../api/client'
 import { useProvider } from '../providers'
-import { type AutoNudgeLoop } from '../components/AutoNudgePopover'
-import { fileReadUrl } from '../utils/fileReadUrl'
+import {
+  isFullLegacyAutomationRecord,
+  normalizeAutomationRecord,
+  type AutomationRecord,
+} from '../monitoring/automation'
+import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../utils/fileReadQuery'
 import { safeSetItem, safeSetSessionItem } from '../utils/safeStorage'
 import { handleStopPress, isEscalationState } from '../utils/stopDebounce'
 import { EmptyState, Btn, Input } from '../components/ui'
 import { type FileChangeEntry } from '../components/FileChangeChips'
 import { ChatTranscriptSkeleton } from '../components/ChatTranscriptSkeleton'
 import SnipOverlay from '../components/SnipOverlay'
-import { captureScreen, screenSnipSupported, currentTabCaptureDeps } from '../hooks/useScreenSnip'
-import { useTheme } from '../hooks/useTheme'
 import CollapsibleToolGroup from './chat/CollapsibleToolGroup'
+import { isSystemNoticeRow } from './chat/CompactionCard'
+import { decisionStripFieldOf } from './chat/decisionRecord'
 import { RowDisclosureProvider } from './chat/rowDisclosure'
+import { useJevAutoSend } from './chat/useJevAutoSend'
 import type { DisplayItem, TurnItem } from './chat/types'
 import { MeasureFarm } from '../hooks/virtualizer/MeasureFarm'
 import { useScrollManager } from './chat/useScrollManager'
@@ -88,15 +103,31 @@ import {
   virtualKeyFor,
 } from './chat/ChatPageMessageContent'
 import { useChatPageTranscriptEarlyController } from './chat/useChatPageTranscriptController'
+import { useChatPageSessionController } from './chat/useChatPageSessionController'
+import { useChatPageResourcesController } from './chat/useChatPageResourcesController'
 import EarlierMessagesBar from './chat/EarlierMessagesBar'
 import TranscriptScrollShell from './chat/TranscriptScrollShell'
 import { devLog, devWatchMessages, inspectorOn } from '../dev/scrollInspector'
+import TurnNavigationMinimap from './chat/TurnNavigationMinimap'
 import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
-import { addPendingFile, prepareSendPayload, buildRelMap, hasExactRelMention, normalizeWindowsPath, parseDirTokens, serializeDirTokens, spliceDirTokens, VIDEO_EXT } from '../utils/fileTokens'
-import { classifyDrop } from '../utils/dropClassify'
+import { MENTION_LINE_SUFFIX, WRAPPER_CLOSER, addPendingFile, extendsConsumably, foldWinSep, isWindowsShapedPath, leadingMentionBoundary, mentionBoundary, mentionBoundaryFor, mentionTokenRegex, normalizeWindowsPath, parseDirTokens, prepareSendPayload, serializeDirTokens, spliceDirTokens } from '../utils/fileTokens'
 import { makeRelative } from '../components/FilePickerMenu'
-import { type PasteBlock, expandAll as expandPasteTokens, pruneBlocks as pruneBlocksUtil, remapCarriedBlocks, saveStoredPaste } from '../utils/pasteTokens'
+import { type PasteBlock, carryPastes, expandAll as expandPasteTokens, findTokenRanges, mergeCarriedDraft, pruneBlocks as pruneBlocksUtil, saveStoredPaste } from '../utils/pasteTokens'
 import { extractPromptFromToken, extractSlackContextFromToken } from '../utils/tokenPrompt'
+/** Map message index → displayItems index, for scroll-to-match and the turn minimap. */
+function buildMessageToDisplayIdx(items: DisplayItem[]): Map<number, number> {
+  const map = new Map<number, number>()
+  items.forEach((item, di) => {
+    if (item.kind === 'turn') {
+      for (const ti of item.items) {
+        if (ti.kind === 'single') map.set(ti.idx, di)
+        else if (ti.kind === 'group') ti.msgs.forEach((_, mi) => map.set(ti.startIdx + mi, di))
+      }
+    } else if (item.kind === 'single') map.set(item.idx, di)
+    else if (item.kind === 'group') item.msgs.forEach((_, mi) => map.set(item.startIdx + mi, di))
+  })
+  return map
+}
 /** Delay (ms) before scrolling to bottom after a state update, giving React time to commit. */
 const SCROLL_AFTER_RENDER_MS = 100
 /** Min gap between scroll-gesture-driven retries of a failed older-history
@@ -155,47 +186,27 @@ const REAL_GESTURE_AUTH_MS = 20000
 /**
  * Height of the transcript's tail spacer, in px.
  *
- * This plus the scroller's own `paddingBottom` is the clearance between the last
- * line of the transcript and the fade band below it, so it MUST stay >= that
- * band's height (`h-3`, 12px) or the fade slices the last line and the sliced
- * glyphs read as a hairline seam above the composer. It is a px value and not
- * `vh` for exactly that reason: as `2vh` the clearance tracked the viewport and
- * the margin was one pixel at 844px tall, so every shorter viewport — i.e. every
- * phone — landed inside the band.
+ * This plus the scroller's own dock clearance is the gap between the last line of
+ * the transcript and the top of the composer dock when the reader is at the
+ * bottom. It is a px value and not `vh` on purpose: as `2vh` the clearance tracked
+ * the viewport and the margin was one pixel at 844px tall, so every shorter
+ * viewport — i.e. every phone — landed the last line under the dock.
  */
 const TRANSCRIPT_TAIL_SPACER_PX = 16
 
 /**
- * How far the transcript's bottom mask reaches ABOVE the scrollport's bottom edge,
- * in px. This is the part that does the actual feathering, because it is the only
- * part that overlaps readable content, so `TRANSCRIPT_TAIL_SPACER_PX` plus the
- * scroller's own `paddingBottom` must stay >= this or the mask slices the last line
- * when the user is at the bottom.
- */
-const TRANSCRIPT_MASK_ABOVE_PX = 16
-
-/**
- * How far that same mask reaches BELOW the scrollport's bottom edge, so it ends
- * flush against the composer box instead of stopping short and leaving a strip
- * where a hairline shows through.
+ * Breathing room, in px, between the composer dock's top edge and the last line of
+ * the transcript, on top of the dock's own measured height.
  *
- * It is the exact distance from the scrollport's bottom edge to the top of the
- * composer box, which `ChatInput` owns as two pieces: the `input-area`'s own `pt-1`
- * (4px) plus the composer's top spacer (`h-[6px]`, the box that replaced the
- * pointer-only drag handle). Overshooting FURTHER is not harmless — the mask is
- * `z-[1]` and the composer sits in a later auto-z sibling, so any excess paints over
- * the box's own top border and dims it.
- *
- * That distance only holds while the composer status stack is EMPTY. When any status
- * bar renders, IT is what occupies the strip, and the mask's opaque tail landed on the
- * bar's top 10px instead — shaving its top border, both top corners and the first
- * line's ascenders, which reads as the bar being clipped by the UI. So every child of
- * the stack is positioned above `z-[1]` (the bars at `z-[2]`, the sub-agent wave chip
- * already at `z-[46]`); the tail then paints harmlessly BEHIND the topmost bar, whose
- * own box is what sits flush under the transcript. `ChatPage.statusStackAboveMask`
- * pins that ordering, and pins the child list so a new bar cannot forget it.
+ * The transcript scroller runs the full height of the pane and the dock floats
+ * over its bottom edge (iOS toolbar layout), so the scroller's `paddingBottom` is
+ * `dockH + this`: exactly the strip the dock covers, plus this margin, so the last
+ * line stops clear of the glass instead of under it. There is no opaque fade band
+ * between the two any more — the transcript scrolls under the glass and the
+ * material's own blur and tint are what keep the dock legible over it.
+ * ChatPage.dockClearance.test.tsx pins the wiring.
  */
-const COMPOSER_MASK_OVERSHOOT_PX = 10
+const DOCK_CLEARANCE_PX = 16
 /**
  * Strip of screen the mobile sessions drawer deliberately leaves uncovered, so a
  * sliver of the conversation behind it stays visible.
@@ -222,35 +233,43 @@ import {
   subscribeChatHandoff,
 } from '../utils/errorReport'
 import WelcomeView from '../components/WelcomeView'
-import { usePanelTabs, openPanelView, clearInlineDraft, getInlineDraft, claimAppAutoOpen, useAnyLiveAppTab } from '../hooks/usePanelTabs'
+import { MemoryModeChip, type MemoryMode } from '../components/MemoryModeChip'
+import { openPanelView, claimAppAutoOpen } from '../hooks/usePanelTabs'
 import { useFilteredDropdown } from '../hooks/useFilteredDropdown'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { effortToCarry, filterInteractiveModels, legacyCodexEffort, modelWithoutEffort, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
+import { isUnpinnedModel, JEV_ROUTE_MODEL, jevRouteOffered, jevRouteShownModel, withJevRoute } from '../lib/jevRoute'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
 import { useAgents } from '../hooks/useAgents'
 import { useRemoteCapabilities } from '../hooks/useRemoteCapabilities'
 import { useSlotDeferredValue } from '../hooks/useSlotDeferredValue'
+import { useLatchedRunning } from '../hooks/useLatchedRunning'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import type { ModelInfo } from '../providers/types'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../components/AgentDropdownList'
 import { agentSwitchFailureMessage } from '../utils/agentSwitchFeedback'
+import { historyDeleteRefusalMessage } from '../utils/historyDeleteRefusal'
 import ProjectPicker from '../components/ProjectPicker'
 import InboundLinkChip from '../components/InboundLinkChip'
 import ModelEffortDropdown from '../components/ModelEffortDropdown'
 
 import ChatInput from '../components/ChatInput'
+import { useStableCallbackProps } from './chat/useStableCallbackProps'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import SessionControlHost from '../components/SessionControlHost'
 import { useSessionControls, useSessionControlStatuses } from '../hooks/useSessionControls'
 import type { ChatFolder } from '../types'
-import ErrorNotice from '../components/ErrorNotice'
-import ChatDropOverlay, { useChatFileDrop } from '../components/ChatDropOverlay'
+import ErrorNotice, { ErrorNoticeMenuItem } from '../components/ErrorNotice'
+import VoicePlaybackNotice from '../components/VoicePlaybackNotice'
+import ChatDropOverlay from '../components/ChatDropOverlay'
 import SessionGridView from '../components/SessionGridView'
 import SessionTabStrip from '../components/SessionTabStrip'
-import { useSessionTabs } from '../hooks/useSessionTabs'
 import { anchorForSlot, loadLayout, sessionSlots } from '../hooks/splitLayoutStore'
 import { modelSupportsEffort } from '../lib/effort'
-import { providerLabel } from '../lib/sttProviders'
+import { mcpAppTabTitle } from '../lib/mcpAppSrcdoc'
 import { countCompletedTurns } from '../lib/completedTurns'
 import { displayModel, pinIsWithheld } from '../lib/model'
+import { slotApprovalMode } from '../utils/slotApprovalMode'
 import FollowUpCard from '../components/FollowUpCard'
 import FolderSuggestionCard from './chat/FolderSuggestionCard'
 import { useMoveSlotToFolder } from '../hooks/useMoveSlotToFolder'
@@ -261,9 +280,7 @@ import type { FollowupItem } from '../store/chatSlice'
 // Stable identity for the "no follow-up cards" case: returning a fresh {} from
 // the selector would make it a new reference on every store update.
 const EMPTY_FOLLOWUPS: Record<string, { items: FollowupItem[]; ts: number }> = {}
-import ReasoningEffortDropdown from '../components/ReasoningEffortDropdown'
 import FlyingQuote from '../components/FlyingQuote'
-import { useMessageSearch } from '../hooks/useMessageSearch'
 import SearchHighlightContext, { MessageSearchScope } from '../hooks/SearchHighlightContext'
 import SearchBar from '../components/SearchBar'
 import SearchResultsList from '../components/SearchResultsList'
@@ -271,9 +288,8 @@ import { pickSearchScrollBehavior, scrollCurrentMatchIntoView } from '../utils/s
 import QueueStack, { SubagentDeliveryProgress, isSystemDelivery, isNonInteractiveQueued } from '../components/QueueStack'
 import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { TipCard, useTipTrigger } from '../components/TipCard'
-import { useVoiceInput, voiceInputSupported, type TranscriptOrigin } from '../hooks/useVoiceInput'
-import { usePushToTalk } from '../hooks/usePushToTalk'
-import VoiceDisabledModal from '../components/VoiceDisabledModal'
+import { Composer, type ComposerHandle, type ComposerVoiceOptions } from '../chat-core/composer/Composer'
+import { createComposerDraftStore, useComposerDraft, useComposerDraftSelector, type ComposerDraftStore } from '../chat-core/composer/draftStore'
 import { ChatFooter, AssistantMessage, UserMessage, PinnedPrompt } from './chat'
 import { useStreamIdle } from './chat/ChatFooter'
 import type { TurnStats } from './chat/AssistantMessage'
@@ -282,57 +298,42 @@ import { turnHadPolicyBlock } from '../app-sdk/turnPolicyBlock'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
-import TypewriterText from '../components/TypewriterText'
+import ErrorBoundary from '../components/ErrorBoundary'
+import SessionTitleControl from './chat/SessionTitleControl'
 import { useChatNavigation } from '../hooks/useChatNavigation'
 import { useChatPins } from '../hooks/useChatPins'
 import SubagentProgressBar from './chat/SubagentProgressBar'
+import CommandCenterDock from './chat/command-center/CommandCenterDock'
 import TaskProgressBar from './chat/TaskProgressBar'
 import SidePanel, { CHAT_PANE_MIN_W, sidePanelFillWidth } from './chat/SidePanel'
 import { useSidePanelDock } from '../hooks/useSidePanelDock'
-import { createTurnGrouper, applyRunningState, REASONING_ROLES } from './chat/groupDisplayItems'
-// Hold-down for the display-layer running latch: a slots broadcast that
-// catches the agent between tool calls flaps `running` false for well under
-// a second; only a false that persists longer reflects the turn ending.
-const RUNNING_LATCH_MS = 2500
-import { setSessionPreviewPending, normalizeUrl, PREVIEW_EXPAND_EVENT, PREVIEW_SNIP_EVENT } from '../components/WebPreviewPanel'
+import { createTurnGrouper, applyRunningState, isTurnEnd, REASONING_ROLES, TURN_OPENER_ROLES, stripAppEnvelope } from './chat/groupDisplayItems'
+import { setSessionPreviewPending, normalizeUrl, PREVIEW_EXPAND_EVENT } from '../components/WebPreviewPanel'
 import { detectPreviewUrl, previewFeedDecision } from '../utils/detectPreviewUrl'
-import { fileLandingSlot } from '../utils/uploadRouting'
 import ChatSidebar from './ChatSidebar'
 import { SIDEBAR_MIN, SIDEBAR_MAX, clampSidebarWidth } from './chat/sidebarWidth'
-import { toSlug, resolveMsgIndex } from '../utils/shareUrl'
-import { DRAFT_SAVE_DEBOUNCE_MS, loadDrafts, mergeIntoDraft, mergeRecoveredDraft, saveDrafts as persistDrafts, setDraft } from '../utils/chatDrafts'
+import { resolveMsgIndex } from '../utils/shareUrl'
+import { DRAFT_SAVE_DEBOUNCE_MS, loadDrafts, mergeIntoDraft, mergeRecoveredDraft, saveDrafts as persistDrafts, setDraft, appendTypedText, typedDuringCreate } from '../utils/chatDrafts'
 import { loadFileDrafts, saveFileDrafts as persistFileDrafts, setFileDraft } from '../utils/chatFileDrafts'
 import { loadPasteDrafts, savePasteDrafts as persistPasteDrafts, setPasteDraft } from '../utils/chatPasteDrafts'
 import { loadSessionRefDrafts, saveSessionRefDrafts as persistSessionRefDrafts, setSessionRefDraft } from '../utils/chatSessionRefDrafts'
 import { addSessionRef, removeSessionRef, mergeSessionRefs, appendSessionRefLinks, type SessionRef } from '../utils/sessionRefs'
-import {
-  adoptSourceSelections,
-  commitRevealedSource,
-  commitSourceSelection,
-  isSourceSelectionKey,
-  loadSeenPullRequestLinks,
-  loadSourceSelections,
-  partitionSourceLinks,
-  parseSourceLinkUrl,
-  persistSeenPullRequestLinks,
-  PullRequestLinkIndex,
-  recordNewPullRequestLinks,
-  type RevealedSources,
-  loadRevealedSources,
-  type SourceLinkKind,
-  sourceSelection,
-  withSourceSelection,
-} from '../utils/pullRequestLinks'
+import { commitRevealedSource, parseSourceLinkUrl, type SourceLinkKind } from '../utils/pullRequestLinks'
 import { deriveFollowUpOptions, parseOptions } from '../app-sdk/protocol'
 import { isNoteRow } from '../lib/noteContract'
 import OverlayDrawer from '../components/OverlayDrawer'
+// Lazy for the same reason App.tsx lazy-loads the pill: the update chunk is
+// off the app-core budget, and the phone menu needs it only while an update exists.
+const MobileUpdateMenuItem = lazy(() => import('../components/UpdatePill'))
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../components/ui/dropdown-menu'
 import { loadChatConfig, CONTENT_WIDTH, type ChatConfig } from './chat/ChatSettings'
+import { scaleContentWidth } from './chat/contentWidth'
 import SessionFlyout, { TOGGLE_RECT } from './chat/SessionFlyout'
 import { focusComposer, focusComposerAfter, revealComposer } from './chat/composerFocus'
 import { useHoverIntent } from '../hooks/useHoverIntent'
 import { useKnowledgeFetch, extractKnowledgeQuery, expandKnowledgeBlock } from './chat/useKnowledgeFetch'
 import { KnowledgePicker } from './chat/KnowledgePicker'
-import { EyeOff, Loader, Pen, MessageSquare, Sparkles, VenetianMask, Clock, Undo2, Columns2, ExternalLink, X } from 'lucide-react'
+import { MessageSquare, Clock, AppWindow, Undo2, Columns2, ExternalLink, X, MoreHorizontal, EyeOff, VenetianMask } from 'lucide-react'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { PanelLeftSolid, PanelLeftLight, PanelRightSolid } from '../components/icons/panels'
 
@@ -343,17 +344,14 @@ import { TagPopoverProvider } from '../hooks/useTagPopover'
 import { AnimatePresence, motion, useMotionValue, useTransform } from 'framer-motion'
 import DetailPanel from '../components/DetailPanel'
 
-import type { ChatMessage, Artifact } from '../types'
+import type { ChatMessage } from '../types'
 
 import { shouldMountSidePanel, isSidePanelHidden, sidePanelDockMotion } from './chat/sidePanelMount'
-import { optsForReplace } from './chat/replaceGuard'
 import type { ParsedSubagentCompletion } from './chat/subagentCompletion'
-import { renderMcpOAuthMessage } from './chat/McpOAuthBanner'
 import { useConnectionsUiEnabled } from '../hooks/useConnectionsUi'
+import { useKirocrewConfigReader } from '../hooks/useKirocrewConfigReader'
 import TurnBlock from './chat/TurnBlock'
 import Clickable from '../components/Clickable'
-import StopEventCard from './chat/StopEventCard'
-import NoticeCard from './chat/NoticeCard'
 import WorkflowProgressBar from './chat/WorkflowProgressBar'
 import { tryQuickSend } from '../lib/quickSend'
 import { rewindWithRollback } from '../lib/rewindCall'
@@ -365,6 +363,20 @@ import { errMessage } from '../utils/thunkError'
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
 import { fmtMessageTime, fmtMessageTimeFull } from './chat/messageTime'
+
+/**
+ * Horizontal room the chat pane reclaims (negative margin) while the desktop
+ * sessions sidebar is collapsed: the gap the open panel kept between itself and
+ * the pane. Every pane-space offset that clears the stationary toggle adds it.
+ */
+const COLLAPSED_PANE_RECLAIM_PX = 8
+/**
+ * Leading clearance for the open-session strip while the desktop sessions
+ * sidebar is collapsed. The pane's reclaimed margin moves the toggle's
+ * container-space right edge (x + size) that much farther into the strip; the
+ * final 4px keeps the first tab visibly separate from the control.
+ */
+const COLLAPSED_SESSION_TABS_INSET = TOGGLE_RECT.x + TOGGLE_RECT.size + COLLAPSED_PANE_RECLAIM_PX + 4
 /**
  * Human-readable reason from a rejected thunk. `unwrap()` rejects with RTK's
  * SERIALIZED error — a plain object, never an `Error` instance — so an
@@ -391,6 +403,11 @@ const createFailReason = (e: unknown): string => {
  *  the registry default that reads this set is never reached here. Frozen and
  *  shared so the per-row context does not allocate. */
 const NO_AUTO_DENIED = new Set<string>()
+
+// `mentionBoundary` / `strictMentionBoundary` / `leadingMentionBoundary`
+// moved to utils/fileTokens.ts: the reconciliation staleness check, the
+// remove-chip strip and send serialization share one definition there and
+// can never disagree about what counts as a boundary.
 
 /** Stable empty set so the mcpApps-derived selector returns a referentially
  *  equal value when the slot has no app renders (avoids useless re-renders). */
@@ -480,6 +497,49 @@ const jumpUnavailableNotice = (origin: PendingJumpOrigin): string =>
     : origin === 'link' ? i18nT('pages.chat.deepLink.message_unavailable')
       : i18nT('pages.chat.pins.message_unavailable')
 
+/** What the composer has staged besides text (file paths and session-ref keys),
+ *  for the create-carry check in ChatPage: only a text-only draft carries. */
+const stagedIdentity = (files: readonly string[] | undefined, sessions: readonly SessionRef[] | undefined) =>
+  JSON.stringify([files ?? [], (sessions ?? []).map(r => r.key)])
+const NOTHING_STAGED = stagedIdentity(undefined, undefined)
+
+/**
+ * The main composer, with its callback props held at stable identities. This
+ * page builds most of them inline on every render; the forwarders let
+ * `memo(ChatInput)` skip a page render (a pin, a streamed frame) that changes
+ * nothing the composer shows.
+ */
+function StableChatInput(props: React.ComponentProps<typeof ChatInput>) {
+  return <ChatInput {...useStableCallbackProps(props)} />
+}
+
+/** One shared empty list, so an absent folder cache keeps a stable identity. */
+const NO_CHAT_FOLDERS: ChatFolder[] = []
+
+/** Draft facts ChatPage renders from; each re-renders the page only when it flips. */
+const isNonBlank = (text: string) => text.trim() !== ''
+/** The staged folder refs as one string, so an unchanged set compares equal. */
+const dirTokensKey = (text: string) => parseDirTokens(text).map(t => t.rel).join('\0')
+
+/**
+ * The per-commit side of the composer draft: mirrors the committed text into
+ * ChatPage's `inputRef` during render and
+ * hands each committed change to `onCommit` (persist the slot draft, feed the
+ * history suggestions). A child of ChatPage, so its effect runs before the
+ * page's own effects in the same commit. Renders nothing, and it is the only
+ * part of the page that re-renders on a keystroke.
+ */
+function ComposerDraftSync({ store, inputRef, onCommit }: {
+  store: ComposerDraftStore
+  inputRef: React.MutableRefObject<string>
+  onCommit: (text: string) => void
+}) {
+  const text = useComposerDraft(store)
+  inputRef.current = text
+  useEffect(() => { onCommit(text) }, [text, onCommit])
+  return null
+}
+
 export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync }: { mode?: string; embedded?: boolean; embedMode?: 'chat' | 'sessions'; popout?: boolean; noUrlSync?: boolean } = {}) {
   const dispatch = useAppDispatch()
   const moveSlotToFolder = useMoveSlotToFolder()
@@ -488,11 +548,47 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const location = useLocation()
   const queryClient = useQueryClient()
   const provider = useProvider()
+  // Kills a Run-in-terminal tab's backend PTY when the dispatch rolls back
+  // (see the mc:run-in-terminal handler). Routed through the same mutation the
+  // tab-close paths use (per the use-react-query guideline); read through a
+  // ref because that handler's effect deliberately registers once ([] deps).
+  const deleteTerminalSession = useDeleteTerminalSession()
+  const deleteTerminalSessionRef = useRef(deleteTerminalSession)
+  deleteTerminalSessionRef.current = deleteTerminalSession
   const [searchParams, setSearchParams] = useSearchParams()
   // Declared with the other top-of-component hooks because the ?sid= URL-sync
   // effect reads it (mobile replaces rather than pushes a session switch), and
   // that effect is defined well above where the layout hooks start.
   const isMobile = useIsMobile()
+  /**
+   * Phone: the App shell's top bar is the ONE bar, and this page's title row
+   * lives in it. The shell renders `#mobile-topbar-slot` (centre cell) and
+   * `#mobile-topbar-trail-slot` (after the bell) only on the chat route below
+   * the breakpoint; this page fills them through `createPortal` — the same
+   * hand-off `#activity-bar-slot` uses on desktop. Both resolve to `null`
+   * anywhere the shell does not render them (the popout window, an embedded
+   * host, a desktop width), and the page then keeps its own inline title row
+   * — so a missing slot degrades to today's layout rather than to no title.
+   *
+   * `mobileNavRail` is the shell's main navigation as an icon rail, rendered
+   * beside the sessions pane inside this page's ONE drawer (see the
+   * OverlayDrawer below). `null` off the phone chat route.
+   */
+  const singleBar = isMobile && !embedded && !popout
+  const topbarSlot = useShellSlot('mobile-topbar-slot', singleBar)
+  const topbarTrailSlot = useShellSlot('mobile-topbar-trail-slot', singleBar)
+  const mobileNavRail = useMobileNavRail()
+  /**
+   * Whether the title row is in the shell's bar rather than inline. Derived
+   * from the slot ELEMENT, not from `isMobile`: the two can disagree for a
+   * render on a breakpoint crossing, and the row must be in exactly one place
+   * — the inline copy stands down only once the portal target exists, and the
+   * transcript's header spacer, the fixed sessions button and the split view's
+   * inline toggle all key off this same flag so none of them doubles up.
+   */
+  const titleInTopbar = topbarSlot !== null
+  // The memoized composer props below hold i18nT labels; their memo re-keys on a catalog load.
+  const langGen = useLanguageGeneration()
   // The mobile sessions drawer and its scrim are `fixed` overlays that autofocus
   // a search input, so a software keyboard is open whenever they are. iOS Safari
   // shrinks only the VISUAL viewport for the keyboard (`interactive-widget`
@@ -508,6 +604,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const keyboardInset =
     typeof window === 'undefined' ? 0 : Math.max(0, window.innerHeight - vv.offsetTop - vv.height)
   const slots = useAppSelector(s => s.dashboard.slots)
+  // A user-facing switch gesture hit a session the server no longer has
+  // (#6372); rendered through the pane ErrorNotice below (errors-use-error-notice).
+  const switchSlotGone = useAppSelector(s => s.chat.switchSlotGone)
   // Unified chat view: show default, orchestrator and crew slots together.
   // App-owned worker slots (s.app) are excluded by the sidebar itself.
   const filteredSlots = useMemo(
@@ -531,10 +630,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Create-in-flight, so the flyout's New button can go inert exactly like the
   // sidebar's does instead of accepting a second click.
   const creatingSlot = useAppSelector(s => s.chat.creatingSlot)
+  // Read synchronously by the slot-change effect, so held in a ref updated every
+  // render. The same reducer case sets it and `activeSlot`, so the render that
+  // sees the new active slot sees this too.
+  const foregroundCreateId = useAppSelector(s => s.chat.foregroundCreateId)
+  const foregroundCreateIdRef = useRef(foregroundCreateId); foregroundCreateIdRef.current = foregroundCreateId
+  const lastCreatedActivation = useAppSelector(s => s.chat.lastCreatedActivation)
+  const lastCreatedActivationRef = useRef(lastCreatedActivation); lastCreatedActivationRef.current = lastCreatedActivation
   // The one post-resolve answer for every resume entry point (#5925); rendered
   // above the composer, which is the only place all of them can see.
   const unresumableResume = useAppSelector(s => s.chat.unresumableResume)
+  const undeletableHistory = useAppSelector(s => s.chat.undeletableHistory)
   const activeSlot = useAppSelector(s => s.chat.activeSlot)
+  // The store this page is rendered under (not the module singleton): the
+  // opener reads live state after an await, and it must be the same store
+  // its dispatches went to. Also read by the MCP-app openers below, so it is
+  // declared ahead of the auto-open effect.
+  const boundStore = useAppStore()
+  // Reveal eligible completed replies while recovery is offered, including an
+  // older reply the user chose to read aloud. Slot identity prevents bleed-over.
+  const [voiceRecoverySlot, setVoiceRecoverySlot] = useState<string | null>(null)
   // tool_call_ids in THIS slot that have a live MCP App render payload. Passed
   // to TurnBlock so app-bearing rows (which mount an interactive iframe) never
   // fold into a collapsible pane — collapsing hides the app, and re-expanding
@@ -577,9 +692,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // a tab the user had deliberately closed.
       if (!claimAppAutoOpen(activeSlot, id)) continue
       dispatch(openActivityPanel())
-      tabsCtlRef.current?.openApp(id, i18nT('pages.chatPage.mcp_app_tab_title'), activeSlot)
+      // Chip title comes from the render payload already in the store -- the
+      // payload IS what created this id (appToolCallIds keys off chat.mcpApps).
+      // Read at effect time from the Provider-bound store (never the module
+      // singleton, which a test harness does not mount) so unrelated chat
+      // updates do not re-run the effect.
+      const payload = boundStore.getState().chat.mcpApps?.[mcpAppKey(activeSlot, id)]
+      tabsCtlRef.current?.openApp(id, mcpAppTabTitle(payload, i18nT('pages.chatPage.mcp_app_tab_title')), activeSlot)
     }
-  }, [mcpAppPanel, activeSlot, appToolCallIds, dispatch])
+  }, [mcpAppPanel, activeSlot, appToolCallIds, dispatch, boundStore])
 
   const messages = useAppSelector(s => s.chat.messages)
     const probeServerTotal = useAppSelector(s => (activeSlot ? (s.chat.slotServerTotal?.[activeSlot] ?? -1) : -1))
@@ -795,19 +916,38 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // declared AFTER those effects so a batched keystroke+switch can't smear one
   // slot's draft onto another. See that advance effect for the full rationale.
   const composerSlotRef = useRef(activeSlot)
-  const [input, setInput] = useState(() => activeSlot ? drafts.current[activeSlot] ?? '' : '')
+  // The composer text lives in a store, not in this component's state: a
+  // keystroke re-renders the composer that subscribes to it (`ChatInput` under
+  // `<Composer draft>`), not this page. `setInput` keeps the `useState` setter
+  // shape; code that acts on the text reads `inputRef`, and render-time facts
+  // (blank or not, staged `@dir/` tokens) are selected below so the page
+  // re-renders only when that fact changes.
+  const composerDraft = useState(() => createComposerDraftStore(activeSlot ? drafts.current[activeSlot] ?? '' : ''))[0]
+  const setInput = composerDraft.set
+  const inputNonBlank = useComposerDraftSelector(composerDraft, isNonBlank)
 
   // History suggestions ("Continue a previous chat?") shown above the input on the welcome screen.
   const sendingRef = useRef(false)
   const [historyQuery, setHistoryQuery] = useState('')
   const [historyDismissed, setHistoryDismissed] = useState(false)
-  useEffect(() => {
-    const q = input.trim()
-    if (!q) { setHistoryQuery(''); setHistoryDismissed(false); return }
-    setHistoryDismissed(false)
-    const t = setTimeout(() => setHistoryQuery(q.toLowerCase()), 300)
-    return () => clearTimeout(t)
-  }, [input])
+  // Fed from the composer-draft commit below (`onComposerDraftCommit`), once per
+  // committed text change. The refs keep a keystroke from calling a setter with
+  // the value it already holds, which is what keeps typing off this page.
+  const historyQueryRef = useRef(historyQuery); historyQueryRef.current = historyQuery
+  const historyDismissedRef = useRef(historyDismissed); historyDismissedRef.current = historyDismissed
+  const historyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const updateHistoryQuery = useCallback((text: string) => {
+    if (historyTimerRef.current) { clearTimeout(historyTimerRef.current); historyTimerRef.current = null }
+    if (historyDismissedRef.current) setHistoryDismissed(false)
+    const q = text.trim()
+    if (!q) { if (historyQueryRef.current) setHistoryQuery(''); return }
+    const next = q.toLowerCase()
+    historyTimerRef.current = setTimeout(() => {
+      historyTimerRef.current = null
+      if (historyQueryRef.current !== next) setHistoryQuery(next)
+    }, 300)
+  }, [])
+  useEffect(() => () => { if (historyTimerRef.current) clearTimeout(historyTimerRef.current) }, [])
   const historySuggestions = useMemo(() =>
     historyQuery && history.length
       ? history.filter(s => (s.title || '').toLowerCase().includes(historyQuery) || s.key.toLowerCase().includes(historyQuery)).slice(0, 5)
@@ -840,13 +980,25 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // project changes which project-scoped agents exist. Derived here rather than
   // from `currentSlot`, which is computed further down the render body.
   const activeSlotProject = slots.find(s => s.key === activeSlot)?.project || undefined
-  const { agents: installedAgents, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // Crew-bound (remote-executor) sessions refuse every local turn-starting
+  // action server-side (`remote_bound_refusal`): regenerate, edit-resend, rewind
+  // and continue would run the crew's turn on THIS machine and diverge the
+  // transcripts. So the client must not OFFER them here either — same predicate
+  // and same `executor` keying `selectContinuable` already uses for Resume.
+  const activeSlotRemoteBound = slotIsRemoteBound(slots.find(s => s.key === activeSlot))
+  const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // The picker lists every catalog row (a member and a template of one name
+  // are two rows). A roster source that exposes only the folded list -- one
+  // row per name -- is still a complete, if namespace-blind, catalog.
+  const agentChoices = catalogChoices ?? installedAgents
   // Is this session bound to a peer crew for execution, and what does that crew
   // offer? Read once here and threaded into the shelf's pickers below, so every
   // control answers from one source rather than each deciding for itself.
   const remoteCrew = useRemoteCapabilities(slots.find(s => s.key === activeSlot))
   const effectiveAgents = useMemo<KiroCrewAgent[]>(() => {
-    if (!remoteCrew.isRemote) return installedAgents
+    // Local: the full catalog, so a same-name member and template stay two
+    // rows. Remote: the peer's own roster, which knows no namespaces.
+    if (!remoteCrew.isRemote) return agentChoices
     // The peer's roster carries the four fields its picker renders. The rest of
     // KiroCrewAgent describes bindings that only mean something on the machine
     // that owns them (`kiro_agent`, `workspace`, `memory_store`), so they are
@@ -861,7 +1013,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       description: a.description,
       source: a.scope || 'remote',
     }))
-  }, [remoteCrew.isRemote, remoteCrew.capabilities, installedAgents])
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, agentChoices])
   const [defaultAgentFailed, setDefaultAgentFailed] = useState(false)
   // Promotes an agent to the global default. Set-only: clearing the default lives on
   // the Agent Templates page, where the control is labelled and the outcome is visible.
@@ -896,8 +1048,75 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       contextWindow: m.context_window || undefined,
     }))
   }, [remoteCrew.isRemote, remoteCrew.capabilities, localModels])
+  const selectionCapabilitiesQ = useQuery({
+    queryKey: ['slot-selection-capabilities', activeSlot],
+    queryFn: () => api.chatSlotSelectionCapabilities(activeSlot!),
+    enabled: !!activeSlot && typeof api.chatSlotSelectionCapabilities === 'function',
+    // A new ACP session may not exist when its slot first appears. Recheck
+    // until the agent reports its config options, then refresh less often.
+    // A missing/non-ACP peer can remain unknown indefinitely. Probe quickly
+    // during session startup, then back off instead of proxying every 2s.
+    refetchInterval: query => query.state.data?.known || query.state.dataUpdateCount + query.state.errorUpdateCount >= 5 ? 30_000 : 2_000,
+  })
+  const selectionCapabilities = selectionCapabilitiesQ.data?.known
+    ? selectionCapabilitiesQ.data
+    : undefined
+  const hiddenModelsQ = useModelPickerHiddenModelsQuery()
+  const hiddenModelIds = hiddenModelsQ.data
+  const modelPickerConfigured = useModelPickerConfigured()
   const availableModels = effectiveModels
-  const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(availableModels)
+  // The server owns the backend-specific model ID convention, including while
+  // the ACP session is still starting. Never infer it from bracketed IDs alone.
+  const codexPairModels = shouldSeparateModelEffort(
+    selectionCapabilitiesQ.data?.model_effort_pair_ids, effectiveModels,
+  )
+  // Whether the picker may offer `Auto (Jev)` (see `lib/jevRoute.ts`): the fleet's
+  // answer AND the owner's keystone consent, both required. Two reads the page
+  // already makes for other reasons, so the row costs no new request.
+  const jevDashCfgQ = useQuery<{ decisions_enabled?: boolean }>({
+    queryKey: ['dashboardConfig'],
+    queryFn: () => api.dashboardConfig(),
+    staleTime: 30_000,
+  })
+  const jevConsentQ = useQuery({
+    queryKey: ['decisionsConsent'],
+    queryFn: () => api.getDecisionsConsent(),
+    // A 404 is "this gateway predates the keystone", not a transient failure: the
+    // row is simply not offered.
+    retry: false,
+  })
+  // NOT offered for a remote-bound session. Its turns run on the peer through
+  // `relay_remote_turn`, which never reaches the routing hook, and the slot-model
+  // route forwards the resolved `auto` to the peer without the flag — so the entry
+  // would be a control that silently does nothing.
+  // The slot answer is the third gate: without one the entry has nowhere to land.
+  // It returns as soon as a slot exists.
+  const jevRouteOn =
+    jevRouteOffered(jevDashCfgQ.data, jevConsentQ.data, !!activeSlot) && !remoteCrew.isRemote
+  const jevRouteLabel = i18nT('pages.chatPage.model_auto_jev_description')
+  const modelPickerModels = useMemo(
+    () => {
+      const pickerSlot = slots.find(slot => slot.key === activeSlot)
+      return withJevRoute(
+        filterInteractiveModels(effectiveModels, hiddenModelIds, [
+          pickerSlot?.model || '',
+          pickerSlot?.served_model || '',
+        ], codexPairModels),
+        jevRouteOn,
+        jevRouteLabel,
+      )
+    },
+    [effectiveModels, hiddenModelIds, slots, activeSlot, jevRouteOn, jevRouteLabel, codexPairModels],
+  )
+  const { open: modelDropdown, setOpen: setModelDropdown, filter: modelFilter, setFilter: setModelFilter, dropdownRef: modelDropdownRef, inputRef: modelInputRef, filtered: filteredModels } = useFilteredDropdown(modelPickerModels)
+  // Whether the composer held focus when the picker was opened from its chip
+  // (ChatInput reads this before the press moves focus). A pick closes the
+  // picker, which unmounts the focused row and would otherwise drop focus on
+  // <body>; when the user was typing, the pick hands focus back to the
+  // composer so they can carry on. A user who was not typing is left alone —
+  // focusing the composer under them would be a surprise, and on touch it
+  // would raise the keyboard (`focusComposer` already skips touch).
+  const modelPickerReturnsFocusRef = useRef(false)
   // Roving-focus keyboard nav for the agent + model dropdowns (shared with StyledSelect/AgentSelector).
   const { onListKeyDown: onAgentListKeyDown } = useListboxKeyboard({
     open: agentDropdown,
@@ -907,7 +1126,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     filteredCount: filteredAgents.length,
     onEnterSingleMatch: () => {
       const a = filteredAgents[0]
-      if (a) { switchAgent(a.name); setAgentDropdown(false) }
+      if (a) { switchAgent(a.name, a.selection_kind); setAgentDropdown(false) }
     },
     closeToTrigger: () => setAgentDropdown(false),
   })
@@ -917,12 +1136,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     inputRef: modelInputRef,
     hasFilterInput: true,
     filteredCount: filteredModels.length,
-    onEnterSingleMatch: () => { switchModel(filteredModels[0].name); setModelDropdown(false) },
+    onEnterSingleMatch: () => { pickModel(filteredModels[0].name) },
     closeToTrigger: () => setModelDropdown(false),
   })
   const [pendingAgent, _setPendingAgent] = useState('')  // agent for next new slot
   const pendingAgentRef = useRef('')
-  const setPendingAgent = useCallback((v: string) => { pendingAgentRef.current = v; _setPendingAgent(v) }, [])
+  // The namespace the pending agent was picked from, kept beside the name so
+  // the create carries both: a pending "reviewer" template must not become the
+  // "reviewer" member on send. Cleared with the name.
+  const pendingAgentKindRef = useRef<'member' | 'template' | undefined>(undefined)
+  const setPendingAgent = useCallback((v: string, kind?: 'member' | 'template') => {
+    pendingAgentRef.current = v
+    pendingAgentKindRef.current = v ? kind : undefined
+    _setPendingAgent(v)
+  }, [])
   const [pendingModel, _setPendingModel] = useState('')  // model for next new slot
   const pendingModelRef = useRef('')
   const setPendingModel = useCallback((v: string) => { pendingModelRef.current = v; _setPendingModel(v) }, [])
@@ -952,7 +1179,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Sending the literal 'auto' would NOT be equivalent: it is truthy, so it
   // short-circuits `slot.model or agent_model` and would override a template or
   // global pin the user did configure.
-  const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
+  // Composer-toolbar picker anchors: each hook keeps its portaled menu glued
+  // to the ChatInput chip that opened it while the menu is open (#10616).
+  const { rect: modelBtnRect, anchorTo: anchorModelBtn } = useAnchoredTriggerRect(modelDropdown)
   // One in-page slot for every failed action whose only report used to be a
   // notification-centre toast, a native alert() or a swallowed catch (fork,
   // plan-from-here, apply-plan, steer, rename, title generation, the agent
@@ -961,7 +1190,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // ErrorNotice; the newest failure wins, the same shape as `refusedPress`.
   // `title` is optional because several sites already own a whole-sentence
   // message ("Fork failed: …") that must stay intact for the error-journal match.
-  const [actionError, setActionError] = useState<{ title?: string; message: string } | null>(null)
+  const [actionError, setActionError] = useState<{ title?: string; message: string; preserveOnSwitch?: boolean } | null>(null)
   const showActionError = useCallback((message: string, title?: string) => {
     // Same failure re-reported (an effect re-run, a retry that fails the same
     // way) keeps the stored object, so React bails out instead of re-rendering.
@@ -973,18 +1202,26 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // same transport -- `sendTurn` never rejects, so the outcome is read from the
   // receipt, not from an error callback.
   const steerMutation = useMutation({
-    mutationFn: ({ text, sendId, slot }: { text: string; sendId?: string; slot: string }) =>
-      sendTurn({ message: text, slot, steer: true, ...(sendId ? { meta: { sendId } } : {}) }),
+    // `auto` sends the same POST with `steer: 'auto'`: the gateway then chooses
+    // between injecting into the running turn and queueing for the next one
+    // (`decisions/points/message_steer.py`). The receipt policy below is unchanged,
+    // because the answer arrives as the `dispatched` of a steer or the `queued` of
+    // a queue -- both rulings `applySteerReceipt` already owns.
+    mutationFn: ({ text, sendId, slot, auto }: { text: string; sendId?: string; slot: string; auto?: boolean }) =>
+      sendTurn({ message: text, slot, steer: auto ? 'auto' : true, ...(sendId ? { meta: { sendId } } : {}) }),
     onSuccess: (receipt, { text, sendId, slot }) => {
-      // Receipt policy for a steer. The composer was cleared at submit and the
-      // optimistic bubble is NOT persisted -- the next transcript rebuild drops
-      // it -- so a steer that did not provably reach the gateway hands its text
-      // back. Everything below is addressed to the SENDING slot, not the
-      // active one: the user can switch sessions inside the deadline window,
-      // and this text and its rows belong to the transcript they were typed
-      // into (the same rule `send()`'s restore and steer-echo append follow).
+      // Receipt policy for a steer, owned once in chat-core (issue #9457):
+      // applySteerReceipt decides WHICH ruling applies; the adapter below is
+      // ChatPage's HOW. The composer was cleared at submit and the optimistic
+      // bubble is NOT persisted -- the next transcript rebuild drops it -- so a
+      // steer that did not provably reach the gateway hands its text back.
+      // Everything here is addressed to the SENDING slot, not the active one:
+      // the user can switch sessions inside the deadline window, and this text
+      // and its rows belong to the transcript they were typed into (the same
+      // rule send()'s restore and steer-echo append follow).
+      //
       // "On screen" means the LIVE composer state belongs to this slot --
-      // `composerSlotRef`, not `activeSlotRef`: during a slot switch the active
+      // composerSlotRef, not activeSlotRef: during a slot switch the active
       // slot has already flipped while the composer still holds (and is about
       // to flush) the outgoing slot's text. Writing only the persisted draft in
       // that window would be overwritten by that flush from the stale input;
@@ -998,107 +1235,99 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         if (onScreenNow) setInput(back)
       }
       const row = (message: ChatMessage) => dispatch(appendSlotMessage({ slot, message }))
-      // - `refused` / `transport-error`: nothing was accepted -- the same two
-      //   outcomes `send()` reports with an error row (the server's reason,
-      //   framed, or the connection copy that names the restore) and a
-      //   restore. The optimistic bubble is dropped first (the reducer's drop
-      //   arm; a no-op once the server owns the row): left standing it would be
-      //   a third, false representation of the same text next to the error row
-      //   and the refilled composer.
-      if (receipt.status === 'refused' || receipt.status === 'transport-error') {
-        if (sendId) dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
-        row({
+      applySteerReceipt(receipt, {
+        // A confirmed echo is stronger evidence than a missing HTTP response,
+        // including when a steer raced onto a new turn and lost its steer flag.
+        echoReconciled: () => !!sendId && selectSendConfirmed(store.getState(), slot, sendId),
+        restore: handBack,
+        // The reducer drops only an optimistic bubble; left standing it would be
+        // a third, false representation of the same text next to the error row
+        // and the refilled composer. 'queued' is the reducer's DROP arm, 'turn'
+        // demotes. Guarded on sendId/slot exactly as before: with no sendId the
+        // reducer has no key and there is nothing to resolve (the old code's
+        // `if (sendId)` on the failure arms and its `if (!sendId || !slot)
+        // return` before the accepted arms both collapse to this guard).
+        resolveBubble: (outcome) => {
+          if (!sendId || !slot) return
+          dispatch(resolveOptimisticSteer({ slot, sendId, outcome: outcome === 'turn' ? 'turn' : 'queued' }))
+        },
+        reportFailure: (reason, status) => row({
           role: 'error',
-          content: receipt.reason
-            ? i18nT('pages.chatPage.send_failed_with_error', { error: receipt.reason })
-            : i18nT(receipt.status === 'transport-error' ? 'pages.chatPage.send_failed_connection' : 'pages.chatPage.send_failed'),
+          content: reason
+            ? i18nT('pages.chatPage.send_failed_with_error', { error: reason })
+            : i18nT(status === 'transport-error' ? 'pages.chatPage.send_failed_connection' : 'pages.chatPage.send_failed'),
           cls: '',
-        })
-        handBack()
-        return
-      }
-      // - `response-late`: the transport's deadline fired and aborted the POST.
-      //   It may have arrived (a slow answer) or not (a stalled socket the abort
-      //   killed) -- the steer never had a deadline before this transport, so
-      //   this window is new here. If the server's own echo already reconciled
-      //   the bubble, the steer landed: nothing to do. Otherwise the bubble is
-      //   removed (standing, it would read as delivered), the text goes back,
-      //   and a WARN-tone notice tells the user to check the transcript before
-      //   resending -- a duplicate is visible and deletable, a lost steer is not.
-      if (receipt.status === 'response-late') {
-        if (sendId) {
-          const chat = store.getState().chat
-          const rows = slot === chat.activeSlot ? chat.messages : (chat.slotMessages[slot] ?? chat.messages)
-          const bubble = rows.find(m => m.role === 'user' && m.meta?.sendId === sendId)
-          if (bubble && !bubble.meta?.optimistic) return
-          // `queued` is the reducer's DROP arm (its other arm, `turn`, demotes):
-          // an unconfirmed steer drops its bubble for the same reason a
-          // demoted-to-queue one does -- the server-side row, if any, is the
-          // representation, and a standing bubble would assert delivery.
-          dispatch(resolveOptimisticSteer({ slot, sendId, outcome: 'queued' }))
-        }
-        handBack()
+        }),
         // The lead glyph is NoticeCard's tone selector (parseNotice): \u26A0 =
         // warn, which also gives the row its "Warning" screen-reader label.
         // Kept out of the catalog string so the copy stays shared with the
         // surfaces that render it in their own strip.
-        row({ role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' })
-        return
-      }
-      if (!sendId || !slot) return
-      // - `unknown`: a 2xx whose body would not parse. Accepted; `steered` is the
-      //   one shape the badge's claim is true for and an unreadable body
-      //   confirms nothing, so neither rewrites the bubble.
-      if (receipt.status === 'unknown') return
-      const body = receipt.body as { steered?: boolean }
-      if (body.steered) return
-      dispatch(resolveOptimisticSteer({ slot, sendId, outcome: receipt.status === 'queued' ? 'queued' : 'turn' }))
+        warnUnconfirmed: () => row({ role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed'), cls: '' }),
+        // ChatPage's steer is TEXT-ONLY and carries no raw/files split into the
+        // mutation (`text` is already the wire text; attachments are excluded
+        // from ChatPage steer by design, see steer()). It never stashed on a
+        // queued demotion and structurally cannot do so losslessly, so this arm
+        // stays a no-op -- the queue card falls to the parser fallback exactly
+        // as it did before #9457. resolveBubble('drop') still fires for the
+        // demotion via the helper's queued path.
+        stashDemoted: () => undefined,
+      })
     },
   })
-  const [reasoningEffortDropdown, setReasoningEffortDropdown] = useState(false)
-  const [reasoningEffortBtnRect, setReasoningEffortBtnRect] = useState<DOMRect | null>(null)
-  const reasoningEffortDropdownRef = useRef<HTMLDivElement>(null)
-  const [autoNudgeOpen, setAutoNudgeOpen] = useState(false)
-  const [autoNudgeLoop, setAutoNudgeLoop] = useState<AutoNudgeLoop | null>(null)
+  const [automationOpen, setAutomationOpen] = useState(false)
+  const liveAutomation = useAppSelector(state => activeSlot
+    ? selectAutomationForSlot(state, activeSlot)
+    : null)
+  const automationSnapshot = useQuery({
+    queryKey: ['session-automation', activeSlot],
+    enabled: !!activeSlot,
+    queryFn: async () => {
+      const slot = activeSlot!
+      const [legacy, structured] = await Promise.all([
+        api.autonudgeForSlot(slot),
+        api.monitorForSlot(slot),
+      ])
+      const hasFullLegacyRecord = legacy.loop !== null
+        && isFullLegacyAutomationRecord(legacy.loop)
+      const legacySnapshot = !hasFullLegacyRecord
+        ? null
+        : normalizeAutomationRecord(legacy.loop)
+      const structuredRecord = structured.monitor === null
+        ? null
+        : normalizeAutomationRecord(structured.monitor)
+      if ((hasFullLegacyRecord && !legacySnapshot)
+        || (structured.monitor !== null
+          && structuredRecord?.kind !== 'structured_monitor')) {
+        throw new Error('Invalid session automation snapshot')
+      }
+      const legacyRecord = legacySnapshot?.kind === 'legacy_goal_loop'
+        ? legacySnapshot
+        : null
+      if (legacyRecord && structuredRecord) {
+        throw new Error('Conflicting session automation snapshot')
+      }
+      return structuredRecord ?? legacyRecord
+    },
+    staleTime: 0,
+  })
+  // Redux is the live/list projection; this query is the authoritative cold
+  // read for the active slot, including retained terminal evidence that the
+  // global collection intentionally does not grow to hold. Writers must
+  // invalidate this query before clearing Redux. That ordering keeps creation
+  // disabled while absence is being re-proved and prevents a stale snapshot
+  // from replacing or resurrecting a live record.
+  const automation = liveAutomation ?? automationSnapshot.data ?? null
+  const automationId = automation?.id
+  const automationCreationReady = !!automation
+    || (automationSnapshot.isSuccess && !automationSnapshot.isFetching)
+  const automationSnapshotFailed = automationSnapshot.isError
   const approvalMode = useAppSelector(s => s.dashboard.approvalMode)
 
-  // ── Reasoning effort dropdown click-outside ──
+  // Close the slot-scoped automation surface on navigation. Its record comes
+  // from the same Redux collection the sidebar reads; the WebSocket hook owns
+  // both the cold REST snapshot and live updates.
   useEffect(() => {
-    if (!reasoningEffortDropdown) return
-    const handler = (e: MouseEvent) => {
-      if (reasoningEffortDropdownRef.current?.contains(e.target as Node)) return
-      if (reasoningEffortBtnRect) {
-        const r = reasoningEffortBtnRect
-        if (e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom) return
-      }
-      setReasoningEffortDropdown(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [reasoningEffortDropdown, reasoningEffortBtnRect])
-
-  // ── Auto-nudge: fetch loop state for active slot, subscribe to WS updates ──
-  useEffect(() => {
-    // Clear stale state and close the popover on slot switch so it remounts
-    // with fresh useState initializers sourced from the new slot's loop.
-    // Otherwise the popover's internal message/idleSecs/maxCycles retain
-    // values from the previously-active slot and a Start click would arm the
-    // wrong nudge on the new session.
-    setAutoNudgeLoop(null)
-    setAutoNudgeOpen(false)
-    if (!activeSlot) return
-    let cancelled = false
-    fetch(`/api/autonudge/slot/${encodeURIComponent(activeSlot)}`)
-      .then(r => r.json())
-      .then(d => { if (!cancelled) setAutoNudgeLoop(d.loop || null) })
-      .catch(() => {})
-    const onEvent = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { slot?: string; loop?: AutoNudgeLoop; event?: string }
-      if (!detail || detail.slot !== activeSlot) return
-      setAutoNudgeLoop(detail.event === 'removed' ? null : (detail.loop ?? null))
-    }
-    window.addEventListener('autonudge_state', onEvent)
-    return () => { cancelled = true; window.removeEventListener('autonudge_state', onEvent) }
+    setAutomationOpen(false)
   }, [activeSlot])
   const {
     scrollerRef,
@@ -1177,10 +1406,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const vFarmIsMeasuredRef = useRef<((i: number) => boolean) | null>(null)
   // Mirrored for the interval bodies, which must not re-arm per render.
   const earlierBarInViewRef = useRef<() => boolean>(() => false)
-  const mountIndexRef = useRef<(index: number) => boolean>(() => false)
+  const mountIndexRef = useRef<(index: number, opts?: { unionOnly?: boolean }) => boolean>(() => false)
+  const estimateRowTopRef = useRef<(index: number) => number | null>(() => null)
 
   const [prefillHint, setPrefillHint] = useState(false)
+  // Whether the user has edited the seeded composer. The hint's expiry is armed
+  // by that first edit, not by the seed's arrival: a hand-off's error report is
+  // a dozen lines the user reads before touching anything, and a clock started
+  // at the seed collapsed the box from the prefill cap to the six-line typing
+  // cap under them mid-read, taking the "pre-filled" explanation with it.
+  const [prefillEdited, setPrefillEdited] = useState(false)
+  const raisePrefillHint = useCallback(() => { setPrefillHint(true); setPrefillEdited(false) }, [])
   const autoSendRef = useRef<string | null>(null)
+  const appLaunchSendRef = useRef<{ slotKey?: string } | null>(null)
   const [autoSendTick, setAutoSendTick] = useState(0)
   const newSessionRef = useRef(false)
   // True while the challenge-redirect token effect is creating/linking its
@@ -1189,8 +1427,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const tokenConsumingRef = useRef(
     typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('token'),
   )
-  const inputRef = useRef(input)
-  inputRef.current = input
+  // The composer text as of the last committed draft render. `ComposerDraftSync`
+  // (rendered below) advances it; the mid-switch guards below write it
+  // directly, and the next draft commit overwrites them.
+  const inputRef = useRef(composerDraft.get())
   // Holds the exact text a widget action pre-filled into the composer, so the
   // eventual user-initiated send can be tagged meta.origin='widget' for
  // forensic attribution. Set on widget pre-fill, consumed
@@ -1230,12 +1470,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   errorHandoffConnectedRef.current = connected
   errorHandoffModeRef.current = mode
 
-  // Auto-dismiss prefill hint after 10 seconds
+  // Auto-dismiss the prefill hint 10 seconds after the user starts editing the
+  // seed. Until then it holds: the band and the taller cap are what let the
+  // seeded text be read, and reading has no deadline.
   useEffect(() => {
-    if (!prefillHint) return
+    if (!prefillHint || !prefillEdited) return
     const t = setTimeout(() => setPrefillHint(false), 10000)
     return () => clearTimeout(t)
-  }, [prefillHint])
+  }, [prefillHint, prefillEdited])
 
   const processErrorHandoffs = useCallback(async () => {
     if (
@@ -1465,24 +1707,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       } else {
         if (activeSlot) { setDraft(drafts.current, activeSlot, pendingInput); saveDraftsDebounced() }
         setInput(pendingInput)
-        setPrefillHint(true)
+        raisePrefillHint()
       }
     }
-  }, [pendingInput, activeSlot, dispatch, searchParams, setSearchParams, saveDraftsDebounced, embedded])
-
-  // Consume chat launch intent from app-sdk (useChatLauncher writes to window.__mc_chat_launch)
-  useEffect(() => {
-    const launchWindow = window as Window & {
-      __mc_chat_launch?: { ts?: number; agent?: string; message?: string }
-    }
-    const intent = launchWindow.__mc_chat_launch
-    if (!intent || Date.now() - (intent.ts ?? 0) > 10_000) return
-    delete launchWindow.__mc_chat_launch
-    if (intent.agent) setPendingAgent(intent.agent)
-    if (intent.message) { autoSendRef.current = intent.message; newSessionRef.current = true }
-    // setPendingAgent is a stable useState setter, so including it keeps this a
-    // mount-only "consume the one-shot window global" effect.
-  }, [setPendingAgent])
+  }, [pendingInput, activeSlot, dispatch, searchParams, setSearchParams, saveDraftsDebounced, embedded, raisePrefillHint, setInput])
 
   // Consume ?prefill= — the no-main-window fallback path for navigation
   // intents forwarded from a popout (see utils/popoutController.ts). The
@@ -1505,7 +1733,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     sp.delete('prefill')
     const qs = sp.toString()
-    window.history.replaceState({}, '', window.location.pathname + (qs ? `?${qs}` : ''))
+    // PRESERVE the existing state: react-router keeps its stack position in
+    // history.state.idx, and replacing it with {} makes idx NaN for every
+    // later push — permanently disabling the top-bar Back/Forward arrows and
+    // the ⌘/Ctrl+arrow chords (routeHistoryPosition reads that bookkeeping).
+    window.history.replaceState(window.history.state, '', window.location.pathname + (qs ? `?${qs}` : ''))
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Consume prompt from token payload (channel challenge-and-redirect flow).
@@ -1532,7 +1764,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const token = new URLSearchParams(window.location.search).get('token')
     if (!token) { tokenConsumingRef.current = false; return }
     // Always strip token from URL to prevent leakage via referrer/history
-    window.history.replaceState({}, '', window.location.pathname)
+    // Preserves history.state for the same reason as the prefill strip above.
+    window.history.replaceState(window.history.state, '', window.location.pathname)
     const prompt = extractPromptFromToken(token)
     if (!prompt) { tokenConsumingRef.current = false; return }
     const { sessionKey, channel, threadTs } = extractSlackContextFromToken(token)
@@ -1556,7 +1789,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         // No targetSlot (or reconnect failed): create the session HERE and,
         // for a fresh thread, slack-link it so responses mirror to Slack.
         try {
-          const slot = await dispatch(createSlot({ mode })).unwrap()
+          const create = dispatch(createSlot({ mode }))
+          noCarryCreateIdsRef.current.add(create.requestId)
+          const slot = await create.unwrap()
           slotKey = slot?.key ?? null
         } catch {
           // ignore — fall back to prefilling the current slot
@@ -1580,8 +1815,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           JSON.stringify({ slotKey, prompt, ts: Date.now() }),
         )
       }
-      setInput(prompt)
-      setPrefillHint(true)
+      // While the switch to `slotKey` has not committed yet, the composer still
+      // belongs to the old session and a write here would persist the prompt
+      // into ITS draft. The slot-change effect restores the prompt from the
+      // prefill hand-off written above, so only write when the composer is
+      // already on the target (or there is no target to switch to).
+      if (!slotKey || composerSlotRef.current === slotKey) setInput(prompt)
+      raisePrefillHint()
       autoSendRef.current = prompt
       setAutoSendTick(t => t + 1)
      } finally {
@@ -1596,7 +1836,51 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // not the live activeSlot (see the composerSlotRef note above).
   // The draft key is composerSlotRef, which a ref does not need to be a
   // dependency of; the slot-change effect below handles the transition.
-  useEffect(() => { inputRef.current = input; const s = composerSlotRef.current; if (s) { setDraft(drafts.current, s, input); saveDraftsDebounced() } }, [input, saveDraftsDebounced])
+  // Runs from `ComposerDraftSync`'s effect, a child of this page, so it lands
+  // before this page's own effects in the same commit: ahead of the slot-change
+  // and composerSlotRef-advance effects, which is what keeps a keystroke batched
+  // with a switch on the slot it was typed in.
+  // Set where the file-chip reconciliation is defined (further down, after
+  // the helpers it needs); called on every committed draft text.
+  const reconcileFileChipsRef = useRef<((text: string) => void) | null>(null)
+  const onComposerDraftCommit = useCallback((text: string) => {
+    inputRef.current = text
+    const s = composerSlotRef.current
+    if (s) { setDraft(drafts.current, s, text); saveDraftsDebounced() }
+    updateHistoryQuery(text)
+    reconcileFileChipsRef.current?.(text)
+  }, [saveDraftsDebounced, updateHistoryQuery])
+  // Create-carry. The composer stays bound to the old slot until a create
+  // resolves, so anything typed in that window (a fast typist after the new-chat
+  // shortcut, or a click into the composer while the POST is slow) lands in the
+  // OLD slot's draft, and the activation then restores the new slot's empty draft
+  // over it: the text vanishes. Snapshot the composer when a create starts; the
+  // slot-change effect below moves only what was typed since into the new slot
+  // and puts the old slot's draft back as it was. Declared after the persist
+  // effect above, so `inputRef` already reflects a composer cleared in the same
+  // commit (the send path clears it before its create), and before the
+  // slot-change effect, which consumes the snapshot.
+  // Snapshots are kept per create requestId, so overlapping creates (two quick
+  // shortcut presses) each keep their own, and an activation consumes only the
+  // one its own create took. The snapshot also records the staged attachments
+  // and session refs: if any are staged when the create starts or when it
+  // activates, the carry is skipped and the whole draft stays together in the
+  // old session, as it did before the carry existed, rather than moving the
+  // text without its files.
+  type CreateCarry = { origin: string | null; baseline: string; staged: string }
+  const createCarryRef = useRef<Map<string, CreateCarry>>(new Map())
+  // Creates that write their own composer content and must never carry: the
+  // Slack-link token flow sets its prompt with setInput and auto-sends it, so
+  // carried text would be overwritten or sent. Typed text stays in the old
+  // session's draft for those, as on main.
+  const noCarryCreateIdsRef = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    if (foregroundCreateId && !noCarryCreateIdsRef.current.has(foregroundCreateId)) {
+      createCarryRef.current.set(foregroundCreateId, {
+        origin: composerSlotRef.current, baseline: inputRef.current, staged: stagedIdentity(stagedNowRef.current.files, stagedNowRef.current.sessions),
+      })
+    }
+  }, [foregroundCreateId])
   // Per-slot draft: save current → restore target (persisted to localStorage)
   useEffect(() => {
     // Re-hydrate from localStorage — only pull in keys we don't already have
@@ -1610,28 +1894,100 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const storedSessionRefs = loadSessionRefDrafts()
     for (const [k, v] of Object.entries(storedSessionRefs)) { if (!(k in sessionRefDrafts.current)) sessionRefDrafts.current[k] = v }
     if (prevSlot.current) setDraft(drafts.current, prevSlot.current, inputRef.current)
-    if (prevSlot.current) setFileDraft(fileDrafts.current, prevSlot.current, pendingFilesRef.current)
-    if (prevSlot.current) setPasteDraft(pasteDrafts.current, prevSlot.current, pasteBlocksRef.current)
-    if (prevSlot.current) setSessionRefDraft(sessionRefDrafts.current, prevSlot.current, pendingSessionsRef.current)
+    const stagedNow = stagedNowRef.current
+    if (prevSlot.current) setFileDraft(fileDrafts.current, prevSlot.current, stagedNow.files)
+    if (prevSlot.current) setPasteDraft(pasteDrafts.current, prevSlot.current, stagedNow.pastes)
+    if (prevSlot.current) setSessionRefDraft(sessionRefDrafts.current, prevSlot.current, stagedNow.sessions)
     const prevSlotVal = prevSlot.current
     prevSlot.current = activeSlot
+    // Create-carry (see createCarryRef): only on the transition the create itself
+    // made, from the slot the snapshot was taken on. A switch the user made while
+    // the create was pending keeps the create from activating at all, so it never
+    // matches here and a plain switch restores drafts exactly as before.
+    const activation = lastCreatedActivationRef.current
+    const carry = activation && activation.slot === activeSlot ? createCarryRef.current.get(activation.requestId) : undefined
+    // A consumed snapshot is spent. The others survive ordinary switches, so
+    // leaving and returning to the origin while a create is pending keeps the
+    // baseline the create started from. The map stays small: an entry is
+    // added per create, and the oldest are dropped past a handful.
+    if (carry && activation) createCarryRef.current.delete(activation.requestId)
+    while (createCarryRef.current.size > 8) createCarryRef.current.delete(createCarryRef.current.keys().next().value as string)
+    let carried: string | null = null
+    // Carry only a text-only draft: nothing staged when the create started and
+    // nothing staged now. A file or session ref staged at either end belongs
+    // with the caption, so the whole draft stays in the old session instead.
+    const nothingStaged = !!carry && carry.staged === NOTHING_STAGED && stagedIdentity(stagedNow.files, stagedNow.sessions) === NOTHING_STAGED
+    if (carry && activeSlot && prevSlotVal === carry.origin && nothingStaged) {
+      const typed = typedDuringCreate(carry.baseline, inputRef.current)
+      if (typed !== null) {
+        // A large paste in the window became a `[ Paste #N ]` token whose block
+        // sits in the old slot's paste list. The token and its block move
+        // together, renumbered against the new slot's own blocks, or the send
+        // would carry the bare token and the content would belong to no draft.
+        const blocks = stagedNow.pastes
+        const moved = carryPastes(typed, pruneBlocksUtil(typed, blocks), pasteDrafts.current[activeSlot] ?? [])
+        carried = moved.text
+        setPasteDraft(pasteDrafts.current, activeSlot, moved.pastes)
+        if (prevSlotVal) {
+          setDraft(drafts.current, prevSlotVal, carry.baseline)
+          setPasteDraft(pasteDrafts.current, prevSlotVal, pruneBlocksUtil(carry.baseline, blocks))
+        }
+      }
+    }
     const raw = sessionStorage.getItem(PREFILL_STORAGE_KEY)
-    const draftFallback = activeSlot ? drafts.current[activeSlot] ?? '' : ''
+    const storedDraft = activeSlot ? drafts.current[activeSlot] ?? '' : ''
+    const draftFallback = carried !== null ? appendTypedText(storedDraft, carried) : storedDraft
+    // What this switch put in the composer, for the create-carry re-arm below.
+    let restoredInput: string | null = null
+    const restoreInput = (value: string) => { restoredInput = value; setInput(value) }
+    // The prefill hint describes THIS composer's seeded text. A switch that
+    // restores a plain draft drops it; the hint no longer expires on its own
+    // clock, so without this it would follow the user to an unrelated session.
+    let seeded = false
     if (raw) {
       try {
         const { slotKey, prompt, ts } = JSON.parse(raw)
-        if (Date.now() - (ts ?? 0) > 30_000) { sessionStorage.removeItem(PREFILL_STORAGE_KEY); setInput(draftFallback) }
-        else if (slotKey === activeSlot) { sessionStorage.removeItem(PREFILL_STORAGE_KEY); consumedPrefillRef.current = `${slotKey}:${ts}`; setInput(prompt) }
-        else { setInput(draftFallback) }
-      } catch { sessionStorage.removeItem(PREFILL_STORAGE_KEY); setInput(draftFallback) }
+        if (Date.now() - (ts ?? 0) > 30_000) { sessionStorage.removeItem(PREFILL_STORAGE_KEY); restoreInput(draftFallback) }
+        else if (slotKey === activeSlot) {
+          sessionStorage.removeItem(PREFILL_STORAGE_KEY)
+          consumedPrefillRef.current = `${slotKey}:${ts}`
+          // A launcher seed and text typed during its create are both the user's;
+          // neither may overwrite the other.
+          restoreInput(carried !== null ? appendTypedText(prompt, carried) : prompt)
+          // Same hint the pendingInput and widget paths raise: it is what lifts the
+          // composer from its ~6-line typing cap to the prefill cap. Without it a
+          // hand-off's error report (13+ lines) sat in a 140px box showing only its
+          // tail, and nothing on the page said the composer had been seeded at all.
+          raisePrefillHint()
+          seeded = true
+        }
+        else { restoreInput(draftFallback) }
+      } catch { sessionStorage.removeItem(PREFILL_STORAGE_KEY); restoreInput(draftFallback) }
     } else if (prevSlotVal === activeSlot && !!activeSlot && consumedPrefillRef.current?.startsWith(`${activeSlot}:`)) {
+      // (see the note below) -- the composer still holds the seed, so the hint
+      // it arrived with stays too.
+      seeded = true
       // StrictMode re-invoked this mount effect for the SAME active slot after
       // the first invoke already consumed+removed the prefill. The composer
       // already holds the staged prompt; a setInput(draftFallback) here would
       // wipe it back to the empty draft. Leave the composer as-is. (A genuine
       // slot switch changes activeSlot, so prevSlotVal !== activeSlot and this
       // branch cannot mask a real draft restore.)
-    } else { setInput(draftFallback) }
+    } else { restoreInput(draftFallback) }
+    // The ?new=1 flow parks on a null slot while its create is in flight, so
+    // the activation comes from no slot. Only that switch, onto no slot,
+    // re-arms the snapshot against the composer it just restored; an ordinary
+    // switch keeps the snapshot the create took.
+    const pendingCreate = foregroundCreateIdRef.current
+    if (!activeSlot && pendingCreate && !noCarryCreateIdsRef.current.has(pendingCreate)) {
+      createCarryRef.current.set(pendingCreate, {
+        origin: activeSlot,
+        baseline: restoredInput ?? inputRef.current,
+        // What this switch is about to stage, not what the outgoing slot had.
+        staged: stagedIdentity(activeSlot ? fileDrafts.current[activeSlot] : undefined, activeSlot ? sessionRefDrafts.current[activeSlot] : undefined),
+      })
+    }
+    if (!seeded) setPrefillHint(false)
     // Restore the incoming slot's staged file attachments (copy so the
     // live state array and the stored draft don't share a reference).
     setPendingFiles(activeSlot ? (fileDrafts.current[activeSlot] ?? []).slice() : [])
@@ -1656,9 +2012,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     setUploadHint('')
     // A pane-level action failure ("Fork failed", "Could not read …") belongs to
     // the slot it happened in; carried over, it reads as the new slot's.
-    setActionError(null)
+    setActionError(prev => prev?.preserveOnSwitch ? prev : null)
     flushDrafts()
-  }, [activeSlot, flushDrafts])
+  }, [activeSlot, flushDrafts, raisePrefillHint, setInput])
   // Persist drafts on unmount (navigating away from chat page)
   useEffect(() => () => {
     if (saveDraftsTimer.current) { clearTimeout(saveDraftsTimer.current); saveDraftsTimer.current = null }
@@ -1680,9 +2036,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     window.addEventListener('beforeunload', h)
     return () => window.removeEventListener('beforeunload', h)
   }, [flushDrafts])
-  const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
+  const { rect: agentBtnRect, anchorTo: anchorAgentBtn } = useAnchoredTriggerRect(agentDropdown)
   const [projectPickerOpen, setProjectPickerOpen] = useState(false)
-  const [projectBtnRect, setProjectBtnRect] = useState<DOMRect | null>(null)
+  const { rect: projectBtnRect, anchorTo: anchorProjectBtn } = useAnchoredTriggerRect(projectPickerOpen)
 
   // Prevent Chrome from navigating to dropped files.
   // Must be on document to catch drops anywhere on the page.
@@ -1709,13 +2065,72 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // slots, clear on send, or sync against hand-edits — inserting the token
   // stages the chip, deleting the token (by any means) unstages it, and the
   // per-slot text draft persists the reference across slot switches for free.
-  const pendingDirs = useMemo(() => parseDirTokens(input).map(t => t.rel), [input])
+  const pendingDirsKey = useComposerDraftSelector(composerDraft, dirTokensKey)
+  const pendingDirs = useMemo(() => (pendingDirsKey ? pendingDirsKey.split('\0') : []), [pendingDirsKey])
   // Exact `@rel` composer token recorded per PICKER-PICKED file, so the file
   // chip's remove control can strip precisely the token the pick inserted —
   // the same remove contract folder chips have. Uploaded/dropped files never
   // get an entry (they have no token), so their remove stays state-only. A
   // ref, not state: it never drives rendering. Entries die with their chip.
-  const pickedFileTokens = useRef<Record<string, string>>({})
+  //
+  // Keyed by SLOT first, then absolute path, then an ARRAY of every `@rel`
+  // alias ever recorded for that path in this slot (`pickedFileTokens.current
+  // [slot][absPath] = ['@src/main.ts', '@main.ts']`) -- five review rounds on
+  // progressively narrower shapes each found a different way the previous
+  // shape lost information:
+  //  1-3. A flat, path-only `Record<absPath, token>` let a DIFFERENT slot's
+  //     pick/send/staging corrupt this slot's entry through the shared key.
+  //     Moot once each slot owns its own sub-map, reachable ONLY through
+  //     composerSlotRef -- a foreign slot's entry can never be read as this
+  //     slot's own.
+  //  4-5. Even slot-scoped, a single STRING per path only remembers the LAST
+  //     alias recorded. If the slot's project changes and the same file gets
+  //     a SECOND `@rel` alias (a fresh pick, or an already-typed mention in
+  //     the new form), the second pick overwrote the first alias outright --
+  //     deleting the NEW alias then unstaged the file even though the text
+  //     still carried the ORIGINAL alias untouched. An array keeps every
+  //     alias ever recorded; the file counts as mentioned if ANY of them is
+  //     still in the text, and unstages only once NONE are.
+  // Producer/consumer seam table (every site that writes or reads this map;
+  // keep it current -- it is the one place the full population is enumerated):
+  //   record:   recordSlotToken (file pick / typed-mention adoption)
+  //   restore:  mergeSlotTokens <- transport-failure, queued-cancel stash,
+  //             create-failure (all three recovery arms restore aliases)
+  //   clear:    send-clear (captures sentSlotTokens first), slot teardown
+  //   read:     reconciliation effect, insertion clamp,
+  //             remove-chip strip, send-boundary replaceTokens
+  //   outside:  fileDrafts persistence (reload/cross-tab, #11256), steer
+  //             (attachments discarded by design), split-view pane (no
+  //             alias consumer -- see ChatPane's restoreDraft adapter)
+  const pickedFileTokens = useRef<Record<string, Record<string, string[]>>>({})
+  // useCallback (not a plain function) purely so a caller wrapped in its own
+  // useCallback/useEffect gets a STABLE reference to depend on -- the body
+  // only reads refs, which never change identity, so `[]` deps are already
+  // exhaustive.
+  const currentSlotTokens = useCallback(() => {
+    const slot = composerSlotRef.current
+    if (!slot) return null
+    return pickedFileTokens.current[slot] ??= {}
+  }, [])
+  /** Append `token` as an alias for `absPath` in the CURRENT slot's token map,
+   *  deduping exact repeats. No-ops outside a known slot. */
+  const recordSlotToken = useCallback((absPath: string, token: string) => {
+    const slotTokens = currentSlotTokens()
+    if (!slotTokens) return
+    const aliases = slotTokens[absPath] ?? []
+    if (!aliases.includes(token)) slotTokens[absPath] = [...aliases, token]
+  }, [currentSlotTokens])
+  /** Merge a captured alias sub-map back into `slot`'s live token map,
+   *  deduping exact repeats -- the one restore-side primitive every
+   *  composer-recovery path shares (transport failure, queued cancel,
+   *  create failure). See the seam table on `pickedFileTokens`. */
+  const mergeSlotTokens = useCallback((slot: string, aliases: Record<string, string[]>) => {
+    const live = pickedFileTokens.current[slot] ??= {}
+    for (const [p, toks] of Object.entries(aliases)) {
+      const cur = live[p] ?? []
+      live[p] = [...cur, ...toks.filter(t => !cur.includes(t))]
+    }
+  }, [])
   const [snipFrame, setSnipFrame] = useState<HTMLCanvasElement | null>(null)
   // The slot that INITIATED the current snip. getDisplayMedia + cropping is
   // async and the user may switch slots meanwhile, so the cropped image must
@@ -1734,6 +2149,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // Draft key is composerSlotRef; the slot-change effect handles that
     // transition.
   }, [pendingFiles, saveDraftsDebounced])
+  // File-chip <-> composer-text reconciliation lives below, right after
+  // handleAddToContext (search "pickedFileTokens reconciliation").
   // Collapsed paste blocks backing the `[ Paste #N · M lines ]` tokens in
   // `input`. Persisted per-slot via chatPasteDrafts (localStorage, 30-day TTL)
   // so they survive slot switches / refresh; cleared on send and slot delete.
@@ -1755,6 +2172,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // pane. Serialized as LINKS on send — never the referenced transcript.
   const [pendingSessions, setPendingSessions] = useState<SessionRef[]>([])
   const pendingSessionsRef = useRef(pendingSessions)
+  // Render-current staged resources for the slot-change effect. The three refs
+  // above sync in effects declared AFTER that effect, so within one commit it
+  // would read the previous render's files, pastes and session refs. This one is
+  // written during render, so every effect sees the current values.
+  const stagedNowRef = useRef({ files: pendingFiles, pastes: pasteBlocks, sessions: pendingSessions })
+  stagedNowRef.current = { files: pendingFiles, pastes: pasteBlocks, sessions: pendingSessions }
   useEffect(() => {
     pendingSessionsRef.current = pendingSessions
     // Key off composerSlotRef, not activeSlot (see the composerSlotRef note).
@@ -1817,1027 +2240,122 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // restore chips per slot) and stale keys are harmless.
   const [resizedInfo, setResizedInfo] = useState<Record<string, ResizeInfo>>({})
   const isMac = useAppSelector(s => s.dashboard.status?.platform) === 'darwin'
-  const { data: sttCfg } = useQuery({
-    queryKey: ['sttConfig'],
-    queryFn: () => api.sttConfig() as Promise<{ streaming?: boolean; enabled?: boolean; dictation_panel?: boolean; available?: boolean; provider?: string }>,
-  })
-  const sttStreaming = !!sttCfg?.streaming
-  const sttEnabled = !!sttCfg?.enabled
-  // The backend probes for the provider's binary and reports `available`.
-  // Default true so a not-yet-loaded config doesn't flash the modal; the
-  // separate sttConfigLoaded guard already covers the pre-load case.
-  const sttAvailable = sttCfg?.available !== false
-  // The LOCALISED provider name, not the wire id: the modal puts it in a
-  // sentence, and a bare id reads as a typo there ("local is not installed").
-  const sttProvider = providerLabel(sttCfg?.provider || '')
-  // Default true so the panel is the standard recording surface; the backend
-  // sends an explicit boolean, so `undefined` here means "config not loaded yet"
-  // rather than "off", and a pre-load recording would otherwise flash the bar.
-  const sttDictationPanel = sttCfg?.dictation_panel !== false
-  // Treat "config not loaded yet" as disabled so the guard never lets a
-  // recording start before STT is confirmed on. Stable boolean so toggleVoice's
-  // deps don't churn on every sttCfg object identity from a refetch.
-  const sttConfigLoaded = !!sttCfg
-  // Opened when the user clicks the mic while STT is disabled — points them at
-  // the setting that turns it on instead of starting a recording that would
-  // never be transcribed.
-  const [voiceSetupOpen, setVoiceSetupOpen] = useState(false)
-  const frozenInputRef = useRef<string | null>(null)
-  // Caret snapshot taken alongside frozenInputRef, so a streaming partial (and
-  // the final that replaces it) keeps inserting at the same spot. The batch
-  // path leaves both null and reads the LIVE composer caret instead.
-  const frozenCaretRef = useRef<{ start: number; end: number } | null>(null)
-  // Live composer caret, kept current by ChatInput (onSelect / click / typing).
-  // Dictation splices the transcript in HERE instead of always appending at end.
-  const voiceCaretRef = useRef<{ start: number; end: number } | null>(null)
-  // Caret offset ChatInput should restore after a dictation-driven value update
-  // lands (set by the splice below, consumed + cleared inside ChatInput).
-  const voicePendingCaretRef = useRef<number | null>(null)
-  // Drops late-arriving partials/finals for the CURRENT slot after a send.
-  // `stop()` is async (up to 5s for backend close) — without this guard, a
-  // delayed onFinal would repopulate the composer with text the user already
-  // sent. Cross-SLOT safety is handled separately by session-scoped routing
-  // (see applyVoiceText + voice.sessionOwner).
-  const sttDisarmedRef = useRef(false)
-  // Narrower sibling of `sttDisarmedRef`, for a MANUAL STOP of a streaming
-  // recording that already put a hypothesis in the composer.
+  // Voice dictation is the Composer's Voice atom (chat-core P3-b): ChatPage no
+  // longer runs the hook or wires 23 props. It supplies, through the `Composer`
+  // root below, only what the atom cannot know on its own: which slot the
+  // composer currently shows (the draft-settlement predicate), where an
+  // off-screen batch transcript goes (that slot's persisted draft), the
+  // endpointer's auto-submit, and that this is the surface owning the
+  // document-wide push-to-talk key. `composerRef` reaches the atom's controls
+  // from send().
   //
-  // One flag was doing two jobs, and a manual stop only wants one of them.
-  // `applyVoiceText` APPENDS (`base + ' ' + text`), so the close-time final
-  // landing on a composer that already holds the hypothesis duplicates the
-  // utterance ("hello hello") — that has to stay suppressed. But `onPartial`
-  // REPLACES the region at the frozen boundary, and the hook re-emits
-  // `finals.join(' ')` through it on every `final` message while `stop()`
-  // deliberately leaves the socket draining. Suppressing that too meant every
-  // segment Transcribe stabilised AFTER the release was dropped, so the user
-  // was left holding the last UNSTABLE hypothesis. On a push-to-talk hold that
-  // is the common case, not a corner: the hold is short, so the tail of the
-  // utterance is exactly the part still unstable at release.
-  //
-  // So: this flag suppresses the append only, and leaves the drain's own
-  // corrections free to keep replacing the region until the socket closes.
-  // Cancel, send and slot-switch still want EVERYTHING suppressed and keep
-  // using `sttDisarmedRef` — the user discarded, already sent, or left.
-  const sttAppendDisarmedRef = useRef(false)
-  // The composer content UP TO the end of the region onPartial last inserted,
-  // plus the whole value it wrote. Dictation splices at the caret, so it can sit
-  // mid-draft with an existing tail after it — and typing after the release
-  // lands at the restored caret, i.e. between the two. Anchoring on the PREFIX
-  // (not the whole value) is what lets a drain-time update replace the corrected
-  // region and keep everything after it verbatim; anchoring on the whole value
-  // would fail its own startsWith check mid-draft and drop the correction.
-  // The full value distinguishes "the user typed" from "nothing changed", which
-  // decides whether the caret may be moved.
-  const lastDictationAnchorRef = useRef<string | null>(null)
-  const lastDictationValueRef = useRef<string | null>(null)
-  // Sticky for the whole post-stop drain: once the user has typed, the caret is
-  // theirs until dictation restarts. Recomputing "did they edit?" per update is
-  // not enough — after the first correction carries the suffix across, the
-  // composer matches what we wrote again, so a second correction would decide
-  // nothing was edited and yank the caret back in front of the typed text.
-  const postStopEditedRef = useRef(false)
-  // Suppresses ONLY the auto-submit route, and unlike the append flag it is set
-  // by EVERY manual stop of a streaming recording — including a cold-stream stop
-  // where no partial landed. "Stop capturing" is never "send": without this, a
-  // short press against a cold stream leaves the endpointer armed, and a
-  // trailing final's endpoint verdict submits the turn the user never asked to
-  // send. The append flag cannot carry this, because with no partial landed the
-  // close-time final is the only copy of the utterance and must still land.
-  const sttEndpointDisarmedRef = useRef(false)
-  // A frozen caret is a position in the composer as it stood at the release. Once
-  // the user edits after that, it can go stale in two ways, and both corrupt the
-  // splice: a RANGE (dictating over a selection replaces it) whose selection they
-  // have since typed over, and an OFFSET whose meaning shifts when they edit text
-  // BEFORE it. Rebase it onto the current text instead of trusting or discarding
-  // it wholesale — discarding it would put the transcript after text they wrote
-  // later, trusting it would cut into text they wrote earlier.
-  const rebaseFrozenCaret = useCallback(() => {
-    if (!sttEndpointDisarmedRef.current) return
-    const frozen = frozenCaretRef.current
-    const released = lastDictationValueRef.current
-    const cur = inputRef.current ?? ''
-    // Untouched composer: a selection here is still a legitimate replacement
-    // target, which is what dictating over a selection is supposed to do.
-    if (!frozen || released === null || cur === released) return
-    // Bound the edit to the region between the longest common prefix and suffix.
-    let lcp = 0
-    while (lcp < released.length && lcp < cur.length && released[lcp] === cur[lcp]) lcp++
-    let lcs = 0
-    while (
-      lcs < released.length - lcp && lcs < cur.length - lcp &&
-      released[released.length - 1 - lcs] === cur[cur.length - 1 - lcs]
-    ) lcs++
-    const start = frozen.start
-    let next: number
-    if (start <= lcp) next = start                                    // edit is after it
-    else if (start >= released.length - lcs) next = start + (cur.length - released.length)
-    else next = voiceCaretRef.current?.start ?? start                 // edit straddles it
-    next = Math.max(0, Math.min(next, cur.length))
-    frozenCaretRef.current = { start: next, end: next }
-  }, [])
-  // The hook's EFFECTIVE streaming mode: streaming is only truly active when the
-  // config asks for it AND the browser supports it (AudioWorklet/WS). Mirrored
-  // from voice.streamEnabled (set by the effect below, once `voice` exists) so
-  // the disarm + cross-slot-routing decisions gate on what the hook ACTUALLY
-  // runs, not the raw config. Keying those on the config alone would, in a
-  // browser without AudioWorklet, treat a batch-fallback session as streaming
-  // and disarm/drop its (only) transcript.
-  const streamEnabledRef = useRef(false)
   // Forward ref to send() (defined far below) so the streaming endpointer's
-  // auto-submit callback — wired into the voice hook here, above send — can
-  // fire it. Kept fresh by an effect after send is declared.
+  // auto-submit callback — handed to the atom here, above send — can fire it.
+  // Kept fresh by an effect after send is declared.
   const sendRef = useRef<((optionText?: string, targetSlot?: string) => void) | null>(null)
-  // Deliver a finished transcript to the slot that INITIATED the recording,
-  // using the session id useVoiceInput snapshotted at record-start (falling back
-  // to the active slot for the ordinary same-slot case). Same-slot splices into
-  // the live composer; a background slot gets it appended to its persisted draft
-  // (recoverable, shown on return) instead of leaking into the active session or
-  // being dropped. Mirrors handleOptimizeResult's cross-slot routing.
-  // Splice a dictation transcript into `base` at the caret (frozen snapshot
-  // when streaming, else the live caret), returning the new value and the caret
-  // offset to restore. Falls back to appending when no caret is known (e.g. the
-  // composer was never focused).
-  const spliceDictation = useCallback((base: string, text: string): { value: string; caret: number } => {
-    const caret = frozenCaretRef.current ?? voiceCaretRef.current
-    // An empty transcript (e.g. a silent streaming partial) must NOT mutate the
-    // draft: splicing "" across a selection would delete the selected range.
-    // Leave the base untouched and collapse the caret to the insertion point.
-    if (!text) return { value: base, caret: caret ? Math.min(caret.start, base.length) : base.length }
-    if (!caret) {
-      const value = base ? (base.endsWith(' ') ? base + text : base + ' ' + text) : text
-      return { value, caret: value.length }
-    }
-    const start = Math.min(caret.start, base.length)
-    const end = Math.min(caret.end, base.length)
-    const before = base.slice(0, start)
-    const after = base.slice(end)
-    // Leading space only when joining onto a non-space char, so mid-sentence
-    // dictation doesn't glue onto the preceding word.
-    // Leading/trailing space uses whitespace-class checks (not only ' ') so a
-    // caret beside a newline or tab doesn't get an unwanted literal space.
-    const lead = before && !/\s$/.test(before) && !/^\s/.test(text) ? ' ' : ''
-    const trail = after && !/^\s/.test(after) && !/\s$/.test(text) ? ' ' : ''
-    const insert = lead + text
-    return { value: before + insert + trail + after, caret: before.length + insert.length }
-  }, [])
-  const applyVoiceText = useCallback((text: string, sessionId: string | null, origin: TranscriptOrigin) => {
-    // Disarmed after a send (streaming) — the transcript was already sent, so
-    // drop it for EVERY route. Checked FIRST (before the cross-slot branch) so a
-    // late final can't slip the already-sent text back into the originating
-    // slot's draft.
-    //
-    // `sttAppendDisarmedRef` covers the narrower case: a manual stop whose
-    // hypothesis is already in the composer. This route APPENDS, so letting the
-    // close-time final through there would duplicate the utterance.
-    //
-    // Both are STREAMING-only states — every site that arms them is gated on
-    // streaming — so they are keyed on where the text came from, not on the mode
-    // selected right now. A batch transcription can outlive the page that started
-    // it and land after streaming was switched on, and its onstop transcript is
-    // always the only copy: suppressing it would delete what the user said.
-    if (origin === 'stream' && (sttDisarmedRef.current || sttAppendDisarmedRef.current)) return
-    const target = sessionId ?? activeSlotRef.current
-    const append = (base: string) => (base ? (base.endsWith(' ') ? base + text : base + ' ' + text) : text)
-    // Splice into the LIVE composer only when the target slot is both the active
-    // slot AND the slot the composer's `input` currently belongs to. On a slot
-    // switch, activeSlotRef updates synchronously in render, but the composer's
-    // draft-restore + composerSlotRef advance run in LATER effects — splicing in
-    // that unsettled window would let the pending draft restore overwrite the
-    // transcript. Otherwise route to the target slot's persisted draft.
-    const onScreen = target === activeSlotRef.current && composerSlotRef.current === target
-    if (!onScreen) {
-      // Off-screen (or not-yet-settled) delivery is BATCH ONLY. Streaming splices
-      // its live hypothesis into `input`, which is flushed into the draft on
-      // switch, so a cross-slot append would double it — a streaming final that
-      // lands off its slot is dropped (pre-existing behaviour). Batch has no
-      // partial, so appending to the slot's draft is unambiguous. Keyed on the
-      // text's origin rather than the live streaming setting, which is a proxy
-      // that goes wrong for a batch transcript arriving after the mode changed.
-      if (!target || origin === 'stream') return
-      const next = append(drafts.current[target] ?? '')
-      setDraft(drafts.current, target, next)
-      // Mid-switch guard: if the composer still belongs to `target` (activeSlot
-      // has advanced in render but the outgoing-slot persist effect hasn't run
-      // yet), that effect will flush inputRef.current into drafts[target] and
-      // would overwrite this transcript with the pre-transcript input. Carry the
-      // appended value into inputRef too so the flush preserves the transcript.
-      if (composerSlotRef.current === target) inputRef.current = next
-      saveDrafts()
-      return
-    }
-    // Foreground: streaming seeds frozenInputRef/frozenCaretRef in onPartial
-    // (the pre-dictation snapshot); the batch path never fires onPartial so both
-    // are null — fall back to the live composer text + caret so the transcript
-    // inserts at the cursor instead of overwriting (or blindly appending to)
-    // what the user typed.
-    rebaseFrozenCaret()
-    const spliced = spliceDictation(frozenInputRef.current ?? inputRef.current ?? '', text)
-    // Only arm the caret restore when the value actually changes. If a streaming
-    // final equals the last partial, setInput is a no-op and the restore effect
-    // (keyed on `value`) never fires — leaving a stale pending caret that would
-    // hijack the user's NEXT edit.
-    if (spliced.value !== inputRef.current) {
-      setInput(spliced.value)
-      voicePendingCaretRef.current = spliced.caret
-    }
-    frozenInputRef.current = null
-    lastDictationAnchorRef.current = null
-    lastDictationValueRef.current = null
-    postStopEditedRef.current = false
-    frozenCaretRef.current = null
-  }, [saveDrafts, spliceDictation, rebaseFrozenCaret])
-  const voice = useVoiceInput(
-    applyVoiceText,
-    {
-      streaming: sttStreaming,
-      sessionId: activeSlot,
-      onPartial: useCallback((text: string, sessionId: string | null) => {
-        // Streaming partials only fire while the originating slot is on screen
-        // (switching slots stops the stream), so a partial attributed to any
-        // other slot is a late straggler — drop it rather than smear a
-        // half-word into the wrong session.
-        if (sessionId && sessionId !== activeSlotRef.current) return
-        // Deliberately NOT gated on `sttAppendDisarmedRef`: after a manual stop
-        // the socket is still draining, and this is the route that carries the
-        // stabilised text. It REPLACES the region at the frozen boundary rather
-        // than appending, so letting it keep firing cannot duplicate anything —
-        // it is what turns the last unstable hypothesis into the real transcript.
-        if (sttDisarmedRef.current) return
-        // Snapshot the pre-dictation text AND caret on the first partial
-        // (before setInput, so the updater stays pure — no ref mutation inside a
-        // function React may invoke twice) so every later partial and the final
-        // insert at the same spot, replacing the growing hypothesis.
-        if (frozenInputRef.current === null) {
-          frozenInputRef.current = inputRef.current
-          // Do not clobber a caret a cold-stream stop already froze: that one is
-          // the release-time insertion point, and the live caret is now wherever
-          // the user has typed since.
-          frozenCaretRef.current = frozenCaretRef.current ?? voiceCaretRef.current
-        }
-        rebaseFrozenCaret()
-        const spliced = spliceDictation(frozenInputRef.current ?? '', text)
-        // Everything up to and including the dictated insertion. What follows it
-        // in the composer (an existing tail, and anything typed after release) is
-        // carried across untouched rather than rebuilt from the snapshot.
-        const anchor = spliced.value.slice(0, spliced.caret)
-        let next = spliced.value
-        // Where the caret should end up. Defaults to the end of the dictated
-        // region (the ordinary "we own the composer" case); the post-stop branch
-        // overrides it when the text is the user's to steer.
-        let caretTarget: number | null = spliced.caret
-        if (sttEndpointDisarmedRef.current) {
-          // POST-STOP DRAIN. The user has let go, so as far as they are concerned
-          // dictation is over and they may already be typing — at the restored
-          // caret, which for mid-draft dictation sits in the MIDDLE of the text.
-          // Rebuilding from the frozen snapshot would delete that typing, so
-          // verify our own prefix is still intact and splice the correction in
-          // ahead of whatever now follows it. If the prefix cannot be verified
-          // the user edited inside the dictated region; leave the composer alone
-          // rather than guess — same policy as cancelVoice, for the same reason:
-          // a heuristic here deletes user-authored text.
-          //
-          // Gated on the ENDPOINT flag, not the append flag: a cold-stream stop
-          // deliberately leaves the append armed (the close-time final is the
-          // only copy of the utterance), so keying off it would skip this branch
-          // in exactly the case where it is still needed.
-          //
-          // During recording this does not apply: the region is being actively
-          // rewritten and that behaviour is unchanged.
-          const prev = lastDictationAnchorRef.current
-          const cur = inputRef.current ?? ''
-          // The composer now holds a copy of the utterance, which is the exact
-          // condition the append flag encodes — so close the close-time route
-          // here rather than at stop time. stopVoice could not decide this: with
-          // frozenInputRef still null it had to leave the append armed, because
-          // back then the close-time final really was the only copy. Once a drain
-          // partial has landed that is no longer true, and letting the final
-          // through would re-splice from the snapshot and delete whatever the
-          // user typed after the release.
-          sttAppendDisarmedRef.current = true
-          // Checked OUTSIDE the anchor guard: on a cold stream the first drain
-          // partial has no anchor yet, but the user may already have typed since
-          // the release, and their caret must still be left alone.
-          if (cur !== lastDictationValueRef.current) postStopEditedRef.current = true
-          // A null anchor means no partial has landed yet — the cold-stream stop.
-          // This IS the first write: there is nothing to preserve and nothing to
-          // verify, and returning here would drop the utterance. Fall through to
-          // the plain write, which establishes the anchor for the next update.
-          // The typed text is inside the snapshot (taken from the LIVE composer)
-          // and the insertion point is the caret stopVoice froze at the release,
-          // so the transcript lands where the user was speaking rather than after
-          // what they wrote afterwards.
-          if (prev !== null) {
-            if (!cur.startsWith(prev)) return
-            next = anchor + cur.slice(prev.length)
-            if (postStopEditedRef.current) {
-              // Their caret is in their own text, so it must not be dragged to the
-              // end of the dictation — but NOT arming it is not "leaving it
-              // alone" either: React replaces the textarea value and the browser
-              // resets the DOM caret to the end. Re-arm it at the same LOGICAL
-              // spot, shifted by how much the region ahead of it grew or shrank.
-              const live = voiceCaretRef.current
-              caretTarget = live && live.start >= prev.length
-                ? live.start + (anchor.length - prev.length)
-                : null
-            }
-          } else if (postStopEditedRef.current) {
-            // Cold-stream first write with typing already done: there is no old
-            // anchor to measure a shift against, and the value commit leaves the
-            // caret at the end — which is past their text, a sane place to be.
-            caretTarget = null
-          }
-        }
-        if (next !== inputRef.current) {
-          setInput(next)
-          if (caretTarget !== null) voicePendingCaretRef.current = caretTarget
-        }
-        lastDictationAnchorRef.current = anchor
-        lastDictationValueRef.current = next
-      }, [spliceDictation, rebaseFrozenCaret]),
-      // Semantic endpointing (stt.endpointing) judged the utterance complete:
-      // auto-submit. The composer already holds the streamed transcript via
-      // onPartial, and send() reads inputRef.current + stops the live capture
-      // itself (its recording+streaming branch), so this is the same path as
-      // pressing Enter mid-dictation — just triggered by the backend verdict.
-      onEndpoint: useCallback(() => {
-        // A manual stop is the user saying "stop capturing", so a backend
-        // endpoint verdict arriving during the drain must not turn that into an
-        // unrequested send. The endpoint flag is what covers a COLD-stream stop,
-        // where no partial landed and the append flag is deliberately left unset
-        // so the close-time final can still deliver the utterance.
-        if (sttDisarmedRef.current || sttAppendDisarmedRef.current || sttEndpointDisarmedRef.current) return
-        sendRef.current?.()
-      }, []),
-    }
-  )
-  // Keep a ref to the latest `voice` so effects that intentionally omit
-  // `voice` from their deps always invoke the current instance — otherwise
-  // they'd capture a stale `toggle`/`recording` whenever `voice` identity
-  // changes (e.g. when `sttStreaming` flips).
-  const voiceRef = useRef(voice)
-  useEffect(() => { voiceRef.current = voice }, [voice])
-  // Same reason as voiceRef: send() deliberately keeps a minimal dep array (with
-  // an exhaustive-deps suppression), so reading `sttStreaming` directly there
-  // would close over the value from the render that created that send().
-  // Keep streamEnabledRef in sync with the hook's EFFECTIVE streaming mode (see
-  // its declaration above). send()/the slot-switch effect/toggleVoice read it to
-  // decide whether a draining final should be disarmed — which must reflect what
-  // the hook actually runs, not the raw config.
-  useEffect(() => { streamEnabledRef.current = voice.streamEnabled }, [voice.streamEnabled])
-  // Re-arm when the user explicitly (re)starts recording — wrap toggle.
-  // Depend on the individual stable members actually read so this callback
-  // is only re-created when they change. `[voice]` would recreate every
-  // render (hooks don't memoize their return by default), re-rendering all
-  // child components that receive `toggleVoice` as a prop.
-  /**
-   * Start voice capture, with the gating and state resets every entry point
-   * needs. Extracted from `toggleVoice` so the push-to-talk key driver
-   * (`usePushToTalk`) goes through the SAME preamble — calling `voice.start()`
-   * raw would skip the disarm reset and the frozen-snapshot clear, and a
-   * key-started dictation would then be rebuilt from stale pre-dictation text.
-   *
-   * RETURNS the start promise. Load-bearing, not incidental: `usePushToTalk`
-   * chains on it to stop a session whose async startup only finished after the
-   * key was already released. Swallowing it here leaves that guard unreachable
-   * and the microphone open with nothing holding it.
-   *
-   * `silent` suppresses the "voice needs setting up" modal. The key binding is a
-   * PASSIVE trigger — a bare modifier is also an ordinary typing modifier — so a
-   * keystroke that used to type a character must never throw an unsolicited
-   * dialog. Clicking the mic button is a deliberate request and still explains
-   * itself.
-   */
-  const startVoice = useCallback((opts?: { silent?: boolean }): Promise<void> | void => {
-    // Starting a recording while server-side STT is disabled would capture
-    // audio that never gets transcribed. Point the user at the enable setting
-    // instead — unless this came from the keyboard (see `silent`).
-    if (!sttConfigLoaded || !sttEnabled || !sttAvailable) {
-      if (!opts?.silent) setVoiceSetupOpen(true)
-      return
-    }
-    // Exclusive sessions: the mic is a single shared device, so refuse to
-    // START a new recording while another session's transcription is still
-    // in flight (voice.transcribing). This is what keeps voice single-session
-    // — no two recordings/transcriptions ever overlap — so the busy state
-    // needs only a single owner and can never be misattributed.
-    if (voice.transcribing) return
-    sttDisarmedRef.current = false
-    sttAppendDisarmedRef.current = false
-    sttEndpointDisarmedRef.current = false
-    // Reset stale snapshot from a prior session that ended without
-    // finals — otherwise onPartial sees a non-null ref, skips
-    // re-snapshotting, and text typed between sessions is dropped.
-    frozenInputRef.current = null
-    lastDictationAnchorRef.current = null
-    lastDictationValueRef.current = null
-    postStopEditedRef.current = false
-    frozenCaretRef.current = null
-    return voice.start()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [voice.transcribing, voice.start, sttEnabled, sttConfigLoaded, sttAvailable])
+  const composerRef = useRef<ComposerHandle>(null)
+  // Live composer caret, kept current by ChatInput; the resources controller
+  // splices a picked file token at it, and dictation splices the transcript at
+  // it — so ChatPage owns the refs and hands them to the atom.
+  const voiceCaretRef = useRef<{ start: number; end: number } | null>(null)
+  const voicePendingCaretRef = useRef<number | null>(null)
+  // Splice into the LIVE composer only when the target slot is both the active
+  // slot AND the slot the composer's `input` currently belongs to. On a slot
+  // switch, activeSlotRef updates synchronously in render, but the composer's
+  // draft-restore + composerSlotRef advance run in LATER effects — splicing in
+  // that unsettled window would let the pending draft restore overwrite the
+  // transcript.
+  const voiceIsComposerFor = useCallback((target: string | null) => target === activeSlotRef.current && composerSlotRef.current === target, [])
+  // Off-screen batch transcript: append to the target slot's persisted draft
+  // (recoverable, shown on return). Mirrors handleOptimizeResult's cross-slot
+  // routing.
+  const voiceDeliverOffScreen = useCallback((target: string, append: (base: string) => string) => {
+    const next = append(drafts.current[target] ?? '')
+    setDraft(drafts.current, target, next)
+    // Mid-switch guard: if the composer still belongs to `target` (activeSlot
+    // has advanced in render but the outgoing-slot persist effect hasn't run
+    // yet), that effect will flush inputRef.current into drafts[target] and
+    // would overwrite this transcript with the pre-transcript input. Carry the
+    // appended value into inputRef too so the flush preserves the transcript.
+    if (composerSlotRef.current === target) inputRef.current = next
+    saveDrafts()
+  }, [saveDrafts])
+  const voiceAutoSubmit = useCallback(() => { sendRef.current?.() }, [])
+  const composerVoiceOptions = useMemo<ComposerVoiceOptions>(() => ({
+    isComposerFor: voiceIsComposerFor,
+    deliverOffScreen: voiceDeliverOffScreen,
+    onAutoSubmit: voiceAutoSubmit,
+    pushToTalk: true,
+    caretRef: voiceCaretRef,
+    pendingCaretRef: voicePendingCaretRef,
+    settingsRoute: embedded ? '/embed/settings' : settingsPath({ tab: 'voice' }),
+  }), [voiceIsComposerFor, voiceDeliverOffScreen, voiceAutoSubmit, embedded])
 
-  /** Stop voice capture. Always allowed — only starting is gated. */
-  const stopVoice = useCallback(() => {
-    // Manual stop of a STREAMING recording: streamStop() drains the socket
-    // asynchronously, so more of the utterance can still arrive. Two routes are
-    // in play and they need OPPOSITE treatment, which is why this sets the
-    // narrow flag rather than the blanket one:
-    //
-    //   - `applyVoiceText` (close-time) APPENDS. The composer already holds the
-    //     hypothesis, so letting it through duplicates the utterance. Suppress.
-    //   - `onPartial` (drain-time) REPLACES the region at the frozen boundary,
-    //     and the hook re-emits `finals.join(' ')` through it as Transcribe
-    //     stabilises each segment. That is the authoritative text. Keep armed.
-    //
-    // Only suppress once the composer actually holds a copy of the speech, which
-    // is exactly what frozenInputRef being set means (onPartial snapshots it on
-    // the FIRST partial, then writes each hypothesis into `input`).
-    //
-    // With frozenInputRef still null NO partial has landed, so the composer
-    // holds nothing and the close-time final is the ONLY copy of the utterance:
-    // suppressing there silently deletes what the user just said. That is the
-    // ordinary case for a short press against a COLD stream, where the release
-    // beats the server's first partial. (Batch is likewise never suppressed
-    // here: its onstop transcript is always the only copy.)
-    if (streamEnabledRef.current && frozenInputRef.current !== null) {
-      sttAppendDisarmedRef.current = true
-    }
-    // Unconditional for a streaming stop: the auto-submit route must close even
-    // when the append route stays open (the cold-stream case above).
-    if (streamEnabledRef.current) {
-      sttEndpointDisarmedRef.current = true
-    }
-    if (streamEnabledRef.current && frozenInputRef.current === null) {
-      // COLD STREAM: no partial landed, so nothing has pinned the insertion point
-      // yet. Freeze the CARET at the release, so a drain partial arriving after
-      // the user has started typing still inserts where they were speaking
-      // instead of after the text they wrote afterwards.
-      //
-      // Deliberately NOT freezing the text as well: with no partial landed the
-      // close-time final is the only copy of the utterance and must splice into
-      // the LIVE composer. Pinning the text here would make it rebuild from the
-      // release-time snapshot and delete anything typed after the release —
-      // trading a wrong insertion point for lost text.
-      //
-      // The value fingerprint is seeded too, so the first drain partial can tell
-      // that the user has typed since the release and leave their caret alone.
-      frozenCaretRef.current = voiceCaretRef.current
-      lastDictationValueRef.current = inputRef.current
-    }
-    voice.stop()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [voice.stop])
-
-  const toggleVoice = useCallback(() => {
-    if (voice.recording) stopVoice()
-    else startVoice()
-    // Depends on the individual member actually read (`voice.recording`), not the
-    // whole `voice` object — `[voice]` would recreate this callback every render
-    // and re-render every child that receives `toggleVoice`. No suppression is
-    // needed here because the split into startVoice/stopVoice left this list
-    // genuinely exhaustive.
-  }, [voice.recording, startVoice, stopVoice])
-  // Cancel (discard) the in-progress dictation — Esc. Batch simply drops the
-  // pending audio (the hook's onstop skips transcription), so nothing lands in
-  // the composer. Streaming additionally disarms the draining final AND removes
-  // the live dictated region from the composer at the frozenInputRef boundary:
-  // the region is recomputed with the same `spliceDictation` call onPartial used
-  // (so it matches a mid-draft caret splice, not just an append), and we drop
-  // exactly that region — preserving the pre-dictation text verbatim (including
-  // its own trailing whitespace) AND any suffix typed after the dictation. When
-  // the region can't be verified (the user replaced/edited it), leave the
-  // composer unchanged rather than restoring the snapshot and losing that edit.
-  // Uses voiceRef.current (not `voice`) so this prop stays referentially stable
-  // and does not re-render the composer every render — matching toggleVoice.
-  const cancelVoice = useCallback(() => {
-    if (streamEnabledRef.current) {
-      sttDisarmedRef.current = true
-      // Remove the dictated region at the frozenInputRef boundary, preserving
-      // the pre-dictation text EXACTLY (including its own trailing whitespace)
-      // and any suffix the user typed after the dictation. onPartial rebuilt the
-      // composer as `frozen [+ ' ' separator] + partial`, so reconstruct that
-      // exact region and drop only it — never a blanket trailing-space strip.
-      const cur = inputRef.current ?? ''
-      const frozen = frozenInputRef.current
-      const p = voiceRef.current.partial
-      if (frozen !== null && p) {
-        // Reconstruct the composer value through the SAME pure function that
-        // wrote it. onPartial splices at the snapshotted caret, so for a
-        // mid-draft caret the value is `before + lead + partial + trail + after`
-        // — NOT `frozen + separator + partial`. Re-deriving the region with an
-        // append-only formula failed `startsWith` for every mid-draft dictation
-        // and fell through to the leave-unchanged branch, stranding the partial
-        // in the draft. spliceDictation reads the same frozen caret, so this
-        // reproduces the write exactly for both the append and mid-caret shapes.
-        const written = spliceDictation(frozen, p).value
-        if (cur.startsWith(written)) {
-          // The composer still begins with exactly the region onPartial wrote.
-          // Restore the pre-dictation text verbatim and keep any suffix the user
-          // typed after it.
-          setInput(frozen + cur.slice(written.length))
-        }
-        // else: the dictated region can't be verified exactly — the user edited
-        // or replaced it (e.g. deleted the separator, or typed their own text
-        // that merely ends in the same word as the partial). Leave the composer
-        // UNCHANGED: a suffix-match heuristic here would delete user-authored
-        // text ("say hello" -> "say"). The disarm above still drops the draining
-        // final, so no dictation is committed; at worst the visible partial
-        // lingers for the user to clear.
-      }
-      // (frozen===null, or no current partial: nothing verifiably removable —
-      // leave the composer as-is rather than risk clobbering user text.)
-      // Clear BOTH halves of the snapshot: they are written together in
-      // onPartial and a surviving caret would aim the next session's first
-      // splice at a position from the discarded one.
-      frozenInputRef.current = null
-      lastDictationAnchorRef.current = null
-      lastDictationValueRef.current = null
-      postStopEditedRef.current = false
-      frozenCaretRef.current = null
-    }
-    voiceRef.current.cancel()
-  }, [spliceDictation])
-
-  // Push-to-talk / tap-to-toggle keyboard binding (default: hold right ⌥ on
-  // macOS, ⌥⇧Space elsewhere). Routed through startVoice/stopVoice rather than
-  // voice.start/stop so a key-driven dictation gets the same gating and
-  // snapshot resets as the mic button, and `cancelVoice` — NOT the hook's raw
-  // cancel — for the discard. Since capture now opens on the keydown, a fast
-  // partial can reach the composer before the press is revealed as a chord or a
-  // sub-threshold tap, and the raw cancel would strand that text; `cancelVoice`
-  // runs the streaming rollback that removes the dictated region (and no-ops
-  // when nothing verifiably removable was written). No `prewarm`: the driver
-  // opens capture on the keydown itself, so there is no warm-up step to
-  // schedule.
-  usePushToTalk(
-    {
-      recording: voice.recording,
-      // silent: a bare modifier is also an ordinary typing modifier, so a
-      // keystroke must never raise the voice-setup modal on its own.
-      start: () => startVoice({ silent: true }),
-      stop: stopVoice,
-      cancel: cancelVoice,
-    },
-    { disabled: !voiceInputSupported },
-  )
-  // Stop any in-flight recording and clear the streaming prefix when the user
-  // switches slots. The mic is a single shared device, so a recording can't
-  // follow the user to another session; a BATCH transcript is still delivered
-  // to the originating slot via applyVoiceText's session-scoped routing (which
-  // prevents cross-slot leakage precisely — no blanket disarm needed here).
-  // Clearing frozenInputRef here means a streaming final that lands after a
-  // switch-and-return rebases on the LIVE input, so edits made after returning
-  // are preserved rather than clobbered by a stale snapshot.
-  useEffect(() => {
-    frozenInputRef.current = null
-    lastDictationAnchorRef.current = null
-    lastDictationValueRef.current = null
-    postStopEditedRef.current = false
-    frozenCaretRef.current = null
-    // Drop the previous slot's caret so dictating in a freshly switched-to slot
-    // (without touching its composer) appends to that slot's draft instead of
-    // inserting at the old slot's offset.
-    voiceCaretRef.current = null
-    // Streaming ONLY: disarm so a delayed streaming final arriving after this
-    // switch is dropped instead of appended. Its live partial was already
-    // flushed into the outgoing slot's draft, so appending the full final on
-    // return would duplicate the dictated text ("hello hello"). Batch is NOT
-    // disarmed — its single final is routed to the originating slot's draft by
-    // applyVoiceText. (Cross-slot streaming delivery is a follow-up; streaming
-    // is opt-in and off by default.)
-    if (streamEnabledRef.current) sttDisarmedRef.current = true
-    if (voiceRef.current.recording) voiceRef.current.toggle()
-  }, [activeSlot])
-  // True when the current voice session (owned by the slot where recording
-  // actually started — see useVoiceInput's sessionOwner) is the slot on screen.
-  // Gates the recording/transcribing UI so a session transcribing in the
-  // background never shows a busy/locked mic in the session the user switched to.
-  const voiceOwned = voice.sessionOwner === activeSlot
-  // (Streaming-off teardown now lives in useVoiceInput — see its effect on
-  // [streamEnabled, streamRecording, streamStop]. Routing through voice.toggle
-  // here is racy because `useVoiceInput` flips its returned `recording` to the
-  // batch value on the same render that `streamEnabled` goes false.)
-
-  const tabsCtl = usePanelTabs(activeSlot)
-  // An MCP App tab hosts a null-origin iframe with no storage: unmounting it
-  // reloads the app and destroys whatever the user has drawn (see
-  // docs/architecture/dashboard-iframe-hosts.md). The whole SidePanel subtree is normally
-  // gated on `activityOpen`, so closing the panel would unmount it. While an app
-  // tab is live we therefore keep the subtree MOUNTED and hide it instead — the
-  // same hide-not-unmount rule SidePanel already applies to its own tab bodies.
-  // With no app tab, behaviour is unchanged (the panel still unmounts on close,
-  // preserving the existing exit animation).
-  // Across ALL slots, not just the active one: with cross-slot hosting a frame
-  // belonging to another chat lives in this panel subtree, so deciding to unmount
-  // on the active slot's (possibly empty) tab list would destroy that canvas.
-  const hasLiveAppTab = useAnyLiveAppTab()
-  // Current slot only — unlike app tabs (hosted cross-slot via `allAppTabs`), a
-  // Browser tab renders solely from the active slot's strip, and a background
-  // slot's browser view already unmounts (its WebContentsView released) on the
-  // slot switch. So keep-mounted follows THIS slot's tabs, not every slot's.
-  const hasBrowserTab = tabsCtl.tabs.some(t => t.kind === 'browser')
-  // Find/search pane state. Declared above handleFileOpen / handleOpenDiff so
-  // those handlers can call search.close() directly when opening a dock panel
-  // (the right-hand dock is a single slot and the file/diff panes are
-  // render-gated behind !search.isOpen).
-  const search = useMessageSearch(messages, activeSlot)
-  const sourceLinkIndex = useRef(new PullRequestLinkIndex())
-  // Self-managed GitLab hosts the operator authorized (config-only, read-only
-  // here). Without them a pasted self-hosted MR link is not a Changes source.
-  // No refetchInterval: polling this shared ['dashboardConfig'] key turned every
-  // same-key observer into a poller and wrote a dashboard_config_read SEL entry
-  // on each tick. Instead the WS 'slots' push carries the allowlist generation
-  // (see useWebSocket), which invalidates this query only when the allowlist
-  // actually changes — an edit on disk still propagates, without the churn.
-  const { data: sourceHostCfg } = useQuery<{ gitlab_hosts?: string[]; jira_hosts?: string[] }>({
-    queryKey: ['dashboardConfig'],
-    queryFn: () => api.dashboardConfig(),
-    staleTime: 30_000,
-  })
-  const sourceHosts = sourceHostCfg?.gitlab_hosts ?? []
-  const jiraSourceHosts = sourceHostCfg?.jira_hosts ?? []
-  // Read through refs by callbacks that must stay identity-stable (they are
-  // handed to the sidebar, which re-renders every session row).
-  const sourceHostsRef = useRef(sourceHosts)
-  sourceHostsRef.current = sourceHosts
-  const jiraSourceHostsRef = useRef(jiraSourceHosts)
-  jiraSourceHostsRef.current = jiraSourceHosts
-  const indexedSourceLinks = sourceLinkIndex.current.update(
+  // The project ref is read by the resources controller's drop/paste handlers at
+  // event time, so it is declared before the controller and refreshed every render.
+  const currentProjectRef = useRef<string | undefined>(undefined)
+  currentProjectRef.current = slots.find(s => s.key === activeSlot)?.project || undefined
+  const resources = useChatPageResourcesController({
     activeSlot,
+    activeSlotRef,
     messages,
-    sourceHosts,
+    slotLoading,
+    dispatch,
+    queryClient,
+    showActionError,
+    composer: {
+      inputRef,
+      setInput,
+      drafts,
+      fileDrafts,
+      setPendingFiles,
+      currentProjectRef,
+      voiceCaretRef,
+      voicePendingCaretRef,
+      saveDrafts,
+    },
+    capture: {
+      setUploading,
+      setUploadError,
+      setUploadHint,
+      setResizedInfo,
+      snipSlotRef,
+      setSnipFrame,
+    },
+  })
+  const {
+    tabsCtl,
+    hasLiveAppTab,
+    hasBrowserTab,
+    search,
+    sourceHostsRef,
     jiraSourceHosts,
-  )
-  // One scan, one dedup map, two panels: the extractor returns pull requests and
-  // issues together (they share the per-role cap), and the two side-panel tabs
-  // consume the halves. useMemo keyed on the index's own result identity — the
-  // index returns the SAME array reference until the transcript actually changes,
-  // so the halves stay reference-stable and don't retrigger the reconciliation
-  // effects below on every render.
-  const { changes: sourceLinks, issues: issueLinks } = useMemo(
-    () => partitionSourceLinks(indexedSourceLinks),
-    [indexedSourceLinks],
-  )
-  // Which Change / Issue tab is focused, PER SLOT and persisted (see
-  // pullRequestLinks.SourceSelections). Per-slot because a single shared value
-  // reconciles to the first link of whichever transcript is active, so switching
-  // A→B→A dropped A's selection; persisted because the panel tab strip itself
-  // survives reloads (mc-panel-tabs:<slot>) and a strip that comes back focused
-  // on a tab the user never chose is the bug this closes.
-  //
-  // React state holds this window's view for rendering; commitSourceSelection
-  // does the durable write, merging ONE slot into a freshly read snapshot so a
-  // second chat window (a popped-out session shares this localStorage) cannot
-  // publish its stale view of the slots it is not looking at. That means this
-  // window's map can lag another window's writes to OTHER slots — harmless,
-  // since only the active slot is ever read, and far better than losing them.
-  const [sourceSelections, setSourceSelections] = useState(loadSourceSelections)
-  const selectedSourceUrl = sourceSelection(sourceSelections, activeSlot, 'change')
-  const selectedIssueUrl = sourceSelection(sourceSelections, activeSlot, 'issue')
-  // The links sidebar chips asked to see, per slot and per kind.
-  //
-  // The chips and these panels do NOT scan for links the same way: the backend
-  // chip scan (state.py) keeps every provider url in the transcript, while the
-  // panel's extractor emits only links the AGENT surfaced — a pull request the
-  // USER pasted is deliberately a Resource, not a Change. A chip is also drawn
-  // from the whole server-side transcript, while the extractor sees only the
-  // messages this window has loaded. Either gap would make the chip a dead end
-  // (the panel would normalise straight back to the first link it does know), so
-  // the clicked link is injected into the list for the session it belongs to.
-  //
-  // Keyed by slot AND kind, matching the two selection ledgers below. A single
-  // last-one-wins record could not hold a revealed pull request and a revealed
-  // issue at the same time: revealing an issue evicted the pull request, its
-  // injection vanished from `panelSources`, and the Changes reconciliation then
-  // normalised the selection onto a DIFFERENT pull request behind the user's back.
-  //
-  // Durable, for the same reason. The SELECTION pointing at a revealed link is
-  // already persisted; without persisting the link too, a reload remembered the
-  // url but could no longer produce it, and reconciliation performed that same
-  // silent swap one page load later.
-  const [revealedSources, setRevealedSources] = useState<RevealedSources>(loadRevealedSources)
-  const revealedForSlot = activeSlot ? revealedSources[activeSlot] : undefined
-  const revealedChange = revealedForSlot?.change ?? null
-  const revealedIssue = revealedForSlot?.issue ?? null
-  const panelSources = useMemo(() => (
-    revealedChange && !sourceLinks.some(link => link.url === revealedChange.url)
-      ? [revealedChange, ...sourceLinks]
-      : sourceLinks
-  ), [sourceLinks, revealedChange])
-  const panelIssues = useMemo(() => (
-    revealedIssue && !issueLinks.some(link => link.url === revealedIssue.url)
-      ? [revealedIssue, ...issueLinks]
-      : issueLinks
-  ), [issueLinks, revealedIssue])
-  // Fields whose durable write storage REFUSED, per slot. Storage then holds an
-  // older url than the user's live choice, so adoption must not take it back
-  // (see adoptSourceSelections). A ref, not state: it changes nothing on screen
-  // and must not re-render.
-  const unpersistedSelectionsRef = useRef<Record<string, Partial<Record<SourceLinkKind, boolean>>>>({})
-  // Fields whose on-screen value is a provisional fallback rather than a real
-  // choice. The value is the link count seen when the fallback was taken, so the
-  // storage re-read below can retry only once the transcript has actually GROWN
-  // rather than on every render. Cleared by an explicit pick or a successful
-  // restore.
-  const provisionalFallbackRef = useRef<Record<string, Partial<Record<SourceLinkKind, number>>>>({})
-  const selectSource = useCallback((kind: SourceLinkKind, url: string, forSlot?: string) => {
-    // `forSlot` is for a pick made on a session that is not on screen yet — a
-    // sidebar chip switches sessions and selects in one gesture, and
-    // activeSlotRef is assigned during RENDER, so at call time it still names the
-    // chat being left.
-    const slot = forSlot ?? activeSlotRef.current
-    setSourceSelections(previous => withSourceSelection(previous, slot, kind, url))
-    const outcome = commitSourceSelection(slot, kind, url)
-    if (!slot) return
-    // An explicit choice supersedes any provisional fallback for this field.
-    const provisional = { ...provisionalFallbackRef.current[slot] }
-    delete provisional[kind]
-    provisionalFallbackRef.current = { ...provisionalFallbackRef.current, [slot]: provisional }
-    const failed = { ...unpersistedSelectionsRef.current[slot] }
-    // 'failed' means storage refused the write and still holds an older url;
-    // 'unchanged' means storage already agrees. Both are explicit writes, so the
-    // ledger records exactly whether this selection reached storage.
-    if (outcome === 'failed') failed[kind] = true
-    else delete failed[kind]
-    unpersistedSelectionsRef.current = { ...unpersistedSelectionsRef.current, [slot]: failed }
-  }, [])
-  const selectSourceUrl = useCallback((url: string) => selectSource('change', url), [selectSource])
-  const selectIssueUrl = useCallback((url: string) => selectSource('issue', url), [selectSource])
-  // A RECONCILED pick is derived from the transcript, not chosen by the user, and
-  // is deliberately IN-MEMORY ONLY — it never writes to storage.
-  //
-  // Persisting it bought nothing and cost correctness. The fallback is
-  // deterministic (`sourceLinks[0]`), so a session where the user never picked a
-  // tab recomputes the same answer on return without any stored value; the only
-  // case persistence changes is a choice that DIFFERS from the first link, which
-  // is exactly what an explicit click already records. Meanwhile every write from
-  // here could destroy a real choice, because the fallback also fires whenever the
-  // transcript on screen is provisional — `switchSlot.pending` serves a cached
-  // transcript with `slotLoading` already false while the fetch is still in
-  // flight, and a transcript missing a url is not proof the url is gone.
-  //
-  // The slot is marked provisional so the reconciliation effects know to look in
-  // storage once for a better answer (see the effects below).
-  const reconcileSelection = useCallback((kind: SourceLinkKind, url: string, seen = 0) => {
-    const slot = activeSlotRef.current
-    setSourceSelections(previous => withSourceSelection(previous, slot, kind, url))
-    if (!slot) return
-    provisionalFallbackRef.current = {
-      ...provisionalFallbackRef.current,
-      [slot]: { ...provisionalFallbackRef.current[slot], [kind]: seen },
-    }
-  }, [])
-  // The panels normalize their own selection when the remembered url is not among
-  // the tabs they render, and that is NOT a user choice — route it to the
-  // in-memory path so it cannot overwrite storage. Before this split the panels
-  // were handed the persisting callback, which made their normalize a durable
-  // write and defeated the whole in-memory-only rule.
-  const reconcileSourceUrl = useCallback(
-    (url: string) => reconcileSelection('change', url, panelSources.length),
-    [reconcileSelection, panelSources.length],
-  )
-  const reconcileIssueUrl = useCallback(
-    (url: string) => reconcileSelection('issue', url, panelIssues.length),
-    [reconcileSelection, panelIssues.length],
-  )
-
-  // Re-read storage for a slot whose on-screen value is a provisional fallback.
-  //
-  // Without this the fallback would stick for the life of the document: nothing
-  // else re-reads storage in the window that wrote it — loadSourceSelections runs
-  // only in the useState initializer, and the `storage` event never fires in the
-  // writing document — so the user would keep seeing the fallback instead of the
-  // tab they left open until a reload.
-  //
-  // Retried only when the transcript has GROWN since the fallback was taken. A
-  // transcript is append-only within a slot, so growth is the only way a
-  // previously-absent url can appear, and gating on it keeps this off the
-  // per-render (and per-streaming-chunk) path. Membership in `links` is the
-  // "the fetch proved it still exists" condition.
-  const restoreFromStorage = useCallback((
-    kind: SourceLinkKind,
-    links: readonly { url: string }[],
-  ): boolean => {
-    const slot = activeSlotRef.current
-    if (!slot) return false
-    const seen = provisionalFallbackRef.current[slot]?.[kind]
-    if (seen === undefined || links.length <= seen) return false
-
-    const stored = sourceSelection(loadSourceSelections(), slot, kind)
-    if (stored && links.some(link => link.url === stored)) {
-      const provisional = { ...provisionalFallbackRef.current[slot] }
-      delete provisional[kind]
-      provisionalFallbackRef.current = { ...provisionalFallbackRef.current, [slot]: provisional }
-      setSourceSelections(previous => withSourceSelection(previous, slot, kind, stored))
-      return true
-    }
-    // Not there yet — wait for further growth rather than re-reading every render.
-    provisionalFallbackRef.current = {
-      ...provisionalFallbackRef.current,
-      [slot]: { ...provisionalFallbackRef.current[slot], [kind]: links.length },
-    }
-    return false
-  }, [])
-
-  // Adopt a sibling window's writes. `storage` fires in every OTHER document on
-  // this origin, so the window that did NOT write is the one that needs to
-  // re-read. Without this, a window carries its mount-time view until reload and
-  // two windows focused on the same session would each show their own last
-  // choice. The event's newValue is ignored in favour of a full re-read, so the
-  // loader's own validation and bounds apply to whatever a sibling wrote.
-  //
-  // The urls THIS window can actually SHOW go in with the read: adoption is
-  // conditional on them for the active slot, which is what keeps two windows
-  // with divergent transcripts from overwriting each other in a loop (see
-  // adoptSourceSelections). The panel lists rather than the raw scan, so a link
-  // revealed from a sidebar chip is not taken back by a sibling's write. Read
-  // through a ref because the listener is registered once and must see the
-  // current lists at event time.
-  const availableSourceUrls = useMemo(() => ({
-    change: panelSources.map(source => source.url),
-    issue: panelIssues.map(issue => issue.url),
-  }), [panelSources, panelIssues])
-  const availableSourceUrlsRef = useRef(availableSourceUrls)
-  availableSourceUrlsRef.current = availableSourceUrls
-  useEffect(() => {
-    const onStorage = (event: StorageEvent) => {
-      if (event.storageArea && event.storageArea !== localStorage) return
-      // key === null is a storage.clear(), which does concern us. Otherwise
-      // match the store's key prefix — the selection lives in one key per
-      // (slot, kind), so there is no single literal to compare against.
-      if (event.key !== null && !isSourceSelectionKey(event.key)) return
-      setSourceSelections(previous => adoptSourceSelections(
-        previous,
-        activeSlotRef.current,
-        availableSourceUrlsRef.current,
-        unpersistedSelectionsRef.current,
-      ))
-    }
-    window.addEventListener('storage', onStorage)
-    return () => window.removeEventListener('storage', onStorage)
-  }, [])
-
-  // Add and focus the per-slot Changes / Issues tabs for newly detected URLs,
-  // but leave panel visibility under explicit user control. Both kinds share one
-  // seen-url bookkeeping set (it is keyed by url, and the cap is a per-slot
-  // budget), so each kind is recorded separately only to learn WHICH tab to open.
-  const [seenSourceUrls] = useState(loadSeenPullRequestLinks)
-  useEffect(() => {
-    const newChanges = recordNewPullRequestLinks(seenSourceUrls, activeSlot, sourceLinks)
-    const newIssues = recordNewPullRequestLinks(seenSourceUrls, activeSlot, issueLinks)
-    if (!newChanges && !newIssues) return
-    persistSeenPullRequestLinks(seenSourceUrls)
-    if (newChanges) tabsCtl.openView('changes')
-    if (newIssues) tabsCtl.openView('issues')
-    // tabsCtl is intentionally not a dependency: this effect reacts only to
-    // source discovery, not tab focus or panel visibility changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSlot, sourceLinks, issueLinks, seenSourceUrls])
-
-  useEffect(() => {
-    // An uncached slot temporarily has no messages while its history hydrates.
-    // Preserve the persisted strip until that source-of-truth load settles.
-    if (slotLoading) return
-    // Reconciled against the list the PANEL renders, not the raw transcript scan:
-    // a link revealed from a sidebar chip is a real, user-chosen tab, and judging
-    // it against the scan alone would normalise the selection straight off it.
-    // A previous provisional render may have fallen back in memory while storage
-    // still holds the tab the user chose; look there first once links appear.
-    if (restoreFromStorage('change', panelSources)) return
-    if (panelSources.length === 0) {
-      // Changes is a permanently pinned tab (SidePanel.syncPinned) — never
-      // auto-close it here. Just clear the source selection; the tab stays put
-      // and renders its empty state until sources are detected again.
-      //
-      // Two guards, both load-bearing:
-      //  - transcript LOADED, not merely empty. switchSlot.rejected (a dropped
-      //    history fetch) empties `messages` AND drops slotLoading in one reducer
-      //    pass, so the guard above does not hold; since the selection is durable,
-      //    clearing there would outlive the failure and lose the tab on retry.
-      //  - something to clear. commitSourceSelection enumerates storage to decide
-      //    whether the value already matches, and these effects re-run on every
-      //    streaming chunk (the link index hands back a fresh array per chunk), so
-      //    an unconditional clear costs a full enumeration per chunk for every
-      //    session that never mentions a pull request — the common case.
-      if (messages.length && selectedSourceUrl) reconcileSelection('change', '')
-      return
-    }
-    // First-wins fallback ONLY when the remembered url is gone from the
-    // transcript: while it is still present, selectedSourceUrl already carries
-    // the restored per-slot choice and this reconciliation leaves it alone.
-    if (!panelSources.some(source => source.url === selectedSourceUrl)) {
-      // Storage may still hold the tab the user actually chose — absent from an
-      // earlier PROVISIONAL transcript but present now that the fetch landed.
-      // Look there once before falling back, gated on the url being in THIS
-      // transcript (that gate IS the "the fetch proved it exists" condition).
-      reconcileSelection('change', panelSources[0].url, panelSources.length)
-    }
-    // reconcileSourceUrl reads the active slot through a ref, so it is stable and
-    // this effect reacts only to sources, selection, and hydration state.
-  }, [panelSources, selectedSourceUrl, slotLoading, messages.length, reconcileSelection, restoreFromStorage])
-
-  useEffect(() => {
-    // Same first-wins / clear-on-empty reconciliation as the Changes selection
-    // above, including the loaded-transcript guard on the clear.
-    if (slotLoading) return
-    if (restoreFromStorage('issue', panelIssues)) return
-    if (panelIssues.length === 0) {
-      if (messages.length && selectedIssueUrl) reconcileSelection('issue', '')
-      return
-    }
-    if (!panelIssues.some(issue => issue.url === selectedIssueUrl)) {
-      reconcileSelection('issue', panelIssues[0].url, panelIssues.length)
-    }
-  }, [panelIssues, selectedIssueUrl, slotLoading, messages.length, reconcileSelection, restoreFromStorage])
-
-  const addSourceCommentToChat = useCallback((text: string) => {
-    setInput(previous => previous.trim() ? `${previous.trimEnd()}\n\n${text}` : text)
-  }, [])
-
-  const { colorTheme } = useTheme()
-  // Mirror colorTheme into a ref so the `send` callback (which does not depend
-  // on colorTheme, to avoid re-creating on every theme switch) can always read
-  // the current theme without going stale — otherwise a theme change with no
-  // activeSlot change sends the previous theme's color_theme to the backend,
-  // mis-injecting the persona.
-  const colorThemeRef = useRef(colorTheme)
-  useEffect(() => { colorThemeRef.current = colorTheme }, [colorTheme])
-  // Read file content via queryClient.fetchQuery so we get React Query's
-  // caching/deduplication on repeated opens (re-opening the same file is
-  // instant for ~10s) AND proper error semantics (queryFn throws → catch
-  // block runs). useMutation was the wrong tool for a read operation.
-  // The `ok` flag gates whether the file is recorded in history — 404s and
-  // other HTTP failures show a placeholder in the panel but should NOT
-  // pollute the history list with files that don't exist on disk.
-  const handleFileOpen = useCallback(async (filePath: string, opts?: { replaceId?: string; line?: number; endLine?: number; diffMode?: boolean; canReplace?: () => boolean }) => {
-    // Plugin host integration: notify the IntelliJ plugin (if active) so
-    // it can open the file natively in the IDE editor. If the plugin
-    // handles file opens, skip the dashboard's DiffPanel — the user wanted
-    // IDE-native, not in-dashboard.
-    try { window.dispatchEvent(new CustomEvent('kirocrew-file-open', { detail: { path: filePath } })) } catch { /* ignore */ }
-    if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
-    try {
-      const [{ text, ok, status }] = await Promise.all([
-        queryClient.fetchQuery({
-          queryKey: ['file-read', filePath],
-          queryFn: async () => {
-            const url = fileReadUrl(filePath)
-            const res = await fetch(url)
-            // A 404 is a real answer about the file (it is not on disk), so the
-            // panel shows that placeholder. Any other failure is an ERROR: it is
-            // reported as one below instead of being rendered as the file's text.
-            const text = res.ok
-              ? await res.text()
-              : res.status === 404 ? i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-              : ''
-            return { text, ok: res.ok, status: res.status }
-          },
-          staleTime: 10_000,
-        }),
-        queryClient.prefetchQuery({
-          queryKey: ['file-diff', filePath],
-          queryFn: () => api.fileDiff(filePath),
-        }),
-      ])
-      if (!ok && status !== 404) {
-        // Read failure — nothing in the viewer to lose, so the notice hands off.
-        showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: i18nT('pages.chatPage.http_status', { status }) }))
-        return
-      }
-      tabsCtl.openFile(filePath, text, activeSlotRef.current ?? null, optsForReplace(opts))
-      dispatch(openActivityPanel())
-      // The right-hand dock is a single slot; the file viewer is render-gated
-      // behind !search.isOpen. Close the find pane so the opened file actually
-      // shows instead of being silently suppressed.
-      search.close()
-    } catch (e) {
-      // The read itself threw (network, aborted). Reported above the composer
-      // rather than as a tab whose "content" is the error sentence.
-      showActionError(i18nT('pages.chatPage.could_not_read_file_reason', { path: filePath, reason: errMessage(e) || i18nT('pages.chatPage.unknown_error') }))
-    }
-    // Depend on the stable member, not the whole hook object: `search.close` is a
-    // useCallback([]) in useMessageSearch, while the `search` object changes
-    // identity on every search-state change (isOpen/term/matches), which would
-    // churn this callback and the onFileOpen prop on every row. (tabsCtl still
-    // churns on tab changes, but those are user actions, not per-chunk.)
-    // The lint rule still asks for the whole object because `close` is INVOKED, and
-    // a called member is attributed to its receiver — not because anything here
-    // reads `search` itself.
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; depending on the enclosing object instead would churn the onFileOpen prop on every transcript row each render
-  }, [queryClient, tabsCtl, dispatch, search.close, showActionError])
-
-  /** Open a DIRECTORY as a panel tab.
-   *
-   *  The folder twin of handleFileOpen, and deliberately much thinner: there is
-   *  no content to prefetch (FolderPanel owns its own ['browse-files', path]
-   *  query). Only reachable for paths the backend already
-   *  confirmed are directories, so there is no not-found branch to handle. */
-  const handleFolderOpen = useCallback((dirPath: string) => {
-    tabsCtl.openFolder(dirPath, activeSlotRef.current ?? null)
-    dispatch(openActivityPanel())
-    search.close()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- same as handleFileOpen above: `search.close` is a useCallback([]) and the enclosing `search` object is a fresh literal every render, so listing it would churn the onFolderOpen prop on every transcript row
-  }, [tabsCtl, dispatch, search.close])
+    jiraSourceHostsRef,
+    panelSources,
+    panelIssues,
+    selectedSourceUrl,
+    selectedIssueUrl,
+    selectSource,
+    selectSourceUrl,
+    selectIssueUrl,
+    reconcileSourceUrl,
+    reconcileIssueUrl,
+    setRevealedSources,
+    addSourceCommentToChat,
+    colorThemeRef,
+    handleFileOpen,
+    handleFolderOpen,
+    handleArtifactOpen,
+    handleOpenDiff,
+    handleFileSave,
+    handleCapture,
+    uploadFiles,
+    cancelUpload,
+    uploadCancellable,
+    handleOptimizeResult,
+    dragOver,
+    dropTargetProps,
+  } = resources
 
   // Open the Subagents panel from a completion card. A per-agent event
   // deep-links to the agent it reports on, so the panel lands on that
@@ -2856,85 +2374,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on the value-equal pair signature, not the slot objects (see above)
     [sessionTitleSig],
   )
-
-  // Open an artifact as a side-panel tab — the artifact twin of
-  // handleFileOpen, and the single entry point every in-chat artifact
-  // affordance routes through (the Artifacts tab's rows and `/artifacts/<slug>`
-  // links inside messages). Routing them here renders the document inline in the
-  // panel instead of hard-navigating to the standalone detail page, which would
-  // tear down the chat and make artifacts the only panel-capable content that
-  // could not be flipped between like files.
-  const handleArtifactOpen = useCallback(async (slug: string) => {
-    if (!slug) return
-    const slot = activeSlotRef.current ?? null
-    // Opening an artifact is an act of session involvement: record the
-    // `referenced` breadcrumb so a merely-read (or merely-linked) artifact
-    // joins "This session" instead of sitting in the library section forever.
-    // Deliberately fire-and-forget and deliberately NOT awaited — the panel
-    // must open at click speed, and the store already enforces
-    // one-breadcrumb-per-session so a double click cannot spam the event log.
-    // The 403 an incognito slot returns is expected, not an error to surface.
-    if (slot) {
-      api.recordArtifactReference(slug, slot)
-        .then(() => {
-          // Re-run the involvement scan so the row moves sections live.
-          queryClient.invalidateQueries({ queryKey: ['session-artifact-records', slot] })
-        })
-        .catch(() => { /* best-effort breadcrumb */ })
-    }
-    // Seed the tab from the artifact list cache when it is already warm so the
-    // body paints immediately; ArtifactPanel's own query is authoritative and
-    // overrides kind/content once it resolves, so a miss here costs a spinner,
-    // not correctness.
-    let kind: Artifact['kind'] = 'markdown'
-    let content = ''
-    try {
-      const art = await queryClient.fetchQuery<Artifact>({
-        queryKey: ['artifact', slug],
-        queryFn: () => api.artifact(slug),
-        staleTime: 10_000,
-      })
-      kind = art.kind
-      content = art.content ?? ''
-    } catch { /* fall through — the panel's own query renders the error state */ }
-    tabsCtl.openArtifact({ slug, kind }, content, slot)
-    dispatch(openActivityPanel())
-    // Same single-slot constraint as handleFileOpen: the right-hand dock is
-    // render-gated behind !search.isOpen, so an open find pane would silently
-    // swallow the tab we just focused.
-    search.close()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [queryClient, tabsCtl, dispatch, search.close])
-
-  // Open the diff panel from a file-change chip click. Closes the
-  // markdown viewer and the activity panel so panels stay mutually exclusive.
-  const handleOpenDiff = useCallback((filePath: string, modified: string, original: string) => {
-    // If the IntelliJ plugin's file bridge is active, dispatch the event
-    // with before/after content so the plugin can show a native IntelliJ
-    // diff viewer (with syntax highlighting). Skip the dashboard's
-    // own DiffPanel in that case — the plugin sets the flag on page load.
-    try {
-      window.dispatchEvent(new CustomEvent('kirocrew-file-open', {
-        detail: { path: filePath, before: original, after: modified },
-      }))
-    } catch { /* ignore */ }
-    if ((window as unknown as { __kirocrewPluginHandlesFiles?: boolean }).__kirocrewPluginHandlesFiles) return
-    // Brand-new file (no prior content): a diff would render as one big green
-    // all-additions block, which hurts readability. Open the normal readable
-    // file view instead — there's no meaningful "before" to compare against.
-    // Identical content (no-op): the diff editor shows two identical panes with
-    // zero signal — fall through to the readable file view as well.
-    if (!original || !original.trim() || original === modified) { handleFileOpen(filePath); return }
-    tabsCtl.openDiff(filePath, modified, original)
-    dispatch(openActivityPanel())
-    // Diff pane is render-gated behind !search.isOpen (single right-dock slot);
-    // close the find pane so the diff shows instead of opening underneath it.
-    search.close()
-    // Depend on the stable `search.close`, not the whole `search` object (see
-    // handleFileOpen above) — avoids recreating this callback on search-state
-    // changes.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tabsCtl, dispatch, search.close, handleFileOpen])
 
   const { data: forkCfg } = useQuery<{ tail_fork_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
   const handleFork = useCallback(async (visibleIndex: number, messageId?: string) => {
@@ -2980,164 +2419,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
   }, [activeSlot, dispatch, mode, navigate, showActionError])
 
-  const handleFileSave = useCallback(async (filePath: string, content: string) => {
-    // Capture the slot BEFORE awaiting: if the user switches chats mid-save, the
-    // draft we reconcile must be the one that owned this save, not whatever slot
-    // is active when the write resolves.
-    const requestSlot = activeSlotRef.current ?? ''
-    const res = await fetch('/api/file-write', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: filePath, content }),
-    })
-    if (!res.ok) throw new Error(`Save failed: ${res.status}`)
-    // The saved bytes become the tab's dirty baseline, so a later re-open of
-    // the same path refreshes the buffer instead of (needlessly) preserving it
-    // as if it still held unsaved work. Best-effort: a tab that is not open
-    // right now is simply not found by id.
-    tabsCtl.patchTab(`file:${filePath}`, { savedContent: content })
-    // Reconcile the inline-preview draft for the SAVING slot (drafts are
-    // slot+path keyed). Clear it ONLY if it still equals what we just saved -
-    // if the user typed more while the write was in flight, the draft now holds
-    // newer content and must be preserved, not dropped.
-    if (getInlineDraft(requestSlot, filePath) === content) clearInlineDraft(requestSlot, filePath)
-  }, [tabsCtl])
-
-  const takeScreenshot = useCallback(async () => {
-    // Capture the slot at click-time. If the user switches away before the
-    // screenshot promise resolves, we must land the file in the slot the user
-    // was looking at when they clicked — not whatever slot is now active.
-    const requestSlot = activeSlotRef.current
-    setUploading(true)
-    try {
-      const { path } = await api.screenshot()
-      if (path) {
-        if (activeSlotRef.current === requestSlot) {
-          setPendingFiles(prev => [...prev, path])
-        } else if (requestSlot) {
-          // Slot changed during the await — divert the file into the request
-          // slot's persisted draft so it's waiting when the user goes back.
-          const cur = fileDrafts.current[requestSlot] ?? []
-          setFileDraft(fileDrafts.current, requestSlot, [...cur, path])
-          saveDrafts()
-        }
-      }
-    } catch { /* user cancelled */ }
-    setUploading(false)
-  }, [saveDrafts])
-
-  /** Screen capture entry: cross-platform snip+crop when supported, else native macOS screenshot. */
-  const handleCapture = useCallback(async () => {
-    snipSlotRef.current = activeSlotRef.current
-    if (!screenSnipSupported) { takeScreenshot(); return }
-    const canvas = await captureScreen()
-    if (canvas) setSnipFrame(canvas)
-  }, [takeScreenshot])
-
-  // The Web Preview tab's crop button asks for an area screenshot via a window
-  // event. Same crop→attach pipeline as the composer button, but capture pre-
-  // targets THIS tab (preferCurrentTab) so the browser prompt is a single
-  // "Share this tab?" confirm instead of the full source picker. (Desktop app:
-  // no prompt either way via setDisplayMediaRequestHandler.)
-  useEffect(() => {
-    const onSnip = async () => {
-      snipSlotRef.current = activeSlotRef.current
-      if (!screenSnipSupported) { takeScreenshot(); return }
-      const canvas = await captureScreen(currentTabCaptureDeps())
-      if (canvas) setSnipFrame(canvas)
-    }
-    window.addEventListener(PREVIEW_SNIP_EVENT, onSnip)
-    return () => window.removeEventListener(PREVIEW_SNIP_EVENT, onSnip)
-  }, [takeScreenshot])
-
-  /** Upload files via browser File API (cross-platform) */
-  const uploadFiles = useCallback(async (files: File[], targetSlot?: string | null) => {
-    if (!files.length) return
-    // Same slot-capture pattern as takeScreenshot — see note there. An explicit
-    // targetSlot (e.g. the slot that initiated a snip) overrides the live slot
-    // so an async capture lands where it started, not where the user switched to.
-    const requestSlot = targetSlot !== undefined ? targetSlot : activeSlotRef.current
-    setUploadError('')
-    setUploadHint('')
-    if (files.length > 20) { setUploadHint(i18nT('pages.chatPage.too_many_files_max_20')); return }
-    // Video is deliberately exempt from this pre-check: it has a much larger
-    // server-side ceiling and streams to disk there, so the 50 MB figure this
-    // message states would be a lie for a recording. Its own 413 carries the
-    // real cap and surfaces through the `upload_failed_error` branch below,
-    // the same route every other server-side rejection already takes.
-    const big = files.find(f => !VIDEO_EXT.test(f.name) && f.size > 50 * 1024 * 1024)
-    if (big) { setUploadHint(i18nT('pages.chatPage.file_too_large', { name: big.name })); return }
-    setUploading(true)
-    try {
-      const res = await api.uploadFiles(files)
-      if (res.error) {
-        setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error }))
-      } else if (res.paths?.length) {
-        const landing = fileLandingSlot(requestSlot, activeSlotRef.current)
-        if (landing.target === 'pending') {
-          setPendingFiles(prev => [...prev, ...res.paths])
-        } else if (landing.target === 'draft') {
-          const cur = fileDrafts.current[landing.slot] ?? []
-          setFileDraft(fileDrafts.current, landing.slot, [...cur, ...res.paths])
-          saveDrafts()
-        }
-      }
-      if (!res.error && res.resizedByPath && Object.keys(res.resizedByPath).length) {
-        setResizedInfo(prev => ({ ...prev, ...res.resizedByPath }))
-      }
-    } catch { setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb')) }
-    setUploading(false)
-  }, [saveDrafts])
-
-  // Deliver an optimize result to the session that started it when the user
-  // navigated away before the request settled. ChatInput only calls this for
-  // the cross-session case (it writes the result itself when the originating
-  // session is still on screen). Same slot-capture pattern as uploadFiles /
-  // the send-failure draft restore: persist into the originating slot's draft
-  // unconditionally (recoverable on disk + shown when the user returns), and
-  // only splice into the live input when that slot is what's currently on
-  // screen — compared against activeSlotRef.current, never the stale closure.
-  const handleOptimizeResult = useCallback((slot: string | null, optimized: string) => {
-    if (!slot) return
-    setDraft(drafts.current, slot, optimized)
-    saveDrafts()
-    if (slot === activeSlotRef.current) setInput(optimized)
-  }, [saveDrafts])
-
-  const handleDrop = useCallback((dataTransfer: DataTransfer) => {
-    // Classify BEFORE acting (issue #743): a dropped folder inserts its path
-    // into the composer as an `@rel/` token — the same reference the @-picker
-    // stages — instead of taking the upload route, which cannot ingest a
-    // directory. Files keep uploading; a mixed drop takes both routes. In a
-    // plain browser no real path is visible, so classifyDrop leaves folders
-    // on the upload route there (today's behaviour) rather than inserting a
-    // misleading bare name.
-    const { files, dirPaths } = classifyDrop(dataTransfer)
-    if (dirPaths.length) {
-      // Short relative form when the folder lies inside the project root,
-      // absolute otherwise — exactly the picker's own fallback convention.
-      const rels = dirPaths.map(p => makeRelative(p, currentProjectRef.current || ''))
-      const spliced = spliceDirTokens(inputRef.current, voiceCaretRef.current?.start ?? null, rels)
-      if (spliced.changed) {
-        // Arm the caret restore the same way the dictation splice does, so the
-        // cursor lands just past the inserted tokens once the value commits.
-        // Only on a real change: an all-duplicates drop leaves the value
-        // identical, React bails out of the no-op setInput, the restore effect
-        // never fires, and the armed offset would fire stale on the next
-        // unrelated edit, yanking the user's cursor.
-        voicePendingCaretRef.current = spliced.caret
-        setInput(spliced.value)
-      }
-    }
-    if (files.length) {
-      uploadFiles(files)
-    }
-  }, [uploadFiles])
-  const { active: dragOver, dropTargetProps } = useChatFileDrop(handleDrop)
-
   const transcriptEarly = useChatPageTranscriptEarlyController({
     activeTip,
     mountIndexRef,
+    estimateRowTopRef,
     scrollerRef,
     scrollToDisplayIndex,
     slotRunningRef,
@@ -3159,6 +2444,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     pinExpanded,
     setPinExpanded,
     onPinCollapsedHeight,
+    scrollTranscriptBy,
     updatePinnedPrompt,
     onScrollPin,
     scrollToPinnedPrompt,
@@ -3171,540 +2457,104 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // New content while following is handled inside the virtualizer (RO re-pin
   // for in-place growth + append layout-effect pin for new items), so ChatPage
   // does not run its own message-length scroll effect.
-  // Older-sessions history is fetched lazily, not on mount (#765): the
-  // sidebar's "Older sessions" section self-fetches when expanded (see
-  // ChatSidebar's footer toggle -- the section starts collapsed and its open
-  // state is not persisted, so it can never be open at mount), which leaves
-  // the welcome-screen "Continue a previous chat?" suggestions as the only
-  // consumer that can need the payload before that. They need it only once
-  // the user has typed something, so seed on the FIRST keystroke (raw input,
-  // not the 300ms-debounced historyQuery -- keying off the debounce would
-  // stack a round-trip after it, and on the high-RTT tunnels this targets
-  // the suggestions could land after the user already hit Enter; this way
-  // the fetch rides inside the debounce window at the same request cost).
-  // An unconditional mount fetch cost one round-trip on every warm reload
-  // for a list that is usually never shown. Once-only: the ref latches even
-  // when the list is already populated (the sidebar fetched first), so
-  // typing never re-fetches.
-  const historySeededRef = useRef(false)
-  useEffect(() => {
-    if (historySeededRef.current || !input.trim()) return
-    historySeededRef.current = true
-    if (history.length === 0) dispatch(fetchHistory(false))
-  }, [input, history.length, dispatch])
-  // Persist active slot to localStorage for refresh recovery (per-mode)
-  const slotStorageKey = `mc-active-slot-${mode || 'chat'}`
-  const slotStorageKeyRef = useRef(slotStorageKey); slotStorageKeyRef.current = slotStorageKey
-  useEffect(() => {
-    if (activeSlot && filteredSlots.some(s => s.key === activeSlot)) {
-      safeSetItem(slotStorageKey, activeSlot)
-    }
-  }, [activeSlot, slotStorageKey, filteredSlots])
-  useEffect(() => () => { if (activeSlotRef.current && filteredSlotsRef.current.find(s => s.key === activeSlotRef.current)) safeSetItem(slotStorageKeyRef.current, activeSlotRef.current) }, [])
-
-  /* ── Session tabs (#4477) ────────────────────────────────────────────────
-   *  The working set drawn by SessionTabStrip. The hook keeps the active
-   *  session in the set, so a user who never opens a second tab holds a
-   *  one-element set and the strip renders nothing.
-   *
-   *  `ownsSessionTabs` is the ONE predicate deciding both who draws the strip
-   *  and who owns the persisted set. It has to be one predicate: ChatPage is
-   *  also mounted by embedded hosts — a popped-out window, the artifact
-   *  companion panel, Papyrus's co-author panel, the app-SDK chat panel — and
-   *  they share the dashboard's origin, therefore its `localStorage`. Two
-   *  separate conditions would let a host that cannot draw a strip still
-   *  reconcile the key, overwriting the dashboard's working set with a session
-   *  it never opened. `embedded` is exactly that line: every one of those hosts
-   *  passes it, and the routed /chat surface passes none of these flags.
-   *
-   *  Switching is dispatched HERE rather than inside the hook: `switchSlot` is
-   *  the surface's one session-entry path (URL sync, transcript hydration and
-   *  the composer all hang off it), and a second caller inside a layout hook
-   *  would be a second place that decides what "activate" means. */
-  const ownsSessionTabs = !embedded
-  // Read at click time, not captured: the callbacks below are memoized and the
-  // gateway can drop between renders.
-  const connectedRef = useRef(connected)
-  connectedRef.current = connected
-  const sessionTabs = useSessionTabs(mode, activeSlot, filteredSlots, ownsSessionTabs)
-  /**
-   * Every tab path that activates a session is gated on `connected`, for the
-   * reason the sidebar row's own click already documents: an offline
-   * `switchSlot` never resolves its fetch, `switchSlot.rejected` clears
-   * `messages` to `[]`, and the user is left looking at the WelcomeView where
-   * their transcript was. A tab is a second door onto the same action, so it
-   * needs the same lock — and the strip is marked aria-disabled so the click
-   * visibly refuses instead of silently doing nothing.
-   */
-  const openSlotInNewTab = useCallback((key: string, opts?: { background?: boolean }) => {
-    sessionTabs.openInNewTab(key)
-    // A BACKGROUND open (middle-click, modifier-click) queues the session and
-    // leaves the user where they are — the browser/editor meaning of the
-    // gesture, and the whole point of using it to triage several rows in a row.
-    // The row menu is a deliberate "take me there", so it opens in foreground.
-    if (opts?.background) return
-    if (!connectedRef.current) return
-    if (key !== activeSlotRef.current) dispatch(switchSlot(key))
-    // Depends on the ONE member it calls, not on `sessionTabs` — that hook
-    // returns a fresh object literal every render, so the whole object as a dep
-    // makes this callback (and thus ChatSidebar's `onOpenSlotInNewTab`, and thus
-    // the sidebar's `memo`) churn on every ChatPage render. `openInNewTab` is
-    // itself dep-free, so this identity is genuinely stable.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionTabs.openInNewTab, dispatch])
-  const selectSessionTab = useCallback((key: string) => {
-    if (key === activeSlotRef.current || !connectedRef.current) return
-    dispatch(switchSlot(key))
-  }, [dispatch])
-  const closeSessionTab = useCallback((key: string) => {
-    const next = sessionTabs.closeTab(key)
-    // Only the ACTIVE tab's close moves the user; closing any other tab must
-    // leave the transcript they are reading alone (nextActiveAfterClose returns
-    // the unchanged active key in that case, so this compare is the whole gate).
-    // Closing a tab is local, so it still works offline — only the switch that
-    // would follow is withheld, leaving the user on the transcript they have.
-    if (next && next !== activeSlotRef.current && connectedRef.current) dispatch(switchSlot(next))
-    // Below two tabs the strip unmounts, so a keyboard close has no tab left to
-    // land on and the strip cannot hand focus off itself. Without this, focus
-    // falls to document.body and the user Tabs in from the top of the page.
-    // The composer is the surface's own default focus target.
-    if (sessionTabs.tabs.filter(k => k !== key).length < 2) focusComposer()
-  }, [sessionTabs, dispatch])
-  // Handle ?sid= (or legacy ?slot=) query parameter — activate the given session
-  // Capture initial ?sid= at mount time before any effect can overwrite it
-  // noUrlSync also disables the sid-READ paths, not just the URL write. The host
-  // route (e.g. /artifacts/:slug) is not required to be sid-free: land on
-  // /artifacts/foo?sid=other and an ungated read effect would switchSlot() the
-  // embedded panel onto an unrelated session, so the composer would send into
-  // it. Zeroing the ref here neutralizes the mount-activation effect AND the 5s
-  // "session not found" timeout that keys off it; the POP effect reads
-  // searchParams live and is gated separately below.
-  const initialSidRef = useRef(noUrlSync ? null : (searchParams.get('sid') || searchParams.get('slot')))
-  // The active slot as of MOUNT. Redux outlives this component, so `activeSlot`
-  // being set says nothing about whether the USER chose it during this visit —
-  // only a change away from this snapshot does.
-  const mountSlotRef = useRef(activeSlot)
-  // A deep link (?sid=) naming a DIFFERENT session than the one Redux carried
-  // over owns the first switch of this mount — see the mount re-fetch effect.
-  const deepLinkPendingRef = useRef(!!initialSidRef.current && initialSidRef.current !== activeSlot)
-  const initialMsgRef = useRef(searchParams.get('msg'))
-  const initialMidRef = useRef(searchParams.get('mid'))
-  const initialNewRef = useRef(searchParams.get('new') === '1')
-  // Deep-link mount activation in progress — stops the sync effect from stripping
-  // ?sid before activation lands. Cleared once activeSlot is truthy.
-  const pendingSidRef = useRef(!!initialSidRef.current)
-  // Back/Forward (POP) in flight — set ONLY by the POP effect. Kept separate from
-  // pendingSidRef so a deep-link load doesn't trip the POP bail and freeze the
-  // first sidebar switch.
-  const popInFlightRef = useRef(false)
-  // react-router reports the initial render as navigationType 'POP'. That first
-  // run is the deep-link load (owned by initialSidRef), not a real Back/Forward —
-  // skip it so the POP effect doesn't wrongly arm popInFlightRef on mount.
-  const popReadyRef = useRef(false)
-  // Last history entry key honored by the POP effect — distinguishes a genuine
-  // Back/Forward (new location.key) from a re-render where navigationType is
-  // still stuck at 'POP'.
-  const lastLocKeyRef = useRef<string | null>(null)
-  /**
-   * True while THIS page's own `navigate(-1)` — consuming the history entry the
-   * mobile sessions drawer pushed — is in flight.
-   *
-   * Declared next to the other pop refs because it is read by the same effect.
-   * That pop is not the user retracing sessions: the entry it lands on carries
-   * the `?sid=` from before the drawer opened, which is the OUTGOING session
-   * whenever the drawer was closed by picking a different one. Honoring it would
-   * switch the user straight back to the session they just left — the conflict
-   * that kept #5795 out of #5794. The URL is corrected by the `activeSlot → ?sid`
-   * effect below, which replaces (never pushes) on mobile, so the entry ends up
-   * naming the session actually on screen at the pre-drawer stack depth.
-   */
-  const drawerPopRef = useRef(false)
-  /** Keys of history entries a session-switch PUSH created or left behind — the
-   *  only ones a POP may legitimately return to as a session. Written by the
-   *  `activeSlot -> ?sid` sync effect, read by the POP reader; see
-   *  `popMaySwitchSession`. */
-  const pushedSessionEntryKeys = useRef<Set<string>>(new Set())
-  /** A push has been issued and its destination key is not minted yet — the sync
-   *  effect records it on the commit that push lands in. */
-  const pushedEntryPending = useRef(false)
-  const [sidError, setSidError] = useState('')
-  const [newSlotFailed, setNewSlotFailed] = useState(false)
-  const [highlightTs, setHighlightTs] = useState<string | null>(null)
-  // ?new=1: create a blank slot for an embed or a fresh desktop window.
-  const newSlotMutation = useMutation({
-    mutationFn: () => dispatch(createSlot({ mode })).unwrap(),
-    onSuccess: (slot) => {
-      newSessionRef.current = false
-      setNewSlotFailed(false)
-      setSidError('')
-      if (!slot?.key) return
-      navigate(
-        embedMode ? `/embed/chat/${slot.key}` : `/chat?sid=${encodeURIComponent(slot.key)}`,
-        { replace: true },
-      )
-    },
-    onError: () => {
-      // Keep the failed window on its blank-session surface. Clearing only the
-      // ref lets the auto-select effect silently fall back to an older session,
-      // which makes a failed "New Window" look as if it copied that session.
-      newSessionRef.current = false
-      setNewSlotFailed(true)
-      setSidError(i18nT('pages.chatPage.could_not_start_a_new_session'))
-    },
+  const session = useChatPageSessionController({
+    activeSlot,
+    activeSlotRef,
+    connected,
+    defaultAgent,
+    dispatch,
+    drafts,
+    embedMode,
+    embedded,
+    fileDrafts,
+    filteredSlots,
+    filteredSlotsRef,
+    history,
+    inputNonBlank,
+    isMobile,
+    locationKey: location.key,
+    locationPathname: location.pathname,
+    locationHash: location.hash,
+    mode,
+    navigate,
+    navigationType,
+    newSessionRef,
+    noUrlSync,
+    pasteDrafts,
+    popout,
+    prevSlot,
+    saveDrafts,
+    searchParams,
+    slots,
+    tokenConsumingRef,
   })
-  useEffect(() => {
-    if (!initialNewRef.current || (embedded && !embedMode) || popout) return
-    initialNewRef.current = false
-    newSessionRef.current = true
-    setNewSlotFailed(false)
-    setSidError('')
-    if (!embedMode) dispatch(setActiveSlot(null))
-    newSlotMutation.mutate()
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  // Choosing a real session explicitly abandons a failed blank-window intent;
-  // its banner must not follow the user into the selected conversation.
-  useEffect(() => {
-    if (!activeSlot || !newSlotFailed) return
-    setNewSlotFailed(false)
-    setSidError('')
-  }, [activeSlot, newSlotFailed])
-  // On mount, URL ?sid= drives which session is active (URL wins over localStorage)
-  useEffect(() => {
-    if (embedded && !embedMode) return
-    if (!connected) return  // offline: defer URL-driven switchSlot until reconnect
-    const urlSlot = initialSidRef.current
-    if (!urlSlot) return
-    // The deep-link ?sid only sets the INITIAL active slot. The slot list can
-    // populate AFTER the user has already clicked a different session in the
-    // sidebar (switchSlot.pending sets activeSlot synchronously); without this
-    // guard the delayed activation would override that click and snap the UI
-    // back to the deep-linked session.
-    //
-    // The comparison is against the slot as of MOUNT, not against "is there any
-    // active slot at all". `activeSlot` lives in Redux, which outlives this
-    // component: a deep link followed from another dashboard page (the System
-    // page's Session & Task Memory rows, Telemetry's conversation links) mounts
-    // here with the previously-visited session already active, and a bare
-    // truthiness check read that as "the user already chose" and silently
-    // dropped the link — you clicked a session and landed on a different one.
-    // Only a switch that happened AFTER this mount is a real user choice.
-    // Both abandon paths clear the in-flight flag, because arming happens BELOW
-    // and this effect re-runs: an earlier run can have armed it while waiting for
-    // a slot that had not arrived, and the run that abandons the link is a
-    // different one. Leaving it set would kill URL sync for the rest of the mount
-    // — and the not-found timeout is no backstop here, since it only acts while
-    // `initialSidRef` is still set, which these branches clear.
-    if (activeSlot !== mountSlotRef.current) {
-      initialSidRef.current = null
-      popInFlightRef.current = false
-      return
-    }
-    if (activeSlot === urlSlot) {
-      initialSidRef.current = null
-      popInFlightRef.current = false
-      return
-    }
-    // Armed BEFORE the slot is known to exist, because the wait is exactly when
-    // the damage happens: a session created and linked in one go (the app pages'
-    // create-then-navigate) puts `?sid=` in the URL before its slots frame
-    // arrives, and during that window the URL-sync effect below sees a `sid` it
-    // cannot match and PUSHes a history entry for the carried-over session — so
-    // Back opens that session instead of the page the link came from. Same
-    // stale-closure hazard a Back/Forward has, so it takes the same guard.
-    // Released by the sync effect once activeSlot matches the URL, and by the
-    // not-found timeout, so a link that never resolves cannot wedge URL sync.
-    popInFlightRef.current = true
-    // `some` on an empty list is false, so an unpopulated slot list waits here
-    // too; this effect re-runs when `filteredSlots` arrives.
-    if (filteredSlots.some(s => s.key === urlSlot)) {
-      initialSidRef.current = null
-      popInFlightRef.current = true
-      dispatch(switchSlot(urlSlot))
-    }
-    // Don't error immediately — slot may arrive via SSE shortly
-    // embedded/embedMode are read in the guard above; they are stable for the
-    // session, so listing them satisfies the linter without changing behavior.
-  }, [filteredSlots, activeSlot, dispatch, connected, embedded, embedMode])
-  // React to ?sid= changes AFTER mount — required for plugin tab switching
-  // where the URL is updated via react-router navigate() (soft nav). The
-  // mount-only initialSidRef approach above misses these updates because
-  // the component doesn't remount across soft navs. Without this effect
-  // the "activeSlot → URL" sync below would rewrite the URL back to the
-  // current activeSlot instead of switching to the slot the URL is asking
-  // for.
-  //
-  // Embed mode: react to ANY ?sid change (the host app drives the URL).
-  // Main dashboard: react ONLY to a genuine Back/Forward (navigationType POP).
-  // Our own activeSlot→URL writes are PUSH/REPLACE, so they never re-enter here
-  // — that is what avoids the activeSlot↔URL ping-pong. A session switch pushes
-  // a ?sid history entry (sync effect
-  // below), so native browser/Electron Back/Forward (and Alt+←/→) retrace the
-  // sessions you've visited.
-  //
-  // Also gated on `connected`: when offline the switchSlot dispatch fails
-  // (fetchSlotDetail rejects) and clears messages, leaving an activeSlot
-  // with empty messages — the WelcomeView fallback then renders. Defer
-  // the switch until reconnect so cached state stays put.
-  useEffect(() => {
-    // noUrlSync: the host page owns the URL and the panel's session is chosen by
-    // the host, never by a query param. This effect otherwise treats embedMode as
-    // "the host drives ?sid" and would switch the panel onto whatever session the
-    // host route happens to carry.
-    if (noUrlSync) return
-    // Rewrite the entry we are STANDING ON so its `?sid=` names the session
-    // actually on screen. Shared by the two POP paths that must not honour a
-    // stale sid, because the alternative — leaving the URL wrong and relying on
-    // the `activeSlot -> ?sid` effect below to catch up — is what #8209 had to
-    // come back and fix once already. Replacing (never pushing) keeps the stack
-    // depth the pop just restored, and `activeSlotRef` is the render-current
-    // value even when the pop originated in this same commit.
-    const repairPoppedSid = () => {
-      const target = activeSlotRef.current
-      const urlSlot = searchParams.get('sid') || searchParams.get('slot')
-      if (!target || target === urlSlot) return
-      const next = new URLSearchParams(searchParams)
-      next.set('sid', target)
-      next.delete('slot')
-      navigate(
-        { pathname: location.pathname, search: `?${next}`, hash: location.hash },
-        { replace: true },
-      )
-    }
-    // Our own drawer-entry consumption, not a Back/Forward the user asked for.
-    // Correct the POP's stale outgoing `?sid=` HERE, in the effect that owns the
-    // POP, rather than relying on the separate activeSlot -> URL effect below.
-    // In a real mobile browser those two navigation effects can be committed in
-    // either order: a fast New Chat activates the newborn slot, closes the
-    // drawer, then this POP lands on the duplicate's predecessor naming the old
-    // slot. If the generic sync is still gated by a prior POP claim, the old URL
-    // wins and its reader switches Redux straight back, leaving an empty New
-    // Session row behind. MemoryRouter settles synchronously and hid that race.
-    //
-    // `activeSlotRef` is the render-current value even when the close originated
-    // from createSlot.fulfilled in this same commit. Replacing only this popped
-    // entry also preserves the one-entry drawer invariant: the duplicate is gone,
-    // and the surviving history entry names the session actually on screen.
-    if (drawerPopRef.current) {
-      drawerPopRef.current = false
-      lastLocKeyRef.current = location.key
-      popInFlightRef.current = false
-      repairPoppedSid()
-      return
-    }
-    // Embed: host app drives the URL — react to any ?sid change.
-    // Main dashboard: honor only a genuine Back/Forward POP. react-router reports
-    // the initial render as 'POP' and stays 'POP' until our own switch navigates
-    // (PUSH/REPLACE); a real Back/Forward is a POP that follows one of those. So
-    // arm on the first non-POP nav and only honor POP once armed — this ignores
-    // the mount POP (deep-link load, owned by initialSidRef) so it can't wrongly
-    // arm popInFlightRef and freeze the next switch.
-    if (!embedMode) {
-      if (navigationType !== 'POP') { popReadyRef.current = true; lastLocKeyRef.current = location.key; return }
-      if (!popReadyRef.current) return
-      // navigationType stays 'POP' after a Back/Forward until our own navigate()
-      // runs. Without this guard the effect re-fires on every activeSlot change
-      // (a sidebar click) while still 'POP', reads the stale URL sid, and reverts
-      // the click — locking the URL to one chat. location.key changes only on a
-      // genuine history navigation, so honor a POP exactly once per new entry.
-      if (location.key === lastLocKeyRef.current) return
-      lastLocKeyRef.current = location.key
-    }
-    if (!connected) return
-    const urlSid = searchParams.get('sid') || searchParams.get('slot')
-    if (!urlSid || urlSid === activeSlot) return
-    // Mobile replaces on every session switch, so an entry here was pushed by a
-    // switch only if the write side recorded it as one — see
-    // `popMaySwitchSession`. Repair an unrecorded stale sid rather than obeying
-    // it, which is what walked the pane back into the outgoing chat when the
-    // sessions drawer's pop arrived a commit late (#8207).
-    const entryPushedBySwitch = pushedSessionEntryKeys.current.has(location.key)
-    if (!embedMode && !popMaySwitchSession({ isMobile, entryPushedBySwitch })) {
-      repairPoppedSid()
-      return
-    }
-    if (filteredSlots.some(s => s.key === urlSid)) {
-      popInFlightRef.current = true
-      dispatch(switchSlot(urlSid))
-    }
-  }, [searchParams, filteredSlots, activeSlot, dispatch, embedMode, navigationType, location.key, location.pathname, location.hash, connected, noUrlSync, navigate, isMobile])
-  // Timeout: if slot never appears after 5s, show error.
-  // Gated on `connected` so the timer only runs while the gateway is reachable
-  // — otherwise an offline tab would burn its 5s while the resolve effects
-  // above are deferred, fire a false "Session not found", clear initialSidRef,
-  // and the resolve never happens once the gateway comes back. Re-runs the
-  // effect when connected flips so the timer starts fresh on reconnect.
-  // Also gated on `slotsLoaded`: firing is one-way (it clears `initialSidRef`),
-  // so arming before the list lands makes a late arrival unresolvable.
-  const slotsLoaded = useAppSelector(s => s.dashboard.slotsLoaded)
-  useEffect(() => {
-    if (!connected || !slotsLoaded) return
-    const urlSlot = initialSidRef.current
-    if (!urlSlot) return
-    const timer = setTimeout(() => {
-      if (initialSidRef.current) {
-        initialSidRef.current = null
-        pendingSidRef.current = false
-        popInFlightRef.current = false
-        setSidError(i18nT('pages.chatPage.session_not_found', { name: urlSlot }))
-        // Deliberately does NOT refresh the session on screen. The deep link did
-        // own this mount's fetch, so that session's messages can be as stale as
-        // Redux left them — but a refresh here races the user: five seconds is
-        // long enough to type and send, and the in-flight response would land
-        // after the optimistic row and replace both it and `running`, making the
-        // turn they just sent disappear. Stale-until-next-interaction is the
-        // lesser fault, and the banner above tells them the link failed.
-      }
-    }, 5000)
-    return () => clearTimeout(timer)
-  }, [connected, slotsLoaded])
-  // Sync activeSlot → ?sid= in URL (persistent deep-link)
-  // Skip entirely when embedded — URL belongs to the host app
-  const basePath = popout ? '/popout/chat' : embedMode === 'chat' || embedMode === 'sessions' ? '/embed/chat' : '/chat'
-  const searchParamsRef = useRef(searchParams)
-  searchParamsRef.current = searchParams
-  useEffect(() => {
-    if (embedded && !embedMode) return
-    // noUrlSync (artifact companion chat panel): the host page owns the URL
-    // entirely (e.g. /artifacts/:slug) and passes embedMode="chat" only for its
-    // single-session chrome (no sessions sidebar). Never write ?sid= or
-    // navigate to basePath — an in-place navigate would swap the host route out
-    // from under the panel. The sid-READ paths are gated for the same flag
-    // above (initialSidRef + the post-mount POP effect); do not assume a
-    // noUrlSync host route is sid-free.
-    if (noUrlSync) return
-    // In sessions embed mode, the URL is `/embed/sessions` regardless of
-    // activeSlot. Navigation away from sessions is driven by the explicit
-    // onSelectSlot callback in ChatSidebar — never auto-navigate from here,
-    // since activeSlot may change due to background state (initial load,
-    // localStorage hydration, WS updates) which would unwantedly bounce
-    // the user back into chat view.
-    if (embedMode === 'sessions') return
-    // Land the key claimed by our own push below. This effect re-runs on
-    // `location.key`, so the first run after that navigate is standing ON the
-    // entry the push created — the Forward target. Placed ahead of every early
-    // return: the run that lands here is exactly the one where the URL already
-    // agrees with `activeSlot`, which is the earliest bail.
-    if (pushedEntryPending.current) {
-      pushedEntryPending.current = false
-      pushedSessionEntryKeys.current.add(location.key)
-    }
-    const sp = searchParamsRef.current
-    // Back/Forward (POP) activation in flight: the browser already set the URL to
-    // the target session and activeSlot is catching up via the switchSlot the
-    // ?sid→activeSlot effect above just dispatched. Writing the URL here would run
-    // with a STALE activeSlot (the slot we're leaving) and push a spurious history
-    // entry for it — corrupting multi-step Back/Forward. Bail until activeSlot
-    // matches the URL, then fall through for replace-only slug normalization (a POP
-    // must never produce a push).
-    if (popInFlightRef.current) {
-      // `sid || slot` — the same pair the READ paths accept. A legacy `?slot=`
-      // link resolves through this flag too, and matching on `sid` alone would
-      // never release it: the flag would stay armed for the life of the mount,
-      // so URL sync would be dead and a later session switch would leave the
-      // URL (and therefore a reload) pointing at the wrong session.
-      const urlSlot = sp.get('sid') || sp.get('slot')
-      if (!activeSlot || activeSlot !== urlSlot) return
-      popInFlightRef.current = false
-    }
-    if (!activeSlot) {
-      if (sp.has('sid') && !initialSidRef.current && !pendingSidRef.current) {
-        navigate(basePath, { replace: true })
-      }
-      return
-    }
-    pendingSidRef.current = false
-    const current = sp.get('sid')
-    const slot = filteredSlots.find(s => s.key === activeSlot)
-    const slug = slot?.title && slot.title !== slot.key ? toSlug(slot.title) : ''
-    const expectedPath = `${basePath}${slug ? '/' + slug : ''}`
-    if (current === activeSlot && location.pathname === expectedPath) return
-    const next = new URLSearchParams(sp)
-    next.set('sid', activeSlot)
-    next.delete('slot')
-    next.delete('prefill')
-    next.delete('autoSend')
-    next.delete('newSession')
-    next.delete('msg')
-    // Push vs replace — see `shouldReplaceSessionUrl` for why mobile never
-    // pushes. Kept as a named predicate rather than an inline boolean so the
-    // reasoning has somewhere to live and a test can pin it.
-    const isSessionSwitch = !!current && current !== activeSlot
-    const replace = shouldReplaceSessionUrl({ isSessionSwitch, isMobile })
-    // A push leaves the entry we are standing on behind, still naming the session
-    // it was showing, and CREATES another naming the session switched to. Both
-    // were made by a session switch, so both are legitimate history targets — the
-    // first for Back, the second for Forward — and the POP reader must honour
-    // either even if the layout has since crossed the mobile breakpoint. Recorded
-    // here because this is the only place that knows a push happened; the reader
-    // would otherwise have to guess from the viewport, which is read at a
-    // different time (see `popMaySwitchSession`). Per-mount, like every other ref
-    // this reader keeps: a reload starts the history bookkeeping over anyway.
-    //
-    // The destination's key does not exist yet — the router mints it — so it is
-    // claimed here and recorded by the block at the top of this effect on the
-    // commit the push lands in. Recording only the entry left behind made Forward
-    // read as stale, and the reader REPAIRS what it declines, so Forward
-    // overwrote the very session it should have restored.
-    if (!replace) {
-      pushedSessionEntryKeys.current.add(location.key)
-      pushedEntryPending.current = true
-    }
-    navigate(`${basePath}${slug ? '/' + slug : ''}?${next}`, { replace })
-    // `location.key` and not just `location.pathname`: consuming the mobile
-    // drawer's history entry lands on a DIFFERENT entry whose pathname is
-    // IDENTICAL (the entry was a duplicate), so pathname alone reports no change
-    // and this effect would not re-run — leaving `?sid=` naming the session the
-    // user just switched AWAY from, which a reload would then restore. The key
-    // changes on any history move, which is the thing that actually happened.
-    // POPs are still funnelled through the `popInFlightRef` bail above, so this
-    // adds a re-check, not a new writer.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSlot, filteredSlots, navigate, basePath, location.pathname, location.key, embedded, noUrlSync, isMobile])
-  // Re-fetch slot messages on mount (handles nav away + back).
-  // Skip when newSession=1 — createSlot in send() will set the active slot;
-  // dispatching switchSlot here would race and overwrite it.
-  //
-  // Also skipped while a deep link (?sid=) names a DIFFERENT session: this
-  // effect runs after the sid-activation effect above, so re-fetching the slot
-  // Redux carried over from the previous page would switch straight back and
-  // silently undo the link — clicking a session on the System page landed you
-  // in whatever chat you had open before. The sid effect's own switchSlot
-  // fetches, so nothing is lost by skipping here.
-  useEffect(() => { if (!deepLinkPendingRef.current && activeSlot && !newSessionRef.current && filteredSlotsRef.current.find(s => s.key === activeSlot)) dispatch(switchSlot(activeSlot)) }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  // Clear activeSlot when it belongs to a different mode (page switch)
-  useEffect(() => {
-    if (activeSlot && slots.length > 0 && !filteredSlots.find(s => s.key === activeSlot)) {
-      dispatch(setActiveSlot(null))
-    }
-  }, [activeSlot, slots.length, filteredSlots, dispatch])
-  // Auto-select slot after refresh — restore from localStorage or pick first
-  // If no slots exist at all, auto-create one so the user lands in a ready chat
-  const autoCreatedRef = useRef(false)
-  useEffect(() => {
-    if (activeSlot) return
-    // Don't auto-select/auto-create while the challenge-redirect token effect
-    // is still creating + slack-linking its session; otherwise we'd switch to
-    // a different slot and orphan the linked one (breaking Slack mirroring).
-    if (tokenConsumingRef.current) return
-    if (newSessionRef.current || newSlotFailed) return
-    if (searchParams.get('slot') || searchParams.get('sid') || initialSidRef.current) return
-    if (filteredSlots.length > 0) {
-      const saved = localStorage.getItem(slotStorageKey)
-      const target = saved && filteredSlots.find(s => s.key === saved) ? saved : filteredSlots[0].key
-      dispatch(switchSlot(target))
-    } else if (connected && slotsLoaded && !autoCreatedRef.current) {
-      // Connected, slots fetched, and truly empty — auto-create one
-      autoCreatedRef.current = true
-      dispatch(createSlot({ agent: defaultAgent || undefined, mode }))
-    }
-  }, [activeSlot, filteredSlots, searchParams, dispatch, slotStorageKey, connected, slotsLoaded, defaultAgent, mode, newSlotFailed])
+  const {
+    appSlotLaunch,
+    setAppSlotLaunch,
+    closeSessionTab,
+    drawerPopRef,
+    handleResumeSession,
+    highlightTs,
+    initialMidRef,
+    initialMsgRef,
+    initialSidRef,
+    newSlotFailed,
+    newSlotMutation,
+    openSlotInNewTab,
+    ownsSessionTabs,
+    selectSessionTab,
+    sessionTabs,
+    setHighlightTs,
+    setNewSlotFailed,
+    setSidError,
+    sidError,
+  } = session
 
-  // Slot switch: the virtualizer (keyed on sessionId = activeSlot) owns entry
-  // placement — it force-pins to the bottom (arming follow) or restores a
-  // saved reading position (leaving follow released). The gating effects below
-  // read that live state via vGetFollowRef, so nothing here needs re-arming;
-  // forcing "at bottom" on switch used to yank a restored mid-history reader
-  // the moment a tip band or a running-state tick fired.
+  // Only the routed chat consumes app launch intents. Existing-slot messages
+  // arrive here only after the session controller has fulfilled activation.
+  useEffect(() => {
+    if (embedded || !connected) return
+    const launchWindow = window as Window & {
+      __mc_chat_launch?: { ts?: number; agent?: string; message?: string; slotKey?: string; autoSend?: boolean }
+    }
+    const intent = appSlotLaunch ?? launchWindow.__mc_chat_launch
+    if (!intent) return
+    if (!appSlotLaunch) {
+      if (Date.now() - (launchWindow.__mc_chat_launch?.ts ?? 0) > 10_000) {
+        delete launchWindow.__mc_chat_launch
+        return
+      }
+      // The controller owns existing-slot activation and fresh-draft creation.
+      if (intent.slotKey || intent.autoSend === false) return
+      delete launchWindow.__mc_chat_launch
+    } else {
+      if (slotLoading) return
+      setAppSlotLaunch(null)
+      // A user switch while activation was pending cancels this launch rather
+      // than sending into whichever conversation they chose instead.
+      if (activeSlot !== intent.slotKey) {
+        if (intent.message) setActionError({ message: i18nT('appChatLaunch.unsent', { error: i18nT('appChatLaunch.cancelled'), message: intent.message }), preserveOnSwitch: true })
+        return
+      }
+    }
+    // An existing slot keeps its own agent. Agent selection applies only to a
+    // new session, never as an implicit switch of an existing private binding.
+    if (intent.agent && !intent.slotKey) setPendingAgent(intent.agent)
+    if (!intent.message) return
+    if (intent.autoSend === false && activeSlot) {
+      newSessionRef.current = false
+      const merged = mergeIntoDraft(drafts.current[activeSlot], intent.message)
+      setDraft(drafts.current, activeSlot, merged)
+      saveDraftsDebounced()
+      setInput(merged)
+      raisePrefillHint()
+    } else {
+      autoSendRef.current = intent.message
+      appLaunchSendRef.current = { slotKey: intent.slotKey }
+      newSessionRef.current = !intent.slotKey
+      setAutoSendTick(t => t + 1)
+    }
+  }, [embedded, connected, activeSlot, slotLoading, location.key, appSlotLaunch, setAppSlotLaunch, saveDraftsDebounced, raisePrefillHint, setPendingAgent, setInput])
 
   // Auto-scroll during streaming — only when pinned to bottom
   const lastMsg = messages[messages.length - 1]
@@ -3727,8 +2577,30 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Read by the option handler instead of the state: two clicks landing before a
   // re-render would both see the same set and both take the append branch.
   const followUpPickedRef = useRef(followUpPicked); followUpPickedRef.current = followUpPicked
+  // Ownership of the appended suffix, not content-matching (#7616). See
+  // lib/followUpToggle (shared with ChatPane): the chips own a recorded
+  // (base, options) span, options kept as an ARRAY so a comma-bearing label is
+  // one element. Advanced SYNCHRONOUSLY in the click handler, never in a
+  // render-time state updater, so StrictMode's double-invocation cannot rebase
+  // it on stale state (the #7616 F2 defect).
+  const followUpInsertedRef = useRef<OwnedSuffix | null>(null)
+  // Any DIRECT user edit of the composer invalidates chip ownership (#7616) —
+  // the recorded span describes a chip-produced draft, so once the user types
+  // it no longer maps to the live text (even an edit-then-restore). Chip
+  // append/remove set the ref themselves and call setInput directly, bypassing
+  // this handler, so they are unaffected.
+  const clearFollowUpOwnership = useCallback(() => { followUpInsertedRef.current = null }, [])
+  // Stable identities for the composer's change handlers. An inline arrow is a
+  // new `onChange` on every page render, which re-keys the Composer root's
+  // context and re-renders every atom under it.
+  const composerRootChange = useCallback((v: string) => { clearFollowUpOwnership(); setInput(v) }, [clearFollowUpOwnership, setInput])
+  const prefillEditedRef = useRef(prefillEdited); prefillEditedRef.current = prefillEdited
+  const composerUserEdit = useCallback((v: string) => {
+    clearFollowUpOwnership(); setInput(v)
+    if (!prefillEditedRef.current) setPrefillEdited(true)
+  }, [clearFollowUpOwnership, setInput])
   const followUpOptionsKey = followUpOptions.join('\x00')
-  useEffect(() => { setFollowUpPicked(new Set()) }, [followUpOptionsKey, activeSlot])
+  useEffect(() => { setFollowUpPicked(new Set()); followUpInsertedRef.current = null }, [followUpOptionsKey, activeSlot])
   const { data: dashCfg } = useQuery<{ quick_send?: boolean; session_grid?: boolean; link_previews?: boolean; social_share_enabled?: boolean }>({ queryKey: ['dashboardConfig'], queryFn: () => api.dashboardConfig(), staleTime: 30_000 })
   // Session grid (split view) is an opt-in feature flag (Settings › Chat › Split View). Gates ⌘D, the Columns2 button, and the grid render.
   const splitFeatureEnabled = dashCfg?.session_grid === true
@@ -3742,6 +2614,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // entry stays hidden until it says true — the endpoint is the authority, the
   // frontend never guesses (same posture as the mobile-connect rail row).
   const socialShareOn = dashCfg?.social_share_enabled === true
+  // Whether the split send button may offer `Auto (Jev)`: the fleet ceiling and
+  // the owner's consent, both the gateway's answers (see useJevAutoSend).
+  const jevAutoConsented = useJevAutoSend()
   // Connections cards own consent for the providers they render, so chat drops
   // the duplicate OAuth banner — but only while that gallery is reachable.
   const connectionsUiOn = useConnectionsUiEnabled()
@@ -3780,32 +2655,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     dispatch(syncSlotRunningFromServer({ slot: s.key, running: s.running, stopping: s.stopping ?? false }))
   }, [slots, activeSlot, dispatch])
 
-  const handleResumeSession = useCallback(async (key: string, title: string) => {
-    try {
-      const result = await dispatch(resumeFromHistory({ key, title })).unwrap()
-      // The cleanup below is the SECOND half of a swap: it retires the tab the
-      // resumed session is replacing. A resume that answered with a surface
-      // this page cannot display never performs the first half -- the reducer
-      // short-circuits, so `activeSlot` still names the tab the user is in and
-      // the history row is still in the list. Running the cleanup anyway
-      // deleted that tab and discarded the text just typed into it, while the
-      // session the user asked for never opened (#5925). `ok` alone cannot
-      // tell the two apart: the wire request succeeds either way, which is why
-      // the thunk returns `surface` at all (#3624).
-      if (!result.ok || !isChatPageSurface(result.surface)) return
-      if (activeSlot && activeSlot !== key) {
-        delete drafts.current[activeSlot]; delete fileDrafts.current[activeSlot]; delete pasteDrafts.current[activeSlot]; prevSlot.current = null; saveDrafts()
-        dispatch(deleteSlot(activeSlot)).unwrap().catch(() => {})
-      }
-    } catch { /* resume failed — keep current slot */ }
-  }, [activeSlot, dispatch, saveDrafts])
   // Raw send — sends pre-built text directly to the server
   const modeRef = useRef(mode)
   modeRef.current = mode
   const planActionMutationRef = useRef(planActionMutation)
   planActionMutationRef.current = planActionMutation
 
-  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean) => {
+  // Resolves true when the server accepted the message (dispatched, queued,
+  // or received-but-late), false when nothing was delivered (offline, empty,
+  // intercepted locally, transport error, refused). UI reactions all stay
+  // inside send(); the verdict exists for callers that persist state only on
+  // delivery (ArtifactPanel's submit-to-chat batch marks comments sent on it).
+  const send = useCallback(async (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated = false): Promise<boolean> => {
     // Defense-in-depth: ChatInput already gates Send/Optimize buttons and
     // the keyboard Enter shortcut on `connected`, but a future caller (a
     // programmatic dispatch from a hotkey, a follow-up option click, an
@@ -3813,38 +2674,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // clear the draft via setInput('') below — losing the user's typed
     // message with no recovery path is the offline-UX regression we're
     // guarding against. Cheap belt-and-braces.
-    if (!connected) return
-    const raw = (optionText || inputRef.current).trim()
- // Capture + clear the widget-origin tag: attribute this
-    // turn to a widget only if the composer still carries the exact text a
-    // widget action pre-filled. Cleared on every send so it can't go stale.
-    const widgetOrigin = !!widgetPrefillRef.current && raw.includes(widgetPrefillRef.current)
-    widgetPrefillRef.current = null
-    if (!raw && !pendingFilesRef.current.length && !pendingSessionsRef.current.length) return
+    if (!connected) return false
+    const raw = (isolated ? optionText ?? '' : optionText || inputRef.current).trim()
+    // App launches own only their explicit text, not the composer's staged data.
+    const widgetOrigin = !isolated && !!widgetPrefillRef.current && raw.includes(widgetPrefillRef.current)
+    if (!isolated) widgetPrefillRef.current = null
+    if (!raw && (isolated || (!pendingFilesRef.current.length && !pendingSessionsRef.current.length))) return false
 
-    // Sending while STREAMING dictation is live ends the dictation. The panel
-    // advertises "Enter to send", so this path is reachable by design — and
-    // without it, streaming STT keeps running past the send: `onPartial`
-    // re-derives the composer value from `frozenInputRef`, which was snapshotted
-    // BEFORE the send cleared it, so the next partial repopulates the composer
-    // with text the user already sent. Disarm FIRST so any partial/final already
-    // in flight is dropped, then stop capture (stop() is async — up to 5s for
-    // the backend close).
-    //
-    // STREAMING ONLY, deliberately. In batch mode the transcription arrives
-    // exactly once, from `MediaRecorder.onstop` AFTER capture ends, and it
-    // arrives through `onText` — which honours `sttDisarmedRef`. Disarming here
-    // would throw away the entire recording, which is the opposite of the bug
-    // being fixed. Batch therefore keeps its pre-existing behaviour untouched:
-    // capture continues, and the transcript lands when the user stops.
-    if (voiceRef.current.recording && streamEnabledRef.current) {
-      sttDisarmedRef.current = true
-      frozenInputRef.current = null
-      lastDictationAnchorRef.current = null
-      lastDictationValueRef.current = null
-      postStopEditedRef.current = false
-      voiceRef.current.toggle()
-    }
+    // Sending while STREAMING dictation is live ends the dictation (see
+    // `useComposerVoice.disarmForSend` for the full rationale — streaming only,
+    // batch keeps capturing and lands its transcript when the user stops).
+    if (!isolated) composerRef.current?.voice()?.disarmForSend()
 
     // The session actually on screen at send time. Read from the ref (fresh
     // every render), not the closure `activeSlot` (stale until send() is
@@ -3854,16 +2694,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // clear, and (below) the send target.
     const uiSlot = activeSlotRef.current
 
-    // Capture the stateless card pending at ENTRY — before the first await
-    // below. This send consumes the answer channel of the card the user saw
-    // when they hit send; captured after an await, the card-submit flow can
-    // clear the card (or a newer one can land) in the gap, and the capture
-    // would compare against the wrong baseline (fork GPT review, 995718f).
+    // Capture a pending BLOCKING card at ENTRY — before the first await below.
+    // This send consumes the answer channel of the card the user saw when they
+    // hit send; captured after an await, the card-submit flow can resolve the
+    // card (or a newer one can land) in the gap, and the capture would compare
+    // against the wrong baseline. Its staleness is
+    // resolved over the network, not in the store. A STATELESS card needs no
+    // capture: the server retires it when this send's user row lands and
+    // announces it with `question_card_resolved`.
     const entrySendSlot = targetSlot ?? uiSlot
-    const cardAtSend = captureStatelessCard(store.getState().chat.pendingQuestions, entrySendSlot)
-    // Same entry-time capture for a BLOCKING card, whose staleness is resolved
-    // over the network instead of in the store.
-    const askAtSend = capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
+    // An app's supplied text is not the human's answer to a pending card.
+    // Null captures keep all composer-owned completion effects inert.
+    const askAtSend = isolated ? null : capturePendingAskId(store.getState().chat.pendingQuestions, entrySendSlot)
     // Entry-time capture of the folder-suggestion card, ONLY when it was
     // actually on screen for this send: the card renders solely in this page's
     // composer band for the ACTIVE slot, so a targeted send into another slot —
@@ -3872,7 +2714,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // aging dispatch below is ts-guarded so a replacement card arriving while
     // the POST is in flight does not inherit this send's age.
     const folderCardAtSend =
-      entrySendSlot && entrySendSlot === uiSlot ? store.getState().chat.folderSuggestions?.[entrySendSlot] : undefined
+      !isolated && entrySendSlot && entrySendSlot === uiSlot ? store.getState().chat.folderSuggestions?.[entrySendSlot] : undefined
 
     // Slash command interception (e.g. /side): runs before knowledge so a
     // bare prefix like /side returns immediately without touching input parse.
@@ -3882,7 +2724,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // (so a paste after "/side " reaches the side chat as content) and
     // delegated. On failure keep the composer intact so the question stays
     // recoverable — same rules as steer()'s guard.
-    if (isInterceptedSlashCommand(raw)) {
+    // An option answer (optionText — a question-card, follow-up or decision-
+    // card choice) is an answer payload for the agent, never a typed UI
+    // command: a choice that happens to look like "/side …" must reach the
+    // turn as text rather than open Side Chat and strand the card. Same
+    // carve-out the knowledge-fetch branch below applies.
+    if (!optionText && isInterceptedSlashCommand(raw)) {
       const slashPastes = pasteBlocksRef.current
       const slashTxt = slashPastes.length ? expandPasteTokens(raw, slashPastes) : raw
       const slashResult = await interceptSlashCommand(slashTxt, uiSlot, dispatch)
@@ -3897,7 +2744,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             message: slashResult.error || i18nT('pages.chatPage.side_command_not_run'),
           })
         }
-        return
+        return false
       }
     }
 
@@ -3906,31 +2753,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (kq && !optionText) {
       knowledgeFetchRef.current.searchKnowledge(kq)
       setInput('')
-      return
+      return false
     }
 
     // Snapshot the staged attachments BEFORE the composer is cleared below, so a
     // failed send can put them back (prepareSendPayload's `filePaths` drops
     // images, which would silently lose them on restore).
-    const sentFiles = pendingFilesRef.current.slice()
-    // Staged refs belong to the COMPOSER, so only a send that consumes the
-    // composer may carry them. An `optionText` send (a follow-up option click)
-    // supplies its own text and deliberately leaves the composer untouched —
-    // the clear below is skipped for exactly that reason. Consuming refs there
-    // anyway would attach them to an unrelated message AND leave them staged, so
-    // the same links would go out again on the user's next real send.
-    //
-    // Gated on the same condition as the clear, so the two can never disagree in
-    // either direction: no send-without-clear (duplicate) and no clear-without-
-    // send (silent loss). Scoped to refs on purpose — `pendingFiles` has carried
-    // this shape since long before this feature, and changing it here would widen
-    // the PR into pre-existing attachment behaviour.
-    const sentSessionRefs = optionText ? [] : pendingSessionsRef.current.slice()
-    // Snapshot the staged files BEFORE the optimistic clear below: if the
-    // server answers `queued`, this send's pre-serialization composer state
-    // is stashed so a cancel can restore it losslessly (see queuedSendStash).
-    const stagedFilesAtSend = [...new Set(pendingFilesRef.current)]
-    const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = prepareSendPayload(raw, pendingFilesRef.current)
+    const sentFiles = isolated ? [] : pendingFilesRef.current.slice()
+    // Explicit text already excludes staged session refs. App launches also
+    // exclude files, paste expansion and knowledge, without changing legacy
+    // option-click or composer-send behavior.
+    const sentSessionRefs = isolated || optionText ? [] : pendingSessionsRef.current.slice()
+    const stagedFilesAtSend = [...new Set(sentFiles)]
+    const { txt: typedTxt, displayTxt: typedDisplayTxt, filePaths } = isolated
+      ? { txt: raw, displayTxt: raw, filePaths: [] }
+      : prepareSendPayload(raw, sentFiles)
     // Folder references serialize like files but from the text alone: each
     // `@rel/` token becomes `[attached_dir N] /abs/path` in the LLM-facing
     // text (absolute, so the reference survives a cwd/project mismatch and
@@ -3939,7 +2776,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // file pass: file tokens never end in `/`, so the two rewrites are
     // disjoint. `dirPaths` rides `meta.dirs`, ordered so marker N indexes
     // dirPaths[N-1] losslessly.
-    const { llm: typedTxtDirs, dirPaths } = serializeDirTokens(typedTxt, currentProjectRef.current || '')
+    const { llm: typedTxtDirs, dirPaths } = isolated
+      ? { llm: typedTxt, dirPaths: [] }
+      : serializeDirTokens(typedTxt, currentProjectRef.current || '')
     // Staged session references become plain markdown links appended to the
     // message — deliberately a POINTER, not the referenced transcript. Inlining
     // another session's content would spend a large share of THIS session's
@@ -3959,21 +2798,33 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const displayTxt = appendSessionRefLinks(typedDisplayTxt, sentSessionRefs)
     // Expand paste tokens for the LLM; UI-facing displayTxt keeps the tokens
     // intact so the user bubble can render them as clickable chips.
-    const activePastes = pasteBlocksRef.current
+    const activePastes = isolated ? [] : pasteBlocksRef.current
     let llmTxt = activePastes.length ? expandPasteTokens(txt, activePastes) : txt
     // Prepend knowledge context if pending
     let knowledgeBlock: import('./chat/useKnowledgeFetch').KnowledgeBlock | null = null
-    if (knowledgeFetchRef.current.pendingKnowledge) {
+    if (!isolated && knowledgeFetchRef.current.pendingKnowledge) {
       knowledgeBlock = knowledgeFetchRef.current.pendingKnowledge
       llmTxt = expandKnowledgeBlock(knowledgeBlock) + '\n' + llmTxt
     }
-    knowledgeFetchRef.current.clearPending()
+    if (!isolated) knowledgeFetchRef.current.clearPending()
     const bubblePastes = pruneBlocksUtil(displayTxt, activePastes)
     if (bubblePastes.length) saveStoredPaste(llmTxt, displayTxt, bubblePastes, filePaths)
 
-    setPrefillHint(false)
-    if (!optionText) {
-      setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
+    if (!isolated) setPrefillHint(false)
+    // The alias sub-map this send is about to drop, kept as a frozen snapshot
+    // (deleting the key unhooks it; the object survives) so EVERY composer-
+    // recovery path can put the bookkeeping back beside the text and files it
+    // restores (fork GPT review): a queued send cancelled after this clear
+    // restored text + chips whose mentions reconciliation could no longer
+    // see -- hand-deleting one left a stale chip that the next send silently
+    // re-attached.
+    const sentSlotTokens = !isolated && !optionText && uiSlot ? pickedFileTokens.current[uiSlot] : undefined
+    if (!isolated && !optionText) {
+      // Drops only THIS slot's own token sub-map (`pickedFileTokens` is
+      // slot-scoped -- see its declaration), never another slot's: a
+      // DIFFERENT, still-open slot's attachment is untouched regardless of
+      // what this send just carried.
+      setInput(''); setPendingFiles([]); if (uiSlot) delete pickedFileTokens.current[uiSlot]; setPasteBlocks([]); setPendingSessions([]); if (uiSlot) { delete drafts.current[uiSlot]; delete fileDrafts.current[uiSlot]; delete pasteDrafts.current[uiSlot]; delete sessionRefDrafts.current[uiSlot]; saveDrafts() }
       // The challenge-handoff prompt is seeded into PREFILL_STORAGE_KEY and the
       // slot-restore effect re-applies it on slot changes. Once that prompt is
       // sent, clear the seed so a later slot-restore can't re-fill the (now
@@ -4000,9 +2851,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // paste blocks and attachments, surface the failure, and bail.
       let created: { key: string } | null = null
       try {
-        created = await dispatch(createSlot({ agent: pendingAgentRef.current || defaultAgent || undefined, model: pendingModelRef.current || undefined, mode: modeRef.current })).unwrap()
+        created = await dispatch(createSlot({ agent: pendingAgentRef.current || defaultAgent || undefined, agent_kind: pendingAgentRef.current ? pendingAgentKindRef.current : undefined, model: pendingModelRef.current || undefined, mode: modeRef.current })).unwrap()
       } catch (e: unknown) {
         sendingRef.current = false
+        if (isolated) {
+          // The app never consumed the composer. Keep its payload in the
+          // page-level copyable notice, which survives slot switches, instead
+          // of a draft or a user row that would age pending approvals.
+          const failure = i18nT('pages.chatPage.send_failed_with_error', { error: createFailReason(e) })
+          setActionError({ message: i18nT('appChatLaunch.unsent', { error: failure, message: raw }), title: i18nT('pages.chatPage.could_not_start_a_new_session'), preserveOnSwitch: true })
+          return false
+        }
         // Recover the payload WITHOUT clobbering anything newer. Two traps make a
         // plain assignment lossy here:
         //  - The composer is only cleared above when `!optionText`, and the
@@ -4042,25 +2901,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         const keepRefs = onScreen ? pendingSessionsRef.current : (uiSlot ? sessionRefDrafts.current[uiSlot] ?? [] : [])
         const restoredRefs = mergeSessionRefs(keepRefs, sentSessionRefs)
         const keepPastes = onScreen ? pasteBlocksRef.current : (uiSlot ? pasteDrafts.current[uiSlot] ?? [] : [])
-        const keptPasteIds = new Set(keepPastes.map(b => b.id))
         // Collapsed pastes resolve by `seq`, not id, and a paste made while the
         // composer was empty restarts at #1 — so a naive id-merge can leave two
         // blocks sharing #1, with both markers resolving to one of them and
-        // silently swapping the user's content on retry. Re-sequence the carried
-        // blocks past the kept ones and rewrite their markers in the payload text.
-        const { text: payload, blocks: carriedPastes } = remapCarriedBlocks(
-          raw,
-          activePastes.filter(x => !keptPasteIds.has(x.id)),
-          new Set(keepPastes.map(b => b.seq)),
-        )
-        const restoredPastes = [...keepPastes, ...carriedPastes]
+        // silently swapping the user's content on retry. `carryPastes` owns the
+        // rule: re-sequence the carried blocks past the kept ones and rewrite
+        // their markers in the payload text.
+        const carried = carryPastes(raw, activePastes, keepPastes)
+        // `full` keeps every token: it is the payload a retry re-sends whole.
+        const { full: payload, pastes: restoredPastes } = carried
         const keepText = onScreen ? inputRef.current : (uiSlot ? drafts.current[uiSlot] ?? '' : '')
         // Keep whatever the user typed while the create was in flight and append
         // the payload after it, without duplicating one the composer already
         // holds — a synchronously rejected create can land before React flushes
         // the clear. `mergeRecoveredDraft` owns that rule for every recovery
         // site, including the send-failure path further down.
-        const restoredText = mergeRecoveredDraft(keepText, payload)
+        const restoredText = mergeCarriedDraft(keepText, carried)
         if (onScreen && uiSlot) {
           setInput(restoredText); setPasteBlocks(restoredPastes); setPendingFiles(restoredFiles); setPendingSessions(restoredRefs)
           // clearPending() above already consumed the knowledge selection, so a
@@ -4143,6 +2999,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             slot: uiSlot,
           }))
         }
+        // The failed create's alias snapshot goes back beside the text and
+        // chips it restores (fork GPT review): without it a restored mention
+        // is invisible to reconciliation and its chip sticks. Slot-keyed, so
+        // this one merge serves both the on-screen and parked-draft arms.
+        if (uiSlot && sentSlotTokens) mergeSlotTokens(uiSlot, sentSlotTokens)
         if (uiSlot) {
           setDraft(drafts.current, uiSlot, restoredText)
           setPasteDraft(pasteDrafts.current, uiSlot, restoredPastes)
@@ -4150,7 +3011,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           setSessionRefDraft(sessionRefDrafts.current, uiSlot, restoredRefs)
           saveDrafts()
         }
-        return
+        return false
       }
       const result = created
       slot = result.key;
@@ -4176,17 +3037,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const sendId = mintSendId()
     meta.sendId = sendId
     const metaPayload = meta
-    // Skip optimistic user bubble when the slot is busy (shared rule:
-    // chatSlice.selectComposerBusy) — the backend sends a "queued" role
-    // message instead, avoiding a duplicate. A steer-flagged send usually
-    // bypasses the queue and starts a turn, so nothing would represent it; its
-    // bubble is appended from the response instead (see below), because only
-    // the server knows whether this particular send got queued after all.
+    // A busy snapshot may be stale. The server's user event supplies the
+    // bubble for an immediate dispatch; a real queue has its own card.
     const _busy = selectComposerBusy(store.getState(), slot ?? null)
-    if (!_busy || forceNew) {
+    // Whether THIS send drew its own bubble. A plain send on a busy slot does
+    // not: the server's `queue_push` card represents it. The receipt arms
+    // below read this so none of them describes a row that was never rendered.
+    const bubbleMinted = !_busy || forceNew
+    if (bubbleMinted) {
       dispatch(appendMessage({ role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload }))
     }
-    window.dispatchEvent(new Event('voice-stop'))
+    if (!isolated) window.dispatchEvent(new Event('voice-stop'))
     sendingRef.current = false
     setTimeout(() => scrollBottom(), SCROLL_AFTER_RENDER_MS)
     if (slot) dispatch(startLocalTurn(slot))
@@ -4219,7 +3080,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
      * rule so a reference staged while the send was in flight is not clobbered.
      */
     const restoreComposerAfterFailedSend = () => {
-      if (!slot) return
+      // App payloads remain in the page-level error notice for copying; the
+      // composer was never consumed and must not gain the app's text or chips.
+      if (!slot || isolated) return
       // Ownership of the live composer state, not the active tab: see the
       // steer receipt's `onScreenNow` for the mid-switch window this closes.
       const onScreenNow = composerSlotRef.current === slot
@@ -4233,19 +3096,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // blocks cannot claim one `[ Paste #N ]` marker.
       const keepText = onScreenNow ? inputRef.current : (drafts.current[slot] ?? '')
       const keepPastes = onScreenNow ? pasteBlocksRef.current : (pasteDrafts.current[slot] ?? [])
-      const keptIds = new Set(keepPastes.map(b => b.id))
-      const { text: carriedText, blocks: carriedPastes } = remapCarriedBlocks(
-        typedTxt,
-        activePastes.filter(b => !keptIds.has(b.id)),
-        new Set(keepPastes.map(b => b.seq)),
-      )
-      const pastesBack = [...keepPastes, ...carriedPastes]
+      const carried = carryPastes(typedTxt, activePastes, keepPastes)
+      const pastesBack = carried.pastes
       // Same merge rule as the create-failure path above, and the separator lives
       // in `mergeRecoveredDraft` rather than in a template literal here: the blank
       // line between the kept draft and the recovered payload is message
       // structure, not copy, so it stays off the i18n gate honestly rather than by
       // exemption (same treatment as appendSessionRefLinks).
-      const textBack = mergeRecoveredDraft(keepText, carriedText)
+      const textBack = mergeCarriedDraft(keepText, carried)
       setDraft(drafts.current, slot, textBack)
       setPasteDraft(pasteDrafts.current, slot, pastesBack)
       setSessionRefDraft(sessionRefDrafts.current, slot, refsBack)
@@ -4253,6 +3111,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       if (onScreenNow) {
         setInput(textBack); setPasteBlocks(pastesBack); setPendingSessions(refsBack)
       }
+      // Aliases come back with the text they describe -- MERGE, never
+      // overwrite, so a file picked while the send was in flight keeps its
+      // fresh bookkeeping (fork GPT review; same rule as the text above).
+      if (sentSlotTokens) mergeSlotTokens(slot, sentSlotTokens)
     }
     // The POST, its 10 s deadline, the resolves-not-rejects trap and the body
     // classification all live in the chat-core transport now; this surface
@@ -4265,11 +3127,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       colorTheme: colorThemeRef.current,
     })
     const { body } = receipt
-    // - `transport-error`: the fetch itself rejected -- the send never left, so
-    //   restore-and-report is safe (the old catch branch).
-    // - `response-late`: the deadline fired -- the message was received and the
-    //   WS will deliver the answer; the optimistic bubble stays pending and its
-    //   delivery indicator says so (the old AbortError branch).
+    // - `transport-error`: the fetch rejected. Restore and report only when
+    //   no correlated server echo has already proved delivery.
+    // - `response-late`: the deadline fired; the request may have arrived.
+    //   The optimistic bubble stays pending -- `markSendUnconfirmed` stamps
+    //   it, which draws its delivery-pending line, and `selectTurnInterrupted`
+    //   never offers Resume for a row still carrying `meta.optimistic` -- and a
+    //   WARN notice under it says so. No restore: the text may have been
+    //   delivered late, and a duplicate turn is worse than a visible pending
+    //   row (the same ruling the steer path applies to a minted bubble).
     // - `unknown`: a 2xx whose body would not parse. The request was accepted
     //   and only its answer is mangled, so it may have started a turn that is
     //   streaming right now. Reporting a refusal would hand the payload back
@@ -4284,6 +3150,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // slot-keyed inverse of the `startLocalTurn` above; `appendSlotMessage`
     // routes to the slot's own list, the active one included).
     const failLocalTurn = (message: ChatMessage) => {
+      if (isolated) {
+        if (slot) dispatch(endLocalTurn(slot))
+        setActionError({ message: i18nT('appChatLaunch.unsent', { error: message.content, message: raw }), preserveOnSwitch: true })
+        return
+      }
       if (slot) {
         dispatch(endLocalTurn(slot))
         dispatch(appendSlotMessage({ slot, message }))
@@ -4293,14 +3164,36 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       }
     }
     if (receipt.status === 'transport-error') {
+      if (slot && selectSendConfirmed(store.getState(), slot, sendId)) return true
       // Cause-stating and naming the restore ("...and try again"), the shared
       // core copy the other surfaces use, instead of a bare "Connection error".
       failLocalTurn({ role: 'error', content: i18nT('pages.chatPage.send_failed_connection'), cls: '' })
       restoreComposerAfterFailedSend()
-      return
+      return false
     }
-    if (receipt.status === 'response-late') return
-    const accepted = receipt.status === 'dispatched' || receipt.status === 'queued'
+    if (receipt.status === 'response-late') {
+      // Indeterminate, not failed: the local turn stays pending (a late WS
+      // frame or the next slot refresh settles it) and the bubble keeps its
+      // `optimistic` flag. A correlated echo is stronger evidence than the
+      // missing response -- a channel-linked slot can deliver one -- and then
+      // there is nothing to warn about.
+      if (slot && selectSendConfirmed(store.getState(), slot, sendId)) return true
+      // A busy-slot Queue send minted no bubble, so there is no row to mark and
+      // the notice below would point at nothing. It keeps the bare pending
+      // verdict; what becomes of its text is the restore decision this arm
+      // does not take.
+      if (!bubbleMinted || !slot) return true
+      // The mark is what draws the bubble's pending line (the `optimistic` flag
+      // alone cannot, see `markSendUnconfirmed`), and the row under the bubble
+      // says what the line cannot: that the deadline passed and what to do.
+      // WARN tone via NoticeCard's lead-glyph selector (parseNotice), exactly
+      // as the steer receipt's notice above. Both addressed to the SENDING
+      // slot like the failure rows: the user can switch sessions inside the
+      // deadline window.
+      dispatch(markSendUnconfirmed({ slot, sendId }))
+      dispatch(appendSlotMessage({ slot, message: { role: 'notice', content: '\u26A0\uFE0F ' + i18nT('pages.chatPage.delivery_unconfirmed_pending'), cls: '' } }))
+      return true
+    }
     if (body.queued && llmTxt === typedTxtDirs) {
       // The server queued this send and its receipt names the entry:
       // `queue_id` is the same id `queue_push` broadcasts and the card's
@@ -4329,7 +3222,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // and are bounded by how many sends a single tab queues in one
       // session.
       if (typeof body.queue_id === 'string' && body.queue_id) {
-        queuedSendStash.set(body.queue_id, { raw, files: stagedFilesAtSend, sent: llmTxt })
+        queuedSendStash.set(body.queue_id, { raw, files: stagedFilesAtSend, sent: llmTxt, aliases: sentSlotTokens })
       }
     }
     if (receipt.status === 'refused') {
@@ -4346,77 +3239,43 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // The server explicitly accepted neither (`ok` nor `queued`), so nothing
       // was sent — recovering the composer cannot duplicate a delivered turn.
       restoreComposerAfterFailedSend()
-    } else if (accepted && steerNow && _busy && !body.queued && !body.steered) {
-      // A steer-flagged send the server neither queued nor injected: it
-      // started a turn, so no `queue_push` or `steer_push` echo is coming and
-      // the busy rule above left the text with nothing to represent it.
-      // Append only once the answer rules out both echoes — a mid-plan send
-      // is queued, and a child turn that started while this POST was in
-      // flight is injected mid-turn, each of which brings its own bubble.
-      // Addressed to the SENDING slot, not the active one: the user can
-      // switch sessions while the POST is in flight, and this text belongs to
-      // the transcript it was typed into (same reason `steer_push` uses this).
-      if (slot) {
-        dispatch(appendSlotMessage({
-          slot,
-          message: { role: 'user', content: displayTxt, cls: '', ts: new Date().toISOString(), meta: metaPayload },
-        }))
-      }
     }
     if (slot && confirmedDelivered(body)) {
-      // The response IS the delivery receipt (#4131). The server accepted the
-      // message and appended (or queued) the row, so the optimistic bubble is
-      // confirmed and must stop being a candidate for the 30s "may not have
-      // been delivered" sweep. Nothing else can retire it on this surface: the
-      // `chat_message` user echo `reconcileOptimisticEcho` waits for is
-      // suppressed for every dashboard send by design (`DashboardState.append`
-      // defaults `broadcast_user=False` precisely because the composer already
-      // rendered this bubble), so before this the flag survived the whole turn
-      // and only vanished when `chat_done`'s refresh rebuilt the transcript
-      // from disk.
-      //
-      // Addressed to the SENDING slot for the same reason as the steer-echo
-      // append above. Harmless when the busy rule appended no bubble — no row
-      // carries this `sendId`, so it is a no-op. Deliberately NOT dispatched on
-      // a rejected response, a queued acceptance, or the abort-timeout path:
-      // there delivery of THIS row is unknown, which is what the indicator
-      // exists to say (see `confirmedDelivered`).
+      // The response remains a delivery receipt (#4131), even if the correlated
+      // user echo is missed. The echo owns insertion before streaming, so the
+      // receipt must never append another row.
+      // Addressed to the SENDING slot because the user can switch sessions
+      // while the POST is in flight. A queued acceptance is not delivery.
       // The receipt carries the server-minted user-row `mid` (when the send
       // dispatched immediately); handing it to the reconcile stamps it onto
       // this optimistic bubble so message-pinning works this turn instead of
       // only after the chat_done refresh.
       dispatch(confirmOptimisticSend({ slot, sendId, mid: typeof body.mid === 'string' ? body.mid : undefined }))
     }
-    if (body.ok && !body.queued && cardAtSend && slot === entrySendSlot) {
-      // Immediate dispatch confirmed (`ok`): the message consumed the slot's
-      // next-turn channel, so the card captured at entry is now stale. An
-      // independent check, not part of the else-if chain above — the
-      // steer-echo branch also implies `ok && !queued`, and the card must
-      // retire regardless of which transcript-echo rule applied. A QUEUED
-      // acceptance deliberately does NOT retire here — the queued message is
-      // still cancellable, and cancelling must keep the card; it retires at
-      // its queue_pop instead (removeQueuedMessage). The slot-identity guard
-      // covers forceNew rerouting the send into a freshly created session —
-      // that send answers nothing in the entry slot, whose card must stay.
-      // Deliberately NOT done on the optimistic append (a failed send must
-      // keep the card) nor on the abort-timeout path below (delivery
-      // unconfirmed — a wrongly kept card is dismissible, a wrongly deleted
-      // one is not recoverable).
-      dispatch(retireStatelessQuestion({ slot, expected: cardAtSend }))
-    }
+    // No stateless-card retirement here: the server retires the card when the
+    // user row lands (immediate dispatch) or when the queued entry pops, and
+    // announces it with `question_card_resolved` to every window, this one
+    // included. A failed send appends no row, so the card stays; a queued send
+    // stays cancellable with the card intact until its pop.
     if (body.ok && !body.queued && folderCardAtSend && slot === entrySendSlot) {
-      // Same delivery bar and slot-identity guard as the stateless-card
-      // retirement above, for the folder-suggestion card's turn-aging: the
-      // card was on screen when the user hit send (captured at entry, active
-      // slot only) and the server confirmed the send was delivered. Failed
-      // sends never reach here; queued sends are still cancellable; forceNew
-      // reroutes answer nothing in the entry slot. ts pins the card
+      // Delivery bar and slot-identity guard for the folder-suggestion card's
+      // turn-aging: the card was on screen when the user hit send (captured at
+      // entry, active slot only) and the server confirmed the send was
+      // delivered. Failed sends never reach here; queued sends are still
+      // cancellable; forceNew reroutes (the send lands in a freshly created
+      // session) answer nothing in the entry slot. ts pins the card
       // generation, so a replacement that landed mid-flight is not aged.
       dispatch(ageFolderSuggestion({ slot, ts: folderCardAtSend.ts }))
     }
     // The user answered in the composer instead of the card; a blocking card
     // is resolved over the network, so this cannot be a store-only retirement.
     void resolveAskAfterSend(body, slot === entrySendSlot ? askAtSend : null, dispatch)
+    // The delivery verdict (see the callback's doc above). Only an explicit
+    // `refused` reads as not-delivered here; `unknown` (a 2xx whose body did
+    // not parse) may have started a turn, so it counts as delivered for the
+    // same reason the composer above does not restore on it — a retry it
+    // invited could duplicate a delivered turn.
+    return receipt.status !== 'refused'
     // `send` is deliberately kept stable: it reads volatile values (agent,
     // model, project, mode, colorTheme, activeSlot) through refs so it does not
     // re-create on every keystroke/theme/agent change (it is passed to children
@@ -4446,14 +3305,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // Defense-in-depth: the panels' submit buttons are gated on `connected`,
     // but bail here too so an offline call can't switch the active session
     // and then have send() silently drop the message.
-    if (!connected) return
+    if (!connected) return false
     const target = tabsCtl.activeTab?.slot ?? null
     if (target && target !== activeSlot) dispatch(switchSlot(target))
-    send(message, target ?? undefined)
+    // The delivery verdict flows back to the panel: ArtifactPanel marks a
+    // comment batch as sent only when this resolves true.
+    return send(message, target ?? undefined)
   }, [connected, tabsCtl.activeTab, activeSlot, dispatch, send])
 
   // Auto-send when navigated with ?autoSend=1 or ?token= with prompt
-  useEffect(() => { if (connected && autoSendRef.current) { const txt = autoSendRef.current; autoSendRef.current = null; send(txt) } }, [send, connected, autoSendTick])
+  useEffect(() => {
+    if (!connected || !autoSendRef.current) return
+    const txt = autoSendRef.current
+    const appLaunch = appLaunchSendRef.current
+    autoSendRef.current = null
+    appLaunchSendRef.current = null
+    send(txt, appLaunch?.slotKey, undefined, !!appLaunch)
+  }, [send, connected, autoSendTick])
 
   // Widget interactivity: when a mcwidget iframe fires an action, PRE-FILL the
  // composer instead of auto-submitting. Auto-submitting would be a
@@ -4470,12 +3338,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       if (typeof text !== 'string' || !text) return
       widgetPrefillRef.current = text
       setInput(prev => (prev.trim() ? `${prev.trimEnd()}\n${text}` : text))
-      setPrefillHint(true)
+      raisePrefillHint()
       revealComposer()
     }
     window.addEventListener('mc-widget-send', handler)
     return () => window.removeEventListener('mc-widget-send', handler)
-  }, [])
+  }, [raisePrefillHint, setInput])
 
   const approve = useCallback(async (action: string) => { if (activeSlot) await api.approveChatSlot(activeSlot, action) }, [activeSlot])
   // Approvals dismissed through the CollapsibleToolGroup mounts resolve via the
@@ -4484,13 +3352,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // place that mapping is spelled — a Trust affordance on this path would claim
   // a standing grant the backend never records (#5400, #5434).
   const dismissApproval = useCallback((aid: string, decision?: string) => {
-    dispatch(resolveByApprovalId({ id: aid, decision }))
+    dispatch(resolveByApprovalId({ id: aid, slot: activeSlot || undefined, decision }))
     const n = store.getState().notifications.items.find(x => x.approval_id === aid)
     if (n) dispatch(removeNotificationByTs(n.ts))
-  }, [dispatch])
-  const switchAgent = useCallback(async (agentName: string) => {
+  }, [activeSlot, dispatch])
+  const switchAgent = useCallback(async (agentName: string, kind?: 'member' | 'template') => {
     if (!activeSlot) {
-      setPendingAgent(agentName)
+      setPendingAgent(agentName, kind)
       // Clear any explicit pick made for the PREVIOUS agent rather than
       // re-seeding a resolved model: an empty pendingModel makes createSlot omit
       // `model`, which lets the backend resolve the new agent's own chain at
@@ -4503,7 +3371,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // Same protocol as switchModel below (#4523): the acting tab must not
       // depend on the coalesced slots rebroadcast to see its own pick.
       // performAgentSlotSwitch mirrors exactly what the response names.
-      await performAgentSlotSwitch(activeSlot, agentName, dispatch)
+      await performAgentSlotSwitch(activeSlot, agentName, dispatch, kind)
     } catch (error) {
       // Closing the picker is the call sites' job and already happens
       // synchronously alongside this call, so a failure surfaces as the shared
@@ -4525,21 +3393,74 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // pick snap straight back to e.g. claude-opus-5 — Auto was unselectable.
     // kiro-cli advertises `auto` as a real model id (and its default_model), and
     // the ChatPane + Alt+Shift model-cycle paths already send it verbatim.
-    if (!activeSlot) { setPendingModel(modelName); return }
+    // `pendingModel` is forwarded into slot creation verbatim, and the sentinel is
+    // not a model any provider serves. So it is held as NOTHING: creation omits the
+    // model and the backend resolves the agent's own chain, which is what a held
+    // `auto` would have resolved to anyway. Routing is armed by a pick made once the
+    // slot exists, where the flag is set with it.
+    if (!activeSlot) {
+      if (modelName === JEV_ROUTE_MODEL) { setPendingModel(''); return }
+      setPendingModel(modelName)
+      return
+    }
     try {
-      // performSlotSwitch owns the whole protocol: per-slot+field serialized
-      // dispatch, latest-request-wins adjudication, hung-request timeout, and
-      // exactly-one store write on the authoritative value (#4523). The store
-      // write is deliberately NOT awaited on the server's slots rebroadcast:
-      // that push is coalesced and never arrives with the websocket down.
-      await performSlotSwitch('model', activeSlot, modelName,
-        async () => {
-          // The response's `model` is the stored value (deprecated ids are
-          // remapped server-side), so prefer it over the requested name.
-          const r = await api.chatSlotModel(activeSlot, modelName)
-          return r?.model ?? modelName
-        },
-        (value) => dispatch(updateSlot({ key: activeSlot, model: value })))
+      const slotState = store.getState().dashboard.slots.find(s => s.key === activeSlot)
+      // A staged slider pick or a legacy pair level is carried; an effort
+      // write already on the wire is waited for, not re-sent, and its
+      // presence blocks the legacy migration -- see effortToCarry.
+      const inFlightEffort = inFlightSlotSwitchOutcome('reasoning_effort', activeSlot)
+      const carriedEffort = effortToCarry(
+        slotState?.model || '', slotState?.reasoning_effort || '',
+        stagedSlotSwitchTarget('reasoning_effort', activeSlot),
+        inFlightEffort !== null,
+        codexPairModels,
+      )
+      await switchGroupedModel(carriedEffort, async level => {
+        // Either the effort the user just picked in the embedded slider (still
+        // inside its debounce, so not yet on the wire) or, on a Codex slot
+        // that still pins model[max], that old pair level moving into the
+        // separate effort field before a grouped row sends the bare model.
+        // A failed effort write aborts the model pick instead of silently
+        // resetting an owner's previous selection.
+        let normalizedModel: string | undefined
+        await performSlotSwitch('reasoning_effort', activeSlot, level,
+          async () => {
+            const r = await api.chatSlotReasoningEffort(activeSlot, level)
+            normalizedModel = r?.model
+            return r?.reasoning_effort ?? level
+          },
+          (value) => dispatch(updateSlot({
+            key: activeSlot,
+            reasoning_effort: value,
+            ...(normalizedModel ? { model: normalizedModel } : {}),
+          })))
+      }, async afterEffort => {
+        // performSlotSwitch owns the whole protocol: per-slot+field serialized
+        // dispatch, latest-request-wins adjudication, hung-request timeout, and
+        // exactly-one store write on the authoritative value (#4523). The store
+        // write is deliberately NOT awaited on the server's slots rebroadcast:
+        // that push is coalesced and never arrives with the websocket down.
+        await performSlotSwitch('model', activeSlot, modelName,
+          async () => {
+            // The response's `model` is the stored value (deprecated ids are
+            // remapped server-side), so prefer it over the requested name.
+            // Effort first on the wire (see switchGroupedModel); a refused
+            // effort aborts this pick before anything is sent.
+            await afterEffort
+            const r = await api.chatSlotModel(activeSlot, modelName)
+            return r?.model ?? modelName
+          },
+          // The routing flag is written from the REQUEST, not from the response's
+          // `model`: the gateway resolves the sentinel to `auto`, so the stored
+          // model cannot tell a routed pick from a plain Auto one. Written on
+          // every pick, because picking a concrete model is what clears it.
+          (value) => dispatch(updateSlot({
+            key: activeSlot,
+            model: value,
+            jev_route: modelName === JEV_ROUTE_MODEL,
+          })))
+      }, () => inFlightSlotSwitchOutcome('reasoning_effort', activeSlot))
+      queryClient.invalidateQueries({ queryKey: ['slot-selection-capabilities', activeSlot] })
     } catch (e) {
       // Same failure surface as the agent switch beside this: the shared
       // notice toast, preferring the server's own message. The chip keeps
@@ -4548,10 +3469,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // eslint-disable-next-line no-console -- surface switchModel failures for debugging
       console.error('switchModel failed', e)
     }
-    // Keep the dropdown open after selecting — the user may switch models again
-    // or drill into the reasoning-effort panel. Dismiss is via outside-click/Escape.
+    // Dismissal is the picker's job, not this callback's: a row click closes
+    // the menu at the call site (the same shape as the agent picker and the
+    // split-pane ChatPane picker), so a rejected switch is reported by the
+    // notice toast above, never by a menu left open. Reasoning-effort edits
+    // live on the drill-in page and keep the menu open on their own.
     // setPendingModel is a stable useState setter.
-  }, [activeSlot, dispatch, setPendingModel])
+  }, [activeSlot, codexPairModels, dispatch, queryClient, setPendingModel])
+  // A pick from the picker: a row click or Enter on the sole filtered match.
+  // Closes the menu and, when the composer held focus at open time, hands
+  // focus back to it (see `modelPickerReturnsFocusRef`). The picker's other
+  // exits — Escape, outside click, the drill-in page's own links — are not
+  // picks and keep their existing focus behaviour.
+  const pickModel = useCallback((modelName: string) => {
+    switchModel(modelName)
+    setModelDropdown(false)
+    if (modelPickerReturnsFocusRef.current) focusComposer()
+  }, [switchModel, setModelDropdown])
   const setProject = useCallback(async (path: string) => {
     if (!activeSlot) { setPendingProject(path); return }
     try {
@@ -4579,7 +3513,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const { controls: sessionControls, error: sessionControlsError } = useSessionControls()
   const [openSessionControl, setOpenSessionControl] =
     useState<{ key: string; slot: string } | null>(null)
-  const [sessionControlRect, setSessionControlRect] = useState<DOMRect | null>(null)
+  const { rect: sessionControlRect, anchorTo: anchorSessionControl } = useAnchoredTriggerRect(
+    !!openSessionControl && openSessionControl.slot === activeSlot,
+  )
   // Re-poll a control's status when its popover closes: that is when the user
   // has most likely just changed the thing the chip reports. React Query owns
   // the cache, so this is an invalidation rather than a token the hook watches.
@@ -4607,7 +3543,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Normalize the shape, not just the absence: a generic fetch mock (or a
   // future payload change) can resolve to a non-array, and `= []` only covers
   // undefined — which crashed the whole chat page on `.find`.
-  const chatFolders: ChatFolder[] = Array.isArray(chatFoldersRaw) ? chatFoldersRaw : []
+  const chatFolders: ChatFolder[] = Array.isArray(chatFoldersRaw) ? chatFoldersRaw : NO_CHAT_FOLDERS
+  // The sidebar's folder sort mode, for the folder-suggestion card's option list:
+  // the card draws the same tree the sidebar draws and must list it in the same
+  // order. Read here (shared kirocrewConfig query) so the card stays pure. The
+  // read's failure travels too, for the one case the sidebar's banner cannot
+  // cover: this screen with no sidebar on it (see `sidebarOnScreen` below).
+  const { mode: folderSortMode, error: folderSortError } = useFolderSortMode()
   const activeFolderName =
     chatFolders.find(f => f.id === currentSlot?.folder_id)?.name || ''
   // The session IDENTITY, not the display slot. `activeSlot` is the slot id
@@ -4656,14 +3598,73 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const revealAppInPanel = useCallback((toolCallId: string) => {
     search.close()
     dispatch(openActivityPanel())
-    tabsCtlRef.current?.openApp(toolCallId, i18nT('pages.chatPage.mcp_app_tab_title'), activeSlot ?? null)
+    // Same title derivation as the auto-open effect: an event-time read from
+    // the Provider-bound store keeps the payload out of this callback's deps.
+    const payload = activeSlot ? boundStore.getState().chat.mcpApps?.[mcpAppKey(activeSlot, toolCallId)] : undefined
+    tabsCtlRef.current?.openApp(toolCallId, mcpAppTabTitle(payload, i18nT('pages.chatPage.mcp_app_tab_title')), activeSlot ?? null)
     // As at handleFileOpen: the rule asks for the whole `search` object only because
     // `close` is INVOKED and a called member is attributed to its receiver, not
     // because this body reads `search` itself.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `search.close` is a useCallback([]) in useMessageSearch, so the listed member already pins everything this body calls; naming the enclosing object would make this a new function every render and churn renderMessage below
-  }, [dispatch, activeSlot, search.close])
-  const currentProjectRef = useRef<string | undefined>(undefined)
-  currentProjectRef.current = currentSlot?.project || undefined
+  }, [dispatch, activeSlot, boundStore, search.close])
+  // `currentProjectRef` is declared once above, next to the resources
+  // controller, and refreshed every render there; this block only reads it.
+  // Mention checks in this block compare both separator forms only for a
+  // Windows-shaped project, where the OS accepts them interchangeably. On
+  // POSIX, `\` is a legal filename character: a nested file `src/main.ts`
+  // and a literal filename `src\main.ts` in the project root are distinct.
+  // The current-project check uses `isWindowsShapedPath` directly against the
+  // drive-letter/UNC prefix, including Windows paths already written with `/`.
+  // The shared `tokenRegex`'s trailing boundary requires whitespace or
+  // end-of-string, so an entirely ordinary sentence -- "check @file.ts,
+  // please" -- reads as "mention gone" the instant the comma is typed,
+  // and the reconciliation effect below silently unstages a still-
+  // intended attachment before the user finishes the sentence (fork GPT
+  // review). Before this PR nothing acted on that gap: a file chip was
+  // pure list state with no text-driven staleness check at all, so
+  // `tokenRegex`'s pre-existing punctuation blind spot never had a
+  // user-visible consequence. This reconciliation-only boundary also
+  // accepts common trailing punctuation, scoped here rather than
+  // widening the shared `tokenRegex` (used for insertion/splicing
+  // elsewhere, where an inserted token is always followed by a real
+  // space per the caret-insertion logic above). A bare punctuation
+  // character is NOT enough on its own, though (fork GPT review): `.` is
+  // a legal, common mid-filename character (`README.md`), so treating it
+  // as a sufficient boundary by itself would match `@README` as a
+  // PREFIX of the unrelated, longer `@README.md` mention. Each
+  // punctuation option is therefore itself required to be followed by
+  // whitespace or end-of-string. Shared with the remove-chip strip below
+  // (round 16) so the two can never disagree about what counts as a
+  // boundary.
+  // A punctuation boundary can itself be the START of a DIFFERENT staged
+  // file's own longer alias (fork GPT review, round 18): `report` and
+  // `report,` can both be genuine, distinct filenames, so accepting a
+  // bare trailing comma as `report`'s boundary matches it as a PREFIX of
+  // `report,`'s own mention -- silently mis-attributing the LONGER file's
+  // text to the shorter one on both sides of the reconciliation contract
+  // (staleness AND remove-chip strip). Falls back to the strict
+  // whitespace/end-only boundary whenever another currently-relevant
+  // alias literally begins with this one, so a trailing punctuation
+  // character that could belong to a real sibling file's name is never
+  // treated as "just punctuation." `otherAliases` is optional: callers
+  // with no cross-file context to check against (none currently) get the
+  // permissive boundary, same as before this round.
+  const relMentionedHere = useCallback((text: string, rel: string, otherAliases?: ReadonlySet<string>) => {
+    // ONE regex builder (fork First Principles review): the shared
+    // `mentionTokenRegex` assembles the identical pattern this file used to
+    // build locally, and its sibling set drives the same `mentionBoundaryFor`
+    // rule -- the recorded aliases carry a leading `@`, the shared builder
+    // compares bare tokens, so the set is stripped once here.
+    // On a Windows-shaped project separator identity is folded once
+    // (`foldWinSep`): text, rel and sibling aliases are compared with `\`
+    // read as `/`, so every spelling of the same file matches -- uniform or
+    // mixed (`@src\foo/bar.ts`, fork GPT review) -- and a sibling alias
+    // recorded in another spelling still triggers the prefix-sibling rule,
+    // and revival's asymmetry guard with it.
+    const fold = foldWinSep(isWindowsShapedPath(currentProjectRef.current || ''))
+    const bare = otherAliases && new Set([...otherAliases].map(a => fold(a.startsWith('@') ? a.slice(1) : a)))
+    return mentionTokenRegex(fold(rel), '', bare).test(fold(text))
+  }, [])
 
   // "Add to context" from the file-browser rail's row context menu: insert the
   // SAME `@`-mention the file picker does, so a right-click is just a second
@@ -4672,7 +3673,57 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // bare `@rel/` reference (the token IS the reference — no upload). The caret
   // is unknown from the tree, so both append. Idempotent: re-adding a path
   // already referenced in the composer is a no-op.
-  const handleAddToContext = useCallback((absPath: string, kind: 'file' | 'dir') => {
+  /** Move an insertion caret OUT of any token literal it would split.
+   *  A caret strictly inside a token is a legal resting place (the click
+   *  expander's preview inside a paste token; a click inside mention text),
+   *  but splicing text there tears the literal apart. Every token kind, and
+   *  how its span is found:
+   *  - collapsed paste token `[ Paste #N · M lines ]` (contains spaces): its
+   *    recorded range. Splitting it DESTROYS the block unrecoverably --
+   *    pruneBlocks drops the record and the draft effect persists the pruned
+   *    list (fork Opus review);
+   *  - any `@`-reference -- a picked file mention, a typed or draft-restored
+   *    one with no recorded alias, a folder token `@src/utils/`, optionally
+   *    behind an opening wrapper: the whitespace-free run around the caret.
+   *    Splitting it breaks the reference, so a file chip unstages or a
+   *    folder silently drops out of the send (fork Opus review);
+   *  - a recorded file alias, checked FIRST because it can contain spaces
+   *    (`@My Report.pdf`, written unquoted by the picker): the run around a
+   *    caret in `Report.pdf` does not start with `@`, so the run rule alone
+   *    let the insert tear the mention and unstage its chip (fork GPT review).
+   *    On a Windows-shaped project the alias is found with separators folded
+   *    (`foldWinSep`), like the reconciliation that keeps the chip staged: a
+   *    mention hand-edited to `@docs\My Report.pdf` is the same file, so the
+   *    clamp must see it too (fork GPT review). The fold is 1:1, so indices
+   *    found on the folded copy are the original's.
+   *  Clamped to the nearer edge. A caret inside an ordinary word is left
+   *  alone: inserting there is what the user pointed at. */
+  const clampOutOfTokens = useCallback((text: string, at: number): number => {
+    for (const r of findTokenRanges(text, pasteBlocksRef.current)) {
+      if (at > r.start && at < r.end) return at - r.start <= r.end - at ? r.start : r.end
+    }
+    const fold = foldWinSep(isWindowsShapedPath(currentProjectRef.current || ''))
+    const folded = fold(text)
+    for (const alias of Object.values(currentSlotTokens() ?? {}).flat().map(fold)) {
+      for (let s = folded.indexOf(alias); s !== -1; s = folded.indexOf(alias, s + 1)) {
+        const e = s + alias.length
+        if (at > s && at < e) return at - s <= e - at ? s : e
+      }
+    }
+    let start = at
+    let end = at
+    while (start > 0 && !/\s/.test(text[start - 1])) start--
+    while (end < text.length && !/\s/.test(text[end])) end++
+    if (start < at && at < end && /^[($[{`"']?@/.test(text.slice(start, end))) {
+      return at - start <= end - at ? start : end
+    }
+    return at
+  }, [currentSlotTokens])
+
+  const handleAddToContext = useCallback((absPath: string, kind: 'file' | 'dir', dropAt?: number | null) => {
+    // `dropAt` is the text offset under a file-tree drop (useComposerTreeDrop);
+    // the context menu passes none and the mention goes in at the caret.
+    const insertAt = (): number | null => dropAt ?? voiceCaretRef.current?.start ?? null
     // `absPath` arrives from the tree with a forward-slash-normalized Windows
     // root; normalize the project root the same way (Windows-shaped roots
     // only — normalizeWindowsPath leaves POSIX paths, where `\` is a legal
@@ -4693,34 +3744,101 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // be conflated.
       const relSlash = rel.endsWith('/') ? rel : `${rel}/`
       const project = currentProjectRef.current || ''
-      const projectIsWindowsShaped = normalizeWindowsPath(project) !== project
+      // Checked directly against the drive-letter/UNC prefix, not via
+      // `normalizeWindowsPath(project) !== project` (fork GPT review) --
+      // that comparison misses a Windows-shaped project already spelled
+      // with forward slashes (`C:/repo`).
+      const projectIsWindowsShaped = isWindowsShapedPath(project)
       const dup = projectIsWindowsShaped && parseDirTokens(inputRef.current).some(
         t => t.rel.replace(/\\/g, '/') === relSlash,
       )
       if (!dup) {
-        const spliced = spliceDirTokens(inputRef.current, null, [rel])
-        if (spliced.changed) setInput(spliced.value)
+        // Insert at the last known caret, same as a dir-token drop (line ~3130)
+        // -- both go through spliceDirTokens, so they share its caret contract.
+        const dirCaret = insertAt()
+        const spliced = spliceDirTokens(
+          inputRef.current,
+          dirCaret == null ? null : clampOutOfTokens(inputRef.current, Math.max(0, Math.min(dirCaret, inputRef.current.length))),
+          [rel],
+        )
+        if (spliced.changed) {
+          voicePendingCaretRef.current = spliced.caret
+          setInput(spliced.value)
+        }
       }
     } else {
       const token = `@${rel}`
-      // hasExactRelMention checks EXACTLY this rel (either separator
-      // rendition — the Windows @-picker inserts backslash rels), never a
-      // shorter basename suffix: two staged files sharing a basename could
-      // otherwise cross-match on a single `@util.ts` mention, and later
-      // removing the SECOND file's chip (whose fallback derivation also
-      // suffix-walks) would then strip the FIRST file's mention instead.
-      // Checked against the live text (not inside the updater) because the
-      // token BOOKKEEPING must follow the same branch: on the already-mentioned
-      // no-op the token present in the text may be a different form than the
-      // one derived here, and recording ours would make chip-remove strip a
-      // token that is not there while leaving the real one behind.
-      const alreadyMentioned = hasExactRelMention(inputRef.current, rel)
+      const project = currentProjectRef.current || ''
+      const projectIsWindowsShaped = isWindowsShapedPath(project)
+      const foldSep = foldWinSep(projectIsWindowsShaped)
+      // Match EXACTLY this rel, never a shorter basename suffix. Separator
+      // folding is valid only for a Windows-shaped project (`foldWinSep`: any
+      // uniform or mixed spelling of the same file); on POSIX a
+      // backslash is a legal filename character and can name a different file.
+      // Checked with the SHARED permissive matcher (fork GPT review): the old
+      // whitespace-only `tokenRegex` missed a punctuated existing mention
+      // (`check @src/main.ts.`), so "Add to chat" inserted a duplicate token
+      // beside the one already there. Checked against the live text (not
+      // inside the updater) because token bookkeeping must follow the same
+      // branch and record the spelling that is actually present.
+      // The check passes the same live sibling aliases the reconciliation
+      // passes (fork Opus review): with `report,` staged and mentioned, the
+      // permissive boundary read `@report,` as `report`'s own mention, so
+      // no token was inserted, while the reconciliation's strict boundary
+      // for `report` found no match and unstaged the chip just added.
+      const known = currentSlotTokens() ?? {}
+      const siblings = new Set<string>()
+      for (const otherPath of pendingFilesRef.current) {
+        if (otherPath === absPath) continue
+        known[otherPath]?.forEach(t => { if (relMentionedHere(inputRef.current, t.slice(1))) siblings.add(t) })
+      }
+      const bareSiblings = new Set([...siblings].map(t => foldSep(t.slice(1))))
+      const alreadyMentioned = relMentionedHere(inputRef.current, rel, siblings)
       if (!alreadyMentioned) {
-        setInput(prev => {
-          const lead = prev && !/\s$/.test(prev) ? ' ' : ''
-          return `${prev}${lead}${token} `
-        })
-        pickedFileTokens.current[absPath] = token
+        // Insert at the last known caret rather than always appending, so
+        // "please check @README.md for bugs" stays possible when the file is
+        // added mid-sentence instead of the token always landing at the end.
+        const prev = inputRef.current
+        const caret = insertAt()
+        let at = caret == null ? prev.length : Math.max(0, Math.min(caret, prev.length))
+        // The caret can legally be parked INSIDE a token: vertical arrows
+        // are only intercepted for prompt history at the text edges, the
+        // select-snap deliberately leaves a caret inside a PASTE token (the
+        // click expander's preview case), and a click can land inside a
+        // mention. Splicing there tears the literal apart -- for a paste
+        // token pruneBlocks then drops the block and the draft effect
+        // persists the pruned list, destroying the pasted content
+        // unrecoverably (fork Opus review). Clamp to the nearer edge of any
+        // strictly containing range before slicing.
+        at = clampOutOfTokens(prev, at)
+        const before = prev.slice(0, at)
+        const after = prev.slice(at)
+        const lead = before && !/\s$/.test(before) ? ' ' : ''
+        const trail = after && !/^\s/.test(after) ? ' ' : ''
+        const run = `${lead}${token}${trail}${after ? '' : ' '}`
+        voicePendingCaretRef.current = before.length + run.length
+        setInput(before + run + after)
+        recordSlotToken(absPath, token)
+      } else {
+        // Already mentioned, so no text was inserted -- but the file is
+        // about to be staged below regardless, and the reconciliation effect
+        // needs a recorded token to ever notice a later hand-edit on it (fork
+        // GPT review: without this, a pick that lands on an existing mention
+        // never gets bookkeeping, so deleting that mention later leaves an
+        // orphaned chip -- the exact bug this PR fixes, through a side door).
+        // Record the LITERAL form already in the text, not this handler's own
+        // canonical `token` -- the existing mention could be a different
+        // separator rendition (the Windows @-picker inserts backslash rels,
+        // and a hand edit can mix both). It is found the same way
+        // `alreadyMentioned` was, on the folded text, and read back from the
+        // ORIGINAL at the match's indices (the fold is 1:1): the alias recorded
+        // here is exactly the one whose presence justified the no-op insertion
+        // branch, so this file never ends up with no recorded token (the
+        // orphaned-chip gap, fork GPT review). Group 1 is the leading
+        // boundary; `+ 1` skips the `@`.
+        const m = mentionTokenRegex(foldSep(rel), '', bareSiblings).exec(foldSep(inputRef.current))
+        const existing = m ? inputRef.current.slice(m.index + m[1].length + 1, m.index + m[1].length + 1 + rel.length) : null
+        if (existing) recordSlotToken(absPath, `@${existing}`)
       }
       // addPendingFile dedupes by canonical Windows identity: the @-picker may
       // have already staged this file in native `C:\…` form, and an exact check
@@ -4728,7 +3846,180 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setPendingFiles(prev => addPendingFile(prev, absPath))
     }
     revealComposer()
-  }, [])
+  }, [recordSlotToken, clampOutOfTokens, currentSlotTokens, relMentionedHere, setInput])
+
+  // pickedFileTokens reconciliation -- keeps a file chip in sync with its
+  // `@rel` alias(es) in BOTH directions, the same way a folder chip (line
+  // ~1737) already is for free by being text-derived. A file chip is
+  // list-backed (`pendingFiles`), not text-derived, so without this it never
+  // notices a hand-edit:
+  //  - A picker-picked/tree-added file none of whose recorded aliases appear
+  //    in the text anymore has been hand-edited out (cut, or an over-eager
+  //    selection-delete) -- drop its chip.
+  //  - A file whose alias reappears (undo, or the text pasted back after a
+  //    cut-to-reposition -- the very workflow the caret fix above exists for)
+  //    restages its chip, rather than leaving the mention as plain text with
+  //    the attachment silently gone.
+  //
+  // Each path can carry MULTIPLE recorded aliases (fork GPT review): a later
+  // pick of the SAME file under a changed project adds a second `@rel` form
+  // without replacing the first, since the two texts can coexist. So the
+  // stale check requires NONE of the aliases to still be mentioned, and
+  // revival accepts ANY of them.
+  //
+  // Every comparison trusts the STORED alias strings directly (not a
+  // re-derived rel): `pickedFileTokens` is slot-scoped, so the entries read
+  // here can only be ones THIS slot itself wrote, at THIS slot's own pick
+  // time(s) -- unlike a re-derivation against the slot's CURRENT project,
+  // which breaks the moment the slot's project changes after a pick (the
+  // text was never rewritten, so the OLD rel is still what is sitting there;
+  // re-deriving against the NEW project would falsely call it stale and drop
+  // a still-referenced attachment).
+  //
+  // Entries are NOT deleted on unstage (only on the chip's own ✕, which also
+  // strips every recorded alias from the text, so revival can never fire for
+  // it) -- keeping the mapping alive is what makes revival possible.
+  // Uploaded/dropped files carry no recorded aliases and are never touched by
+  // either direction -- there is no text mention to lose or regain.
+  //
+  // Revival, unlike the stale check above, DOES cross-check each candidate
+  // alias's rel against a fresh re-derivation under the CURRENT project (fork
+  // GPT review): an entry that survived an earlier unstage can be for a path
+  // whose alias no longer matches what that same rel would mean under the
+  // project the slot has SINCE moved to. Reviving it purely because the text
+  // happens to contain that rel again -- typed with the NEW project's own
+  // file in mind -- would silently attach the OLD, unrelated absolute path
+  // instead. An alias is skipped (not merely blocked) when the two ever
+  // disagree, so a stale cross-project alias can never revive on a
+  // coincidental rel match.
+  //
+  // KNOWN LIMITATION: `pickedFileTokens` is in-memory only, while `pendingFiles`
+  // persists across a reload/slot-restore via `fileDrafts` (localStorage). A
+  // file chip restored that way has no recorded aliases, so a hand-edit on it
+  // post-restore is invisible to this effect and the chip sticks -- the same
+  // tradeoff the remove button's own token derivation already documents below
+  // ("the ref is in-memory only: a restored draft ... re-stages the file
+  // without it"). Not fixed here: it would mean persisting the aliases
+  // alongside the draft too, a separate change from this reconciliation.
+  //
+  // Runs from the composer-draft commit (`onComposerDraftCommit`, via
+  // `reconcileFileChipsRef`) rather than an `[input]` effect: the text lives
+  // in the draft store, so it fires once per committed text change without
+  // re-rendering this page on a keystroke.
+  const reconcileFileChips = useCallback((input: string) => {
+    const known = currentSlotTokens()
+    if (!known) return
+    const staged = new Set(pendingFiles)
+    const sameSlash = (a: string, b: string) => a.replace(/\\/g, '/') === b.replace(/\\/g, '/')
+    // Deliberately NOT a general boundary-checked path-SUFFIX fallback (tried
+    // and reverted -- fork GPT review, two rounds): recognizing "any suffix of
+    // this path is mentioned" as proof of reference sounds safe for a single
+    // file, but two DIFFERENT staged files can share a trailing path segment
+    // (`/repo/src/main.ts` and `/repo/other/src/main.ts` both end in
+    // `src/main.ts`). Deleting one file's own mention while the other's
+    // longer, unrelated mention remains would then read as "still
+    // referenced" and skip unstaging the WRONG file -- sent when the user
+    // explicitly tried to remove it. Only the EXACT aliases this file was
+    // actually recorded under (never a suffix borrowed from a sibling
+    // file's mention) are trusted here.
+    //
+    // No shortened or re-derived spelling is accepted either: every
+    // spelling this check ACCEPTS is one a pick RECORDED, which is the
+    // symmetry that retires the recorded-vs-accepted divergence class
+    // (staleness, revival and the remove strip all test the same set).
+    // Text that stops matching every recorded alias -- hand-edited,
+    // pasted over, or a restored draft -- is not a mention anymore, the
+    // chip visibly unstages, and re-attaching is one pick away.
+    // Every OTHER currently-STAGED path's aliases, so `relMentionedHere`
+    // can refuse a punctuation-boundary match that is really the start of
+    // a DIFFERENT file's own longer mention (fork GPT review, round 18).
+    // Scoped to `staged`, not the full historical `known` map (fork GPT
+    // review, round 20): entries are deliberately never deleted on
+    // unstage (kept alive for revival), so `known` can carry an OLD
+    // project's long-abandoned alias for a file that isn't attached to
+    // anything anymore. Treating that stale history as "another real
+    // file to protect" forced the strict boundary onto a CURRENTLY
+    // staged file's own, entirely ordinary punctuated mention, and
+    // wrongly unstaged the attachment the user is actually still typing
+    // about.
+    const otherAliasesFor = (p: string) => {
+      const others = new Set<string>()
+      for (const [otherPath, otherTokens] of Object.entries(known)) {
+        if (otherPath === p || !staged.has(otherPath)) continue
+        // Only aliases LIVE in the current input protect (fork GPT review):
+        // the `staged` snapshot is pre-effect, so a sibling whose own
+        // mention was deleted in THIS SAME edit still sat here and forced
+        // the strict boundary onto a survivor's ordinary punctuated
+        // mention (`@report!` dying with `@report,`) -- dropping BOTH
+        // attachments. A dead alias has no text occurrence left to
+        // mis-attribute, so it protects nothing; the round-18 hazard
+        // needs the longer mention actually present. Presence is tested
+        // with the permissive boundary and no cross-alias context (no
+        // recursion).
+        otherTokens.forEach(t => { if (relMentionedHere(input, t.slice(1))) others.add(t) })
+      }
+      return others
+    }
+    const stale = pendingFiles.filter(p => {
+      const aliases = known[p]
+      if (aliases == null || aliases.length === 0) return false
+      return !aliases.some(token => relMentionedHere(input, token.slice(1), otherAliasesFor(p)))
+    })
+    // Revival's protecting set is WIDER (fork GPT review): revival's
+    // candidates are UNSTAGED entries, so a staged-scoped set is empty
+    // exactly when it matters -- stage `report` and `report,`, delete both
+    // mentions, paste `@report,` back: with no staged sibling to protect,
+    // the shorter alias matched the longer file's own mention via the
+    // punctuation boundary and BOTH revived, binding the text (and its
+    // attachment) to the wrong file at send. Every KNOWN path's live
+    // aliases protect here (invariant I3: the protecting population covers
+    // the candidate population). The liveness requirement is unchanged, so
+    // round 20's hazard stays closed: a dead historical alias has no text
+    // occurrence to mis-attribute and still protects nothing. Residual,
+    // preferred over the false positive it replaces: an OLD project's alias
+    // literally live in the text refuses to revive a same-prefix file -- a
+    // visible false negative, one pick away.
+    const liveAliasesFor = (p: string) => {
+      const others = new Set<string>()
+      for (const [otherPath, otherTokens] of Object.entries(known)) {
+        if (otherPath === p) continue
+        otherTokens.forEach(t => { if (relMentionedHere(input, t.slice(1))) others.add(t) })
+      }
+      return others
+    }
+    const revived = Object.keys(known).filter(p => {
+      if (staged.has(p) || stale.includes(p)) return false
+      const currentRel = makeRelative(p, normalizeWindowsPath(currentProjectRef.current || ''))
+      const otherAliases = liveAliasesFor(p)
+      // Revival asymmetry guard (fork GPT review): a LONGER candidate whose
+      // text occurrence merely extends a STAGED file's live alias with
+      // boundary-consumable characters is not unambiguous evidence -- typing
+      // a comma after a staged `@report` reads as that mention plus
+      // punctuation, not as the deleted sibling `report,` re-typed. The
+      // prefix-sibling `unsafe` test is one-directional by design (it forces
+      // strict onto the SHORTER staged alias), so without this the longer
+      // candidate always got the permissive boundary against a shorter
+      // staged sibling and silently re-attached. Same predicate, opposite
+      // direction; staged-scoped and liveness-gated via otherAliasesFor, so
+      // the M2(b) both-unstaged revival (no staged sibling) is untouched and
+      // the round-20 dead-history hazard stays closed. Accepted residual:
+      // pasting `@report,` back while `report` is staged does not revive
+      // `report,` -- a visible false negative, one pick away.
+      const stagedLive = otherAliasesFor(p)
+      return known[p].some(token => {
+        const storedRel = token.slice(1)
+        if (!sameSlash(storedRel, currentRel)) return false
+        if ([...stagedLive].some(s => extendsConsumably(s, token))) return false
+        return relMentionedHere(input, storedRel, otherAliases)
+      })
+    })
+    if (!stale.length && !revived.length) return
+    setPendingFiles(prev => {
+      const next = prev.filter(p => !stale.includes(p))
+      return revived.reduce((acc, p) => addPendingFile(acc, p), next)
+    })
+  }, [currentSlotTokens, relMentionedHere, pendingFiles])
+  reconcileFileChipsRef.current = reconcileFileChips
 
   // ── Follow-up card actions (suggest_followup MCP tool) ───────────────────
   // Both routes PRE-FILL a composer and stop; neither sends. `setPendingInput`
@@ -4758,10 +4049,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // (row menu, drag-to-folder, new-chat-in-folder) already funnels through, so
   // the optimistic update and its guarded rollback are inherited rather than
   // re-implemented here. Both answers clear the card by the ts it rendered with,
-  // for the same reason the follow-up actions do.
-  const folderSuggestionAccept = useCallback(() => {
+  // for the same reason the follow-up actions do. The card passes the folder id
+  // its dropdown currently shows — the suggestion by default, or whatever the
+  // user picked instead.
+  const folderSuggestionAccept = useCallback((folderId: string) => {
     if (!activeSlot || !folderSuggestion) return
-    moveSlotToFolder(activeSlot, folderSuggestion.folderId)
+    moveSlotToFolder(activeSlot, folderId)
     dispatch(clearFolderSuggestion({ slot: activeSlot, ts: folderSuggestion.ts }))
   }, [activeSlot, folderSuggestion, moveSlotToFolder, dispatch])
 
@@ -4911,7 +4204,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       try { applied = localStorage.getItem(`mc-webpreview-applied:${slot}`) || '' } catch { /* ignore */ }
       if (applied === norm || appliedPreviewMemRef.current[slot] === norm) return
       appliedPreviewMemRef.current[slot] = norm
-      try { localStorage.setItem(`mc-webpreview-applied:${slot}`, norm) } catch { /* ignore */ }
+      safeSetItem(`mc-webpreview-applied:${slot}`, norm)
       // Loopback-only (enforced inside setSessionPreviewPending): a rejected
       // (non-loopback) marker feeds nothing — and must not open the tab either.
       if (!setSessionPreviewPending(slot, norm)) return
@@ -4921,32 +4214,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       setSessionPreviewPending(slot, norm)      // heuristic offer: card only, no open, no load
     }
   }, [messages, activeSlot, dispatch])
-  // Auto-open the Browser panel when the agent starts browsing. The signal is the
-  // agent's own shell call: browsing is `playwright-cli` commands, so a shell
-  // tool_call whose preview invokes it is the start of a browse. Open/focus the tab
-  // only at the START (new slot, or after a >90s gap), NOT on every command, so it
-  // cannot steal focus from a tab the user switched to mid-browse.
-  const browseOpenedRef = useRef<{ key: string | null; ts: number }>({ key: null, ts: 0 })
-  useEffect(() => {
-    const onTool = (e: Event) => {
-      const d = (e as CustomEvent<{ slot?: string; is_shell?: boolean; input_preview?: string }>).detail
-      if (!d?.is_shell) return
-      if (!isBrowseCommand(d.input_preview)) return
-      const key = d.slot ?? null
-      // Only auto-open when the browsing session IS the one on screen. A background
-      // session's commands must not open another session's panel.
-      if (!key || key !== activeSlotRef.current) return
-      const now = Date.now()
-      const prev = browseOpenedRef.current
-      if (prev.key !== key || now - prev.ts > 90_000) {
-        dispatch(openActivityPanel())
-        tabsCtlRef.current.openView('browser')
-      }
-      browseOpenedRef.current = { key, ts: now }
-    }
-    window.addEventListener('kirocrew-tool-call', onTool)
-    return () => window.removeEventListener('kirocrew-tool-call', onTool)
-  }, [dispatch])
   // Reachability: declare open chat slots to the Electron main process so the
   // agent command channel polls for them (see listPanelIds) even before the Browser
   // tab is ever opened — this is what makes the built-in browser the default for a
@@ -5008,9 +4275,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Same active-slot guard as the mirror path: a background session's page must
   // not open another session's panel.
   useEffect(() => {
-    const api = (window as unknown as {
-      browserAPI?: { onAgentOpened?: (cb: (p: { panelId?: string }) => void) => () => void }
-    }).browserAPI
+    const api = window.browserAPI
     if (!api?.onAgentOpened) return      // plain browser (no preload bridge)
     return api.onAgentOpened(({ panelId }) => {
       if (!panelId || panelId !== activeSlotRef.current) return
@@ -5045,12 +4310,170 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         )
         emit(sendToTerminalSession(sessionId, text))
       })
-      // Give the PTY time to connect; if it never does, report failure.
-      setTimeout(() => { unsub(); emit(false) }, 6000)
+      // Give the PTY time to connect. A missing `ready` frame is not enough to
+      // prove the dispatch died because a shell profile can replace the
+      // readiness hook while the child process stays live. At the deadline,
+      // report failure for the button hint, then ask the existing terminal
+      // sessions route whether this dispatch's shell is still running.
+      // `settled` distinguishes the normal ready path: once ready has fired,
+      // the result is already emitted and the deadline does nothing.
+      setTimeout(() => {
+        if (settled) return
+        unsub()
+        emit(false)
+
+        // Only probe while this dispatch still owns the tab it minted. Closing
+        // the tab or popping the panel out transfers teardown ownership.
+        if (!hasDockTerminal(sessionId) || isTerminalPopoutOpen()) return
+
+        void (async () => {
+          // One look at the sessions route. `reuseMs` is the cache window: the
+          // first probe shares a request with any concurrent deadline, the
+          // confirm probe must see the present.
+          const probe = async (reuseMs: number) => {
+            const payload: unknown = await queryClient.fetchQuery({
+              queryKey: ['terminal-sessions'],
+              queryFn: async () => {
+                const response = await fetch('/api/terminal/sessions')
+                if (!response.ok) {
+                  throw new Error(`Failed to list terminal sessions (${response.status})`)
+                }
+                return response.json()
+              },
+              staleTime: reuseMs,
+            })
+            if (
+              !payload
+              || typeof payload !== 'object'
+              || !('sessions' in payload)
+              || !Array.isArray(payload.sessions)
+            ) {
+              throw new Error('Invalid terminal sessions response')
+            }
+            const found: Record<string, unknown> | undefined = payload.sessions.find(
+              (entry: unknown): entry is Record<string, unknown> => (
+                !!entry
+                && typeof entry === 'object'
+                && 'session_id' in entry
+                && entry.session_id === sessionId
+              ),
+            )
+            if (found && typeof found.alive !== 'boolean') {
+              throw new Error('Invalid terminal session liveness response')
+            }
+            return found
+          }
+
+          let session: Record<string, unknown> | undefined
+          try {
+            // Concurrent deadlines are what this reuse window dedupes, so it is
+            // far shorter than the deadline itself: a session young enough to be
+            // missing from a reused snapshot cannot have reached its own
+            // deadline yet, so no probe can read a snapshot older than itself.
+            session = await probe(1_000)
+            if (!session) {
+              // Absent is not gone. A shell still opening holds a placeholder
+              // the sessions route skips, so it reads exactly like a session
+              // that never existed -- and rolling that back would remove the tab
+              // from under a shell about to come up. Confirm once, uncached,
+              // after a bounded grace.
+              await new Promise(resolve => setTimeout(resolve, RUN_IN_TERMINAL_OPENING_GRACE_MS))
+              if (!hasDockTerminal(sessionId) || isTerminalPopoutOpen()) return
+              session = await probe(0)
+            }
+          } catch (error) {
+            // Keep on probe failure: removing a possibly-live shell and its
+            // scrollback is irreversible. The tab is user-closable, and the
+            // backend orphan reaper backstops the PTY. The kept tab is
+            // otherwise unexplained, so say so through the required surface --
+            // and keep the probe's own transport error out of that copy, since
+            // the user asked to run a command, not to list terminal sessions.
+            // The console keeps it for whoever debugs the probe.
+            // eslint-disable-next-line no-console -- a failed liveness probe is invisible in dev otherwise
+            console.warn('run-in-terminal: liveness probe failed:', errMessage(error))
+            showActionError(
+              i18nT('pages.chatPage.run_in_terminal_liveness_probe_failed_error'),
+            )
+            return
+          }
+
+          // The user may close the tab or pop the panel out while the probe is
+          // in flight. In either case this dispatch no longer owns it.
+          if (!hasDockTerminal(sessionId) || isTerminalPopoutOpen()) return
+          if (session?.alive === true) {
+            // A profile that replaces the readiness hook (#7657) lands here on
+            // EVERY click, so this is the routine outcome rather than an edge:
+            // the terminal opens, the command never runs, and a 2s button flash
+            // is too small to carry that. The shell is confirmed live, so the
+            // tab is worth keeping and the silence is worth breaking.
+            showActionError(i18nT('pages.chatPage.run_in_terminal_shell_alive_error'))
+            return
+          }
+
+          // Same teardown, same order, as the tab-close paths: end the backend
+          // PTY, drop the local WS + cached xterm, then remove the store entry.
+          // A session the probe did not list is already gone from the backend
+          // registry, so skip the DELETE -- it would 404 and surface a spurious
+          // close failure for a session that needs no closing.
+          if (session) deleteTerminalSessionRef.current.mutate(sessionId)
+          disposeTerminalSession(sessionId)
+          removeDockTerminal(sessionId)
+          // Closing a tab the user watched open is the ROUTINE outcome here, so
+          // it cannot be the quiet one: say what happened to the command.
+          showActionError(i18nT('pages.chatPage.run_in_terminal_dispatch_rolled_back_error'))
+        })()
+      }, RUN_IN_TERMINAL_READY_DEADLINE_MS)
     }
     window.addEventListener('mc:run-in-terminal', handler)
     return () => window.removeEventListener('mc:run-in-terminal', handler)
+    // Both are stable for the provider's / component's lifetime (a context
+    // client and a []-dep useCallback), so the listener still installs once.
+  }, [queryClient, showActionError])
+  // A redaction card's "Open in Terminal": open a dock terminal and TYPE the
+  // command without submitting it, so the reader reviews it before it runs.
+  // The typing tier refuses a newline, which is what keeps this from running.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail || {}
+      const command: unknown = detail.command
+      const reqId: unknown = detail.reqId
+      const emit = (ok: boolean) =>
+        window.dispatchEvent(new CustomEvent('mc:prefill-terminal-result', { detail: { reqId, ok } }))
+      if (typeof command !== 'string' || !command || /[\r\n]/.test(command)) { emit(false); return }
+      const sessionId = addDockTerminal(currentProjectRef.current ?? undefined)
+      if (!sessionId) { emit(false); return }
+      let settled = false
+      const unsub = onTerminalReady(sessionId, () => {
+        settled = true
+        emit(sendRawToTerminalSession(sessionId, command))
+      })
+      setTimeout(() => { if (!settled) { unsub(); emit(false) } }, RUN_IN_TERMINAL_READY_DEADLINE_MS)
+    }
+    window.addEventListener('mc:prefill-terminal', handler)
+    return () => window.removeEventListener('mc:prefill-terminal', handler)
   }, [])
+  // A redaction card's "Pre-fill request": the text lands in the composer for
+  // the reader to review; nothing is sent. It appends to unsent text rather
+  // than replacing it, because the pending-input path persists what it sets.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text: unknown = (e as CustomEvent).detail?.text
+      if (typeof text === 'string' && text) dispatch(setPendingInput(mergeIntoDraft(inputRef.current, text)))
+    }
+    window.addEventListener('mc:prefill-composer', handler)
+    return () => window.removeEventListener('mc:prefill-composer', handler)
+  }, [dispatch])
+  // A redaction card's "Allow for this host": the reply was saved with the
+  // link removed, and the server shows allowed hosts' links again when it
+  // serves the slot, so reload it to show the link in place of the chip.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const slot: unknown = (e as CustomEvent).detail?.slot
+      if (typeof slot === 'string' && slot) void dispatch(refreshSlot(slot))
+    }
+    window.addEventListener('mc:redaction-hosts-changed', handler)
+    return () => window.removeEventListener('mc:redaction-hosts-changed', handler)
+  }, [dispatch])
   // Cold-tab hydration: after a reload (or when restoring a slot's strip from
   // the persisted panel-tabs store), file tabs come back as lightweight
   // references with their heavy content stripped (content === undefined). Read
@@ -5066,18 +4489,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   )
   const coldFileResults = useQueries({
     queries: coldFileTabs.map(t => ({
-      queryKey: ['file-read', t.path!],
-      queryFn: async () => {
-        const res = await fetch(fileReadUrl(t.path!))
-        // Same contract as handleFileOpen: a 404 is a real answer and keeps its
-        // placeholder; any other failure is reported as an error, never as text.
-        const text = res.ok
-          ? await res.text()
-          : res.status === 404 ? i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
-          : ''
-        return { text, ok: res.ok, status: res.status }
-      },
-      staleTime: 10_000,
+      queryKey: fileReadQueryKey(t.path!),
+      // Same fetch (and so the same cache shape) as handleFileOpen: the binary
+      // verdict rides with the text. A 404 is a real answer and keeps its
+      // placeholder; any other failure is reported as an error, never as text.
+      queryFn: ({ signal }) => fetchFileRead(t.path!, signal),
+      staleTime: FILE_READ_STALE_MS,
     })),
   })
   // Mirror settled reads into the tab strip. useQueries owns the fetch
@@ -5095,7 +4512,10 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       if (!t || t.content !== undefined) return
       if (r.data && (r.data.ok || r.data.status === 404)) {
         reportedColdReadsRef.current.delete(t.id)
-        tabsCtl.patchTab(t.id, { content: r.data.text, savedContent: r.data.text })
+        const text = r.data.ok ? r.data.text : i18nT('pages.chatPage.file_not_found_on_disk_it_may_have_been_moved_or')
+        // The verdict is re-established by the same read that refills the
+        // buffer -- it was stripped from persistence alongside the content.
+        tabsCtl.patchTab(t.id, { content: text, savedContent: text, binary: r.data.ok && r.data.binary, partial: r.data.ok && isPartialRead(r.data) })
       } else if ((r.data || r.isError) && !reportedColdReadsRef.current.has(t.id)) {
         // The tab stays cold (its buffer untouched, so the next chip/tree click
         // retries the read) and the failure is reported above the composer.
@@ -5127,7 +4547,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     return true
   }
   const title = currentSlot?.title && currentSlot.title !== currentSlot.key ? currentSlot.title : activeSlot || ''
-  const displayMode = approvalMode === 'yolo' ? 'yolo' : currentSlot?.trust ? 'trust' : currentSlot?.trust_reads ? 'trust_reads' : 'normal'
+  const displayMode = slotApprovalMode(approvalMode, currentSlot)
   // Resolve model for existing slots that don't have one stored
   const _slotAgentName = (currentSlot && !currentSlot.model) ? (currentSlot.agent || defaultAgent || 'default') : ''
   const { data: _slotResolvedModel } = useQuery({
@@ -5184,9 +4604,34 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // authoritative — and is subscribed to rather than read, because it can flip
   // without the list changing.
   const _modelsDegraded = useModelsDegraded(provider.id)
+  const displayModels = codexPairModels
+    ? filterInteractiveModels(availableModels, [], [], true)
+    : availableModels
+  const modelPin = currentSlot?.model || resolvedModel || ''
+  const displayPin = codexPairModels ? modelWithoutEffort(modelPin) : modelPin
   const shownModel = displayModel(
-    currentSlot?.model || resolvedModel || '',
-    availableModels,
+    displayPin,
+    displayModels,
+    _modelsDegraded,
+    currentSlot?.model_withheld,
+    // Names the backend's own choice when the slot inherits, so the chip is not
+    // a bare `auto` for a session running one specific model.
+    codexPairModels ? modelWithoutEffort(currentSlot?.served_model || '') : currentSlot?.served_model,
+  )
+  const effortSupported = provider.capabilities.reasoningEffort && !selectionCapabilitiesQ.isError && (
+    selectionCapabilities
+      ? selectionCapabilities.effort_supported === true
+      : modelSupportsEffort(shownModel === 'auto' ? '' : shownModel)
+  )
+  const effortLevelsOverride = selectionCapabilities
+    ? selectionCapabilities.effort_levels
+    : remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined
+  // The same answer WITHOUT that substitution, for the pin-to-agent row: that
+  // row asks about the PIN, and it must stay disabled for a withheld one even
+  // now that the chip names the model the session inherited instead.
+  const _pinShownModel = displayModel(
+    displayPin,
+    displayModels,
     _modelsDegraded,
     currentSlot?.model_withheld,
   )
@@ -5197,31 +4642,37 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const remoteContextWindow = useMemo(() => {
     if (!remoteCrew.isRemote) return 0
     const picked = shownModel === 'auto' ? '' : shownModel
-    return remoteCrew.capabilities?.models.find(m => m.model_name === picked)?.context_window || 0
-  }, [remoteCrew.isRemote, remoteCrew.capabilities, shownModel])
-  // True when the pin row would be a no-op: the agent already stores exactly
-  // the model the composer is showing. 'auto' is the inherit spelling, never a
-  // stored pin, so it never counts as pinned. Reads the slot's REAL model, not
-  // `shownModel` — this pairs with the write below, and a display fallback must
-  // never decide what gets persisted.
-  const _modelPinActive = currentSlot?.model || resolvedModel || ''
+    return remoteCrew.capabilities?.models.find(m =>
+      (codexPairModels ? modelWithoutEffort(m.model_name) : m.model_name) === picked,
+    )?.context_window || 0
+  }, [remoteCrew.isRemote, remoteCrew.capabilities, shownModel, codexPairModels])
+  // True when the pin row would be a no-op: the agent already stores the
+  // selected base model. 'auto' is the inherit spelling, never a stored pin.
+  // Read the slot's pin through displayPin, not the fallback shownModel: a
+  // withheld model must never become the value saved to the agent template.
+  const _modelPinActive = displayPin
   const _modelPinPinned =
-    !!_modelPinCfg?.model && _modelPinCfg.model === _modelPinActive && _modelPinActive !== 'auto'
+    !!_modelPinCfg?.model &&
+    (codexPairModels ? modelWithoutEffort(_modelPinCfg.model) : _modelPinCfg.model) === _modelPinActive &&
+    _modelPinActive !== 'auto'
   // The configured default effort for new sessions. A slot that has never
   // touched the effort control carries '' (no override) but still RUNS at this
   // default — the backend applies `slot.reasoning_effort or agent.reasoning_effort`
   // — so the composer must show the inherited value rather than a bare
   // "Default", which read as "the model decides" and hid the real setting.
+  const readKirocrewConfig = useKirocrewConfigReader()
   const { data: _defaultEffort } = useQuery({
     queryKey: ['default-effort', provider.id],
-    queryFn: () => provider.resolveDefaultEffort(),
+    queryFn: () => provider.resolveDefaultEffort(readKirocrewConfig),
     enabled: provider.capabilities.reasoningEffort,
   })
   const defaultEffort = _defaultEffort || ''
   // Effort actually in force for the active slot: per-slot override, else the
   // configured default. Display only — the slot's raw value still drives the
   // picker so "no override" stays distinguishable from an explicit pick.
-  const effectiveEffort = currentSlot?.reasoning_effort || defaultEffort
+  const effectiveEffort = currentSlot?.reasoning_effort || legacyCodexEffort(
+    currentSlot?.model || '', '', codexPairModels,
+  ) || defaultEffort
   // Branch label for the active project chip. The user can check out a
   // different branch outside the dashboard at any time, so this refetches on a
   // slow interval and on window focus rather than being read once. A failure
@@ -5244,38 +4695,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const projectBranch = projectGitError
     ? ''
     : projectGit?.branch || (projectGit?.detached ? projectGit.head || '' : '')
-  // Working-tree summary for the composer footer badge. Shares the Git panel's
-  // ['git-status', dir] key so panel and footer dedupe into one fetch — while
-  // the panel is open its 5s interval drives the shared cache and this observer
-  // just reads it. Gated on repo=true so a non-repo project never runs a git
-  // subprocess on an interval; the cheap HEAD-file probe above answers that.
-  const { data: projectGitStatus, isError: projectGitStatusError } = useQuery({
-    queryKey: ['git-status', _slotProject],
-    queryFn: () => api.projectGitStatus(_slotProject),
-    enabled: !!_slotProject && !projectGitError && !!projectGit?.repo,
-    staleTime: 15_000,
-    refetchInterval: 60_000,
-    refetchOnWindowFocus: true,
-    retry: false,
-  })
-  const gitBadge = !projectGitStatusError && projectGitStatus?.repo
-    ? {
-        dirty: projectGitStatus.files.length,
-        ahead: projectGitStatus.ahead ?? 0,
-        behind: projectGitStatus.behind ?? 0,
-      }
-    : undefined
-  // The badge asserts "clean" by ABSENCE, so a stale reading right after the
-  // agent finishes editing files is misleading at exactly the decision moment
-  // the badge exists for. Invalidate the shared key on the running→idle
-  // transition; the 60s interval covers everything else.
-  const prevGitRunningRef = useRef(false)
-  useEffect(() => {
-    if (prevGitRunningRef.current && !slotRunning && _slotProject) {
-      queryClient.invalidateQueries({ queryKey: ['git-status', _slotProject] })
-    }
-    prevGitRunningRef.current = slotRunning
-  }, [slotRunning, _slotProject, queryClient])
 
   // Auto-open the Git panel when the slot has a project dir that is a git repo.
   // OPT-IN (dashboard.auto_open_git_panel, default off) because the marker below
@@ -5291,10 +4710,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!autoOpenGitPanelKnown) return
     const key = `mc-git-panel-opened:${activeSlot}:${_slotProject}`
     if (localStorage.getItem(key)) return
-    // If the marker cannot be persisted (quota), skip the auto-open entirely:
-    // opening changes tabsCtl, which re-runs this effect, and an absent marker
-    // would make it open again forever.
-    try { localStorage.setItem(key, '1') } catch { return }
+    // If the marker cannot be persisted, skip the auto-open entirely: opening
+    // changes tabsCtl, which re-runs this effect, and an absent marker would
+    // make it open again forever. safeSetItem reports whether the write landed
+    // (after reclaiming a disposable tier if the quota was full), so the guard
+    // is the return value rather than a caught throw.
+    if (!safeSetItem(key, '1')) return
     tabsCtl.openView('git')
     if (autoOpenGitPanel) dispatch(openActivityPanel())
   }, [activeSlot, _slotProject, projectGit?.repo, projectGitError, tabsCtl, dispatch, autoOpenGitPanel, autoOpenGitPanelKnown])
@@ -5306,6 +4727,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // it, so exiting focus mode restores what the user had. null = focus mode is
   // not the reason the list is hidden (the user owns the state).
   const sidebarAutoHidden = useRef<boolean | null>(null)
+  // One LLM title generation at a time from the phone bar's menu item: the
+  // menu closes on select, so nothing else stops a second tap from starting a
+  // concurrent call whose last response would win (SessionTitleControl's
+  // button has the same guard in its `generating` state).
+  const menuAutoTitleInFlight = useRef(false)
   const [sidePanelDock] = useSidePanelDock()
   // Recomputed on every dock flip: the wrapper keeps one React key across the
   // flip, so both axes have to stay named or the flipped-away one gets driven
@@ -5369,14 +4795,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
   }, [embedMode, splitMode, enterSplit, splitFeatureEnabled, activeSlot])
-  const [generatingTitleSlots, setGeneratingTitleSlots] = useState<Set<string>>(new Set())
-  const [titleDraft, setTitleDraft] = useState('')
   const lastTextIdx = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
       // Agree with renderMessage's skip: a hidden invisible-only row draws
       // nothing, so anchoring Regenerate/variant-switching on it would make
       // those affordances unreachable for the rest of a quiet monitor run.
-      if (messages[i].role === 'assistant' && !isHiddenInvisibleAssistantRow(messages[i])) return i
+      // System-notice rows (compaction / session reload) are passed over too:
+      // they draw a system card, not a reply, so hosting Regenerate/variant
+      // switching on them would target the wrong row.
+      if (messages[i].role === 'assistant' && !isHiddenInvisibleAssistantRow(messages[i]) && !isSystemNoticeRow(messages[i])) return i
     }
     return -1
   }, [messages])
@@ -5413,14 +4840,27 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // with is over, so the old reason would now describe a state that passed.
   useEffect(() => { if (slotRunning) setRefusedPress(null) }, [slotRunning])
   const handleRegenerate = useCallback(() => {
-    if (!activeSlot || regenerating || slotRunning) return
+    if (!activeSlot || regenerating || slotRunning || activeSlotRemoteBound) return
     // Mirror the server's scan exactly (chat_regenerate.py): the turn being
     // regenerated ends at the last assistant row BY ROLE — hidden
     // invisible-only rows included — so this optimistic truncation cannot
-    // diverge from the history rewrite the server persists. The skip-aware
-    // lastTextIdx only decides which drawn row HOSTS the affordance; using it
-    // here would truncate after an earlier user row than the server does.
-    const aiIdx = messages.map(mm => mm.role).lastIndexOf('assistant')
+    // diverge from the history rewrite the server persists. System-notice
+    // rows (compaction / session reload) ARE skipped, on both sides: they are
+    // status rows, not the reply, and capturing one as the variant would drop
+    // the real reply from variant history. The skip-aware lastTextIdx only
+    // decides which drawn row HOSTS the affordance; its extra invisible-row
+    // skip would truncate after an earlier user row than the server does.
+    let aiIdx = -1
+    for (let i = messages.length - 1; i >= 0; i--) {
+      // Never cross a real user turn (mirror the server): a reply found past
+      // a newer user row (e.g. a /compact row awaiting only its notice) would
+      // be regenerated by deleting that newer turn, irreversibly.
+      if (messages[i].role === 'user') break
+      if (messages[i].role !== 'assistant') continue
+      if (isSystemNoticeRow(messages[i])) continue
+      aiIdx = i
+      break
+    }
     if (aiIdx < 0) return
     const uIdx = messages.slice(0, aiIdx).map(mm => mm.role).lastIndexOf('user')
     if (uIdx < 0) return
@@ -5432,7 +4872,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       dispatch(replaceMessages(snapshot))
       setRegenerating(false)
     })
-  }, [activeSlot, regenerating, slotRunning, messages, dispatch, showRefusedPress])
+  }, [activeSlot, regenerating, slotRunning, activeSlotRemoteBound, messages, dispatch, showRefusedPress])
 
   // ---- Continue the thread ---------------------------------------------------
   // A turn can end without the assistant handing the floor back: the connection
@@ -5454,6 +4894,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // early-returns on — a dead control in the one place recovery is promised.
   const continuable = useAppSelector(selectContinuable)
   const interrupted = useAppSelector(selectTurnInterrupted)
+  // The footer's plain running indicator yields while the newest send is a
+  // bubble whose receipt never came (see `selectTrailingSendUnconfirmed`).
+  const sendUnconfirmed = useAppSelector(selectTrailingSendUnconfirmed)
   const [continuing, setContinuing] = useState(false)
   // Why the refusal is rendered rather than logged: the server re-checks under
   // the slot lock and can refuse a press the client believed was available
@@ -5471,6 +4914,55 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const t = setTimeout(() => { setContinuing(false) }, 30_000)
     return () => clearTimeout(t)
   }, [continuing])
+  // Fix affordances on a model-entitlement error row. The picker is the same
+  // portal the composer's model chip opens, anchored to that chip so it lands
+  // where the user already knows to look; when the chip is not on screen (a
+  // collapsed composer) the picker still opens, anchored to the composer edge.
+  const openModelPickerFromError = useCallback(() => {
+    const chip = document.querySelector<HTMLElement>('[data-testid="composer-model-chip"]')
+    const rect = chip?.getBoundingClientRect()
+      ?? new DOMRect(16, Math.max(0, window.innerHeight - 96), 160, 28)
+    anchorModelBtn(rect, chip)
+    // Opened from a transcript row, not from the composer: nothing to return to.
+    modelPickerReturnsFocusRef.current = false
+    setModelDropdown(true)
+  }, [anchorModelBtn, setModelDropdown])
+  // The Default Model setting lives only on the full dashboard's Settings →
+  // Chat tab. /embed/settings is a different page (Display), and a popout has
+  // no settings route at all, so on both surfaces the affordance is omitted
+  // rather than pointed at a page that does not carry the setting.
+  const openDefaultModelSetting = useCallback(() => {
+    navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: SETTINGS_DEFAULT_MODEL_ID }))
+  }, [navigate])
+  // The Kiro sign-in card (an `auth_required` error row's fix) lives on the
+  // full dashboard's Developer > Agent Backend tab, under the switch that
+  // selects the KAS backend the row can only come from; same surface rule as
+  // the Default Model link above.
+  const openKiroSignIn = useCallback(() => {
+    navigate(KIRO_SIGN_IN_PATH)
+  }, [navigate])
+  // A `materialization_changed` row's fix: the member's Capabilities pane in
+  // the crew editor, where the changed agent file is reviewed and saved.
+  const openMemberCapabilities = useCallback((member: string) => {
+    navigate(`/capabilities?tab=crews&crew=${encodeURIComponent(member)}&pane=capabilities`)
+  }, [navigate])
+  // The non-inference exit for a feature request the plan could not afford
+  // (#13342) is decided per row in the shared row set, from the row alone: the
+  // user row the header's "Request a Feature" action sent carries the flow's
+  // stamp in its `meta`, so the form is offered on that turn's own refusal,
+  // while a usage limit in an ordinary chat, or after the user typed on in
+  // this one, keeps today's card. The card withholds Resume on that refusal
+  // because a retry replays the rejection; the composer must not urge it
+  // beneath the same card, so its Resume and "press Resume" hint yield too
+  // (same rule, same row).
+  const featureRequestRefused = featureRequestRefusalIsNewest(messages)
+  // Same rule for a session start that failed twice in a row: the card has
+  // withheld Resume (a third press re-runs the same start, and the server
+  // refuses it with `session_start_repeat`) and names the remedy, so the
+  // composer must not urge the press beneath it. Typing still works and is
+  // what resets the count.
+  const sessionStartRepeated = sessionStartRepeatIsNewest(messages)
+
   const handleContinue = useCallback(() => {
     if (!activeSlot || continuing || !continuable) return
     setContinuing(true)
@@ -5486,48 +4978,111 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // the shared row set from the transcript it is handed -- see
   // transcriptRenderers.tsx `lastErrorIndex`.)
 
-  const [flyingQuote, setFlyingQuote] = useState<{ text: string; from: DOMRect } | null>(null)
   const inputAreaRef = useRef<HTMLDivElement>(null)
-
-  const handleQuote = useCallback((text: string, rect: DOMRect) => {
-    const quoted = text.split('\n').map(line => `> ${line}`).join('\n')
-    setInput(prev => {
-      // Append new quote after existing content (supports multiple quotes)
-      if (!prev.trim()) return `${quoted}\n\n`
-      return `${prev.trimEnd()}\n\n${quoted}\n\n`
-    })
-    // Trigger flying animation
-    setFlyingQuote({ text, from: rect })
-    revealComposer()
-  }, [])
-
-  // "Ask" (Select-to-Ask): open the isolated /side conversation seeded with the
-  // selection, WITHOUT touching the main chat context (unlike handleQuote, which
-  // injects into the main composer). Mirrors the /side slash command's
-  // openActivityToTab('side') bridge, then hands the selection to SideChat via a
-  // `side-seed` CustomEvent (same event-bridge pattern as openActivityToTab —
-  // no new prop-drilling, no backend change). No transit
-  // animation: the popup routes the selection straight to the Side Chat panel
-  // (matches Codex's "Ask in side chat" behavior).
-  const handleAsk = useCallback((text: string) => {
-    dispatch(openActivityToTab('side'))
-    // The Side Chat panel (and its `side-seed` listener) mounts asynchronously
-    // once the panel opens. Poll a few frames for its input as a mount signal,
-    // then dispatch the seed. Fall back to dispatching after a cap so the
-    // feature still works even if the input never resolves.
-    const trySeed = (attempt = 0) => {
-      const mounted = document.querySelector('[data-side-chat-input] textarea[data-composer-input]')
-      if (mounted || attempt >= 20) {
-        window.dispatchEvent(new CustomEvent('side-seed', { detail: { text } }))
-      } else {
-        requestAnimationFrame(() => trySeed(attempt + 1))
-      }
+  // The composer dock floats over the bottom of the transcript scroller, so the
+  // scroller has to be told how much of its bottom edge is covered. Measured
+  // rather than summed from parts: the dock's height is whatever the status
+  // stack, the follow-up chips, the approval bar and the composer's own growth
+  // add up to at this instant, and every one of those changes independently.
+  // A callback ref, not a mount effect: the dock lives inside the pane's
+  // conditional branch, so a `[]` effect can run before it exists and never
+  // look again. The ref fires in the commit phase each time the box mounts or
+  // unmounts, and its synchronous setState lands before paint — the first
+  // painted frame already carries the right padding, where an effect-timed
+  // measurement paints one frame with the last line under the glass, then jumps.
+  const [dockH, setDockH] = useState(0)
+  // The scroller reserves a `scrollbar-gutter: stable` column on its right, and
+  // its rows are centred in the content box that EXCLUDES that column. The dock
+  // is inset by the same width, so its column lines up with the transcript's and
+  // the thumb stays uncovered down to the pane's bottom edge. Measured, not the
+  // 6px the stylesheet asks for: an engine that ignores `::-webkit-scrollbar`
+  // reserves its own width.
+  const [dockGutter, setDockGutter] = useState(0)
+  const dockObserverRef = useRef<ResizeObserver | null>(null)
+  const dockRef = useCallback((el: HTMLDivElement | null) => {
+    dockObserverRef.current?.disconnect()
+    dockObserverRef.current = null
+    if (!el) { setDockH(0); setDockGutter(0); return }
+    const measure = () => {
+      setDockH(el.offsetHeight)
+      const sc = scrollerRef.current
+      setDockGutter(sc ? Math.max(0, sc.offsetWidth - sc.clientWidth) : 0)
     }
-    requestAnimationFrame(() => trySeed())
-  }, [dispatch])
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    // The gutter is the scroller's own reserved column, so watch the scroller
+    // too: an engine with overlay scrollbars changes that width without the
+    // dock resizing.
+    if (scrollerRef.current) ro.observe(scrollerRef.current)
+    dockObserverRef.current = ro
+  }, [scrollerRef])
+
+  // Quote / Ask on selected assistant text — the shared chat-core seam
+  // (chat-core/composer/selectionActions): Quote lands in this composer with
+  // the transit animation, Ask seeds the Side Chat. This page's Side Chat
+  // surface is the activity panel's `side` tab; the /side slash command opens
+  // it through the same `openActivityToTab('side')` bridge.
+  const openSideChat = useCallback(() => { dispatch(openActivityToTab('side')) }, [dispatch])
+  const { onQuote: handleQuote, onAsk: handleAsk, quoteFlight: flyingQuote, endQuoteFlight } = useSelectionQuoteAsk({
+    slot: activeSlot,
+    setInput,
+    revealComposer,
+    openSideChat,
+  })
+  // Split view's panes ask about THEIR slot, but the activity panel — and the
+  // Side Chat inside it — is bound to the active slot. Re-bind it first (the
+  // same switchSlot the grid's collapse path uses; split mode itself is not
+  // left), then open the tab. The seed names the slot, so it waits for the
+  // re-bound panel's composer rather than landing on the old slot's.
+  //
+  // Offline, the re-bind is withheld like every other switchSlot in this file
+  // (the tab strip, the sidebar row, the ?sid deep link): a rejected switch
+  // clears the pane's active messages and the transcript the reader just
+  // selected from disappears until reconnect. The grid is handed no
+  // `openSideChat` at all while disconnected, so the panes' toolbars offer
+  // Copy / Quote only (capability by omission, never an Ask into the void);
+  // the guard here covers the frame between the drop and the re-render, and
+  // rather than open a Side Chat bound to some OTHER slot it does nothing.
+  // Read at click time, not captured: the callback is memoized and the
+  // gateway can drop between renders (the tab strip's own gate, now inside
+  // useChatPageSessionController, keeps its ref the same way).
+  const connectedRef = useRef(connected)
+  connectedRef.current = connected
+  const openSideChatForPane = useCallback((slot: string): boolean | Promise<boolean> => {
+    if (slot === activeSlot) {
+      dispatch(openActivityToTab('side'))
+      return true
+    }
+    // `false` tells the selection seam the Ask did NOT happen, so it does
+    // not seed a quote into a Side Chat that never opened.
+    if (!connectedRef.current) return false
+    // The re-bind is a request the server can reject (the pane's session was
+    // deleted under it); `switchSlot.rejected` then falls back to the slot the
+    // page was on. Report the verdict only once it is known: the seam seeds
+    // on `true`, and a rejection is surfaced through the page's ErrorNotice
+    // instead of leaving a silent, invisible seed behind.
+    return dispatch(switchSlot(slot)).unwrap().then(
+      () => {
+        // A later switch (the user clicked another pane, or Asked from it)
+        // may have landed while this one was in flight; the panel is bound to
+        // whatever is active NOW, so opening the Side tab here would show the
+        // other pane's Side Chat with this quote hidden in this slot's draft.
+        // Report the Ask as not happened instead of seeding a stale slot.
+        if (boundStore.getState().chat.activeSlot !== slot) return false
+        dispatch(openActivityToTab('side'))
+        return true
+      },
+      (e: unknown) => {
+        showActionError(i18nT('pages.chatPage.side_chat_pane_gone', { error: errMessage(e) || i18nT('pages.chatPage.unknown_error') }))
+        return false
+      },
+    )
+  }, [activeSlot, boundStore, dispatch, showActionError])
 
   const handleEditResend = useCallback((index: number, ts: string, newContent: string) => {
-    if (!activeSlot || slotRunning) return
+    if (!activeSlot || slotRunning || activeSlotRemoteBound) return
     const snapshot = [...messages]
     dispatch(truncateAfterIndex(index))
     dispatch(appendMessage({ role: 'user', content: newContent, cls: '', ts: new Date().toISOString() }))
@@ -5540,7 +5095,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       dispatch(replaceMessages(snapshot))
       setRegenerating(false)
     })
-  }, [activeSlot, slotRunning, messages, dispatch])
+  }, [activeSlot, slotRunning, activeSlotRemoteBound, messages, dispatch])
 
   const searchCtxValue = useMemo(() => ({
     term: search.term,
@@ -5553,7 +5108,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // The session triple matches what the assistant / note rows hand
     // MarkdownRenderer (see the AssistantMessage and inject branches below),
     // so a `/chat?sid=…` link behaves identically across row kinds (#8253).
-    (c: string, mt: Record<string, unknown> | undefined) => renderUserContent({
+    (c: string, mt: Record<string, unknown> | undefined, ts?: string) => renderUserContent({
       content: c,
       meta: mt,
       onFileOpen: handleFileOpen,
@@ -5562,15 +5117,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
       activeSession: activeSlot || undefined,
+      // The short-name chip needs the row's write time; without it no short name
+      // resolves here, because slot numbers are reused.
+      messageTs: ts,
     }),
     [handleFileOpen, handleFolderOpen, linkPreviewsOn, selectSessionTab, connected, sessionTitles, activeSlot]
   )
 
-  const cancelTitleRef = useRef(false)
-  // The session-title field is an Enter-to-commit input; the guard owns both the
-  // composition latch and the keypress, so the rename cannot fire on the Enter that
-  // commits an IME candidate.
-  const titleIme = useImeGuard()
   useEffect(() => {
     const togglePin = () => {
       // Always-available collapse. Only guard is no-sessions (the sidebar is
@@ -5680,6 +5233,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       return
     }
     dispatch(setVoiceAudio(null))
+    // A synthesis still loading its model has no playing audio yet, but owns
+    // the same output channel. Replace it before starting a manual request.
+    window.dispatchEvent(new Event('voice-stop'))
     api.voiceSynthesize(activeSlotRef.current || '', content).catch(() => {})
   }, [dispatch])
 
@@ -5705,22 +5261,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const groupTurns = useMemo(() => createTurnGrouper(), [])
   const groupedTurns = useMemo(() => groupTurns(messages), [groupTurns, messages])
 
-  // LATCHED running for the DISPLAY layer only. The raw flag is derived
-  // from slots broadcasts that catch the agent momentarily idle BETWEEN
-  // tool calls, so mid-turn it flaps false for a beat and back. Each flap
-  // marks the trailing turn complete: TurnBlock auto-collapses it, the
-  // next broadcast re-expands it, and on a long-running turn (hundreds of
-  // steps) that is a multi-thousand-px accordion right above a reader
-  // parked at the bottom -- the field-reported self-bounce, reproduced on
-  // the bottom rig as a ~2Hz scrollHeight oscillation. TRUE applies
-  // immediately (a new turn must render live), FALSE only after holding
-  // steady past the flap window.
-  const [runningLatched, setRunningLatched] = useState(slotRunning)
-  useEffect(() => {
-    if (slotRunning) { setRunningLatched(true); return }
-    const timer = setTimeout(() => setRunningLatched(false), RUNNING_LATCH_MS)
-    return () => clearTimeout(timer)
-  }, [slotRunning])
+  // LATCHED running for the DISPLAY layer only, scoped to the slot that raised
+  // it: the flap it absorbs is one session's own broadcast, and a latch carried
+  // across a switch paints the incoming transcript's steps unfolded for the
+  // whole window. See useLatchedRunning.
+  const runningLatched = useLatchedRunning(activeSlot, !!slotRunning)
   const displayItems = useMemo<DisplayItem[]>(
     () => applyRunningState(groupedTurns, runningLatched),
     [groupedTurns, runningLatched],
@@ -5742,7 +5287,63 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // new chat's first send briefly showed the previous session's messages
   // (#8526). Only same-slot updates (streaming flushes, history landings) are
   // deferred; a switch renders the right transcript in its first commit.
-  const renderedDisplayItems = useSlotDeferredValue(activeSlot, displayItems)
+  // One deferred frame carries both the rows the virtualizer draws and the
+  // messages they came from, so every deferred reader (the transcript, the
+  // turn minimap, the Navigation tab) sees the same snapshot by construction.
+  const liveTranscript = useMemo(() => ({ messages, displayItems }), [messages, displayItems])
+  const renderedTranscript = useSlotDeferredValue(activeSlot, liveTranscript)
+  // MCP App payloads live outside the message list, so promote after the
+  // transcript defer: the FIRST render that can draw an iframe must already use
+  // the same TurnBlock subtree that later grouping will keep. Short turns are
+  // emitted as loose siblings, so promote the WHOLE loose turn region rather
+  // than each app row separately; otherwise a later merge reparents every app
+  // after the first and reloads its iframe. The boundaries mirror the grouper:
+  // opener rows start a turn, persisted assistant-final rows end one, and an
+  // already-grouped turn is its own region. The app-anchor latch below gives
+  // the synthetic turn the same key as its first rendered app row.
+  const renderedDisplayItems = useMemo<DisplayItem[]>(() => {
+    const items = renderedTranscript.displayItems
+    if (appToolCallIds.size === 0) return items
+
+    const next: DisplayItem[] = []
+    let looseItems: TurnItem[] = []
+    let looseHasApp = false
+    let promoted = false
+
+    const flushLooseTurn = () => {
+      if (looseItems.length === 0) return
+      if (looseHasApp) {
+        next.push({ kind: 'turn', items: looseItems, complete: !runningLatched })
+        promoted = true
+      } else {
+        next.push(...looseItems)
+      }
+      looseItems = []
+      looseHasApp = false
+    }
+
+    for (const item of items) {
+      if (item.kind === 'turn') {
+        flushLooseTurn()
+        next.push(item)
+        continue
+      }
+      if (item.kind === 'single' && TURN_OPENER_ROLES.has(item.msg.role)) {
+        flushLooseTurn()
+        next.push(item)
+        continue
+      }
+
+      looseItems.push(item)
+      if (item.kind === 'single' && item.msg.role === 'tool') {
+        const toolCallId = item.msg.meta?.tool_call_id
+        if (typeof toolCallId === 'string' && appToolCallIds.has(toolCallId)) looseHasApp = true
+      }
+      if (item.kind === 'single' && isTurnEnd(item.msg)) flushLooseTurn()
+    }
+    flushLooseTurn()
+    return promoted ? next : items
+  }, [renderedTranscript.displayItems, appToolCallIds, runningLatched])
 
   // Keep the ref in sync so handleRangeChanged / updatePinnedPrompt
   // read the latest displayItems. useLayoutEffect (not useEffect): the DOM's
@@ -5836,10 +5437,64 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     }
     return undefined
   }, [renderedDisplayItems])
-  const rowKeys = useMemo(
-    () => uniqueRowKeys(renderedDisplayItems, stableMsgKey),
-    [renderedDisplayItems, stableMsgKey],
-  )
+  // An inline MCP App makes one row stateful: remounting its iframe discards
+  // in-canvas work. A running turn normally keys on its lead, but a later
+  // reasoning burst can become that lead. Once an app payload exists, anchor
+  // the turn to the first app payload observed in that turn. `appToolCallIds`
+  // preserves the insertion order of chat.mcpApps, so an earlier transcript
+  // row whose slower payload arrives later cannot steal the anchor and remount
+  // an app already on screen. The session-scoped tool-call id selected here
+  // becomes the turn's latch id: its transcript row outlives the bounded render
+  // payload, so retention eviction cannot promote a later app and re-key the
+  // turn. The latched value uses an `mcp-app:` namespace followed by that
+  // session-scoped id. Ordinary row keys use other prefixes, so a history
+  // prepend cannot collide with this key and make `uniqueRowKeys` suffix it.
+  // Rebuilding the map from the rendered turns drops a latch as soon as its
+  // turn disappears.
+  const appAnchorByTurnId = useRef(new Map<string, string>())
+  const rowKeys = useMemo(() => {
+    // Preserve the ordinary transcript's original O(display rows) path. The
+    // deeper turn-item scan is needed only while selecting or retaining an app
+    // anchor.
+    if (appAnchorByTurnId.current.size === 0 && appToolCallIds.size === 0) {
+      return uniqueRowKeys(renderedDisplayItems, stableMsgKey)
+    }
+    const previousAnchors = appAnchorByTurnId.current
+    const retainedAnchors = new Map<string, string>()
+    const keys = uniqueRowKeys(renderedDisplayItems, stableMsgKey, (it) => {
+      if (it.kind !== 'turn' || !activeSlot) return undefined
+
+      // Retention can remove the payload that selected this anchor. Find the
+      // turn's latch from its still-rendered tool row before consulting the
+      // bounded live-payload set.
+      for (const row of it.items) {
+        if (row.kind !== 'single') continue
+        const toolCallId = row.msg.meta?.tool_call_id
+        if (typeof toolCallId !== 'string' || !toolCallId) continue
+        const turnId = mcpAppKey(activeSlot, toolCallId)
+        const anchor = previousAnchors.get(turnId)
+        if (anchor) {
+          retainedAnchors.set(turnId, anchor)
+          return anchor
+        }
+      }
+
+      for (const appToolCallId of appToolCallIds) {
+        for (const row of it.items) {
+          if (row.kind !== 'single') continue
+          if (row.msg.meta?.tool_call_id === appToolCallId) {
+            const turnId = mcpAppKey(activeSlot, appToolCallId)
+            const anchor = `mcp-app:${turnId}`
+            retainedAnchors.set(turnId, anchor)
+            return anchor
+          }
+        }
+      }
+      return undefined
+    })
+    appAnchorByTurnId.current = retainedAnchors
+    return keys
+  }, [renderedDisplayItems, stableMsgKey, appToolCallIds, activeSlot])
   // Index lookup into the deduped list, so this getKey prices an item
   // correctly ONLY against the displayItems of its own render. Live consumers
   // pair getKeyRef with itemsRef from the same tick; the one stale-ITEMS
@@ -6016,7 +5671,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // virtualizer track that one row's growth every RO tick instead of
     // debouncing it into a stale-then-jump spacer (see the `streamingIndex`
     // option's doc and useVirtualChat.spacerLurch.test.tsx).
-    streamingIndex: isStreaming && displayItems.length > 0 ? displayItems.length - 1 : undefined,
+    streamingIndex: isStreaming && renderedDisplayItems.length > 0 ? renderedDisplayItems.length - 1 : undefined,
     // `slotRunning`, not `isStreaming`: a turn spends much of its life in tool
     // calls with no streaming row named, and follow has to keep working there.
     runActive: !!slotRunning,
@@ -6041,10 +5696,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     vFarmIsMeasuredRef.current = virt.farmIsMeasured
     earlierBarInViewRef.current = earlierBarInView
     mountIndexRef.current = virt.mountIndex
+    estimateRowTopRef.current = virt.estimateRowTop
   })
 
   // Legacy aliases so the JSX below keeps reading the same names.
   const visibleDisplayItems = virt.virtualItems
+  // A window replacement can commit after the scroll frame that requested it.
+  // Re-read geometry from the committed rows so an incomplete old window cannot
+  // leave its banner at rest over a different part of the transcript.
+  useLayoutEffect(() => { updatePinnedPrompt() }, [visibleDisplayItems, updatePinnedPrompt])
 
 
 
@@ -6282,7 +5942,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // the text inline via the 'steer_push' WS event. Composer, pending files,
   // paste blocks, and the per-slot drafts are all cleared HERE (not in
   // ChatInput) so text and attachments clear atomically.
-  const steer = useCallback(() => {
+  const steer = useCallback((opts?: { auto?: boolean }) => {
     if (!activeSlot) return
     // Nothing to inject into: the composer is busy purely because background
     // sub-agents are still running for this slot (spawn_run is fire-and-forget,
@@ -6301,6 +5961,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     const raw = inputRef.current.trim()
     const files = pendingFilesRef.current
     if (!raw && !files.length) return
+    // Same rule as send(): a steer while STREAMING dictation is live ends the
+    // dictation before the composer is cleared below. AFTER the empty-payload
+    // check, like send(): an Enter on an empty composer before the first
+    // partial has landed sends nothing, so it must not end the capture — that
+    // would drop the utterance in flight with nothing to show for it.
+    composerRef.current?.voice()?.disarmForSend()
     // Client-side slash commands (/side, /onboarding) are UI commands, not
     // turn content: they must work identically whether the agent is mid-turn
     // or idle. Without this guard the command text is steered into the
@@ -6370,8 +6036,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // races chat_done falls onto — so the bubble is resolvable by id identity
     // whichever path the server took (#6075).
     const steerSendId = mintSendId()
+    // Drain the per-frame chunk buffer first: a pre-steer chunk still pending
+    // in useWebSocket's buffer means appendMessage's finalize-on-steer finds
+    // no streaming row to freeze, so that text would flush BELOW this card
+    // and post-steer chunks would append to it (see lib/pendingChunkDrain.ts).
+    drainPendingChunks()
     dispatch(appendMessage({ role: 'user', content: llmTxt, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: steerSendId } }))
-    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot })
+    // The optimistic bubble above stays a STEER bubble for an `auto` send: steer
+    // is the answer every refusal keeps, so it is the honest guess while the POST
+    // is in flight, and a queue answer replaces this row through the same
+    // `queue_push` reconcile a manual queue uses.
+    steerMutation.mutate({ text: llmTxt, sendId: steerSendId, slot: activeSlot, auto: opts?.auto === true })
     // Staged session references are deliberately NOT part of steering: neither
     // carried into the payload nor cleared. Only the TEXT has a restore path
     // (steerMutation hands it back on a refused, failed or unconfirmed steer);
@@ -6379,10 +6054,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // would lose a reference the user cannot recover except by dragging again.
     // Leaving them staged is lossless and predictable: the chip stays in the
     // composer and rides the next real send, which does have a full restore path.
-    setInput(''); setPendingFiles([]); pickedFileTokens.current = {}; setPasteBlocks([])
+    // Drops only this slot's own token sub-map -- see the same-shaped
+    // comment at the other send-clear site above.
+    setInput(''); setPendingFiles([]); delete pickedFileTokens.current[activeSlot]; setPasteBlocks([])
     delete drafts.current[activeSlot]; delete fileDrafts.current[activeSlot]; delete pasteDrafts.current[activeSlot]
     saveDrafts()
-  }, [activeSlot, slotRunning, send, steerMutation, saveDrafts, dispatch])
+  }, [activeSlot, slotRunning, send, steerMutation, saveDrafts, dispatch, setInput])
 
   // The queue-card recipe is shared with every other host that draws a
   // QueueStack over this slot queue (#5891) — see useQueuedMessageActions for
@@ -6396,13 +6073,20 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Whatever lands here is persisted into this slot's draft by the `[input]`
   // effect above, so a recovered draft survives a slot switch.
   const restoreQueuedDraft = useCallback(
-    (text: string, files: string[]) => {
+    (text: string, files: string[], aliases?: Record<string, string[]>) => {
       setInput(prev => mergeRecoveredDraft(prev, text))
       // Chips MERGE like the text does: paths join whatever is already staged,
       // deduped, so a re-send serializes each attachment exactly once.
       if (files.length) setPendingFiles(prev => [...new Set([...prev, ...files])])
+      // The stash's alias snapshot comes back with them (fork GPT review), so
+      // the restored mentions are reconciled again -- without it a
+      // hand-deleted mention left a stale chip the next send re-attached.
+      if (aliases) {
+        const slot = composerSlotRef.current
+        if (slot) mergeSlotTokens(slot, aliases)
+      }
     },
-    [],
+    [mergeSlotTokens, setInput],
   )
   const {
     onCancel: handleCancelQueued,
@@ -6418,22 +6102,28 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   })
 
 
-  // Search: map message index → displayItems index for scroll-to-match
-  const messageToDisplayIdx = useMemo(() => {
-    const map = new Map<number, number>()
-    displayItems.forEach((item, di) => {
-      if (item.kind === 'turn') {
-        for (const ti of item.items) {
-          if (ti.kind === 'single') map.set(ti.idx, di)
-          else if (ti.kind === 'group') ti.msgs.forEach((_, mi) => map.set(ti.startIdx + mi, di))
-        }
-      } else if (item.kind === 'single') map.set(item.idx, di)
-      else if (item.kind === 'group') item.msgs.forEach((_, mi) => map.set(item.startIdx + mi, di))
-    })
-    return map
-  }, [displayItems])
+  // Search, pins, tool focus, and deep links navigate the rows the virtualizer
+  // actually renders, including post-defer MCP App coalescing.
+  const messageToDisplayIdx = useMemo(
+    () => buildMessageToDisplayIdx(renderedDisplayItems),
+    [renderedDisplayItems],
+  )
 
-  const chatNav = useChatNavigation(messages, messageToDisplayIdx)
+  const navigateToTurn = useCallback((displayIndex: number, opts?: { instant?: boolean }) => {
+    // instant: used by the minimap's drag-scrub — a smooth glide would lag the
+    // pointer and queue easings on every marker crossing.
+    navToDisplayIndex(displayIndex, { behavior: opts?.instant ? 'auto' : 'smooth', align: 'start', offset: -24 })
+  }, [navToDisplayIndex])
+
+  // The transcript renders the deferred `renderedTranscript` snapshot; while a
+  // history page lands, live indexes lead the rows on screen. The minimap's
+  // messages and `messageToDisplayIdx` map come from that same rendered frame,
+  // so a marker's display index always names the virtualizer row on screen.
+  // One per-turn derivation: `sections` feeds the turn minimap; `links` feeds the
+  // Navigation tab. Both read the deferred snapshot, so the link list trails a
+  // landing history page by one deferred commit -- deliberate, and harmless for
+  // a side panel.
+  const chatNav = useChatNavigation(renderedTranscript.messages, messageToDisplayIdx)
 
   // ── Chat Pins ──────────────────────────────────────────────────────────────
   const {
@@ -6475,7 +6165,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     setHighlightTs(messageTs)
     setTimeout(() => setHighlightTs(null), 3000)
     return true
-  }, [messages, navToDisplayIndex])
+  }, [messages, navToDisplayIndex, setHighlightTs])
   const handleJumpToPinnedMessage = useCallback((messageTs: string, mid: string | undefined, { origin }: { origin: PendingJumpOrigin }) => {
     if (jumpToLoadedPinnedMessage(messageTs, mid)) return
     if (activeSlot && (!cursorIsForActiveSlot || (slotHasMore && slotOldestIndex > 0))) {
@@ -6708,7 +6398,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     if (!initialMsgRef.current) return
     const timer = setTimeout(() => { initialMsgRef.current = null; initialMidRef.current = null }, 5000)
     return () => clearTimeout(timer)
-  }, [])
+  }, [initialMsgRef, initialMidRef])
   useEffect(() => {
     const targetTs = initialMsgRef.current
     const targetMid = initialMidRef.current
@@ -6790,6 +6480,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // through the memo.
   const visibleIndexMapRef = useRef(visibleIndexMap); visibleIndexMapRef.current = visibleIndexMap
   const lastTextIdxRef = useRef(lastTextIdx); lastTextIdxRef.current = lastTextIdx
+  // The first reply in this session with a removed credential: the one-time
+  // redaction coach renders after it and nowhere else.
+  const redactionCoachTs = useMemo(() => {
+    for (const m of messages) {
+      const r = (m.meta as Record<string, unknown> | undefined)?.redactions
+      if (m.role === 'assistant' && Array.isArray(r) && r.length > 0) return m.ts ?? null
+    }
+    return null
+  }, [messages])
   const slotStateRef2 = useRef(slotState); slotStateRef2.current = slotState
 
   // ── Registry-driven row dispatch (chat-core P5-a) ──
@@ -6804,12 +6503,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // is the page's precedence order, unchanged from the if-chain it replaces:
   // the shared dashboard set (sub-agent completion, launch cards, tool,
   // thinking, file, nudge, recovery inject, workflow completion, error), then
-  // stop_event, notice, permission, undrawn, mcp_oauth, hidden invisible
-  // assistant, and the conversational bubble. Roles none of these
-  // claim fall to the registry defaults (`undrawn` for queued/system/done and
-  // the reasoning roles; `tool_lifecycle` for raw wire shapes the store
-  // normalizes away), and a role NOBODY claims renders as the bubble, which is
-  // what the if-chain's fall-through did.
+  // permission, undrawn, hidden invisible assistant, and the conversational
+  // bubble. Roles none of these claim fall to the registry defaults (`undrawn`
+  // for queued/system/done and the reasoning roles; `tool_lifecycle` for raw
+  // wire shapes the store normalizes away; the stop-event card, the notice
+  // card and the MCP OAuth banner -- P5-c deleted the page's copies of those
+  // three, which drew the same component from the same inputs), and a role
+  // NOBODY claims renders as the bubble, which is what the if-chain's
+  // fall-through did.
   //
   // Memoized with the deps the old renderMessage carried: UI-state deps
   // (chatConfig, linkPreviewsOn, disclosure, pin state, ...) deliberately STAY
@@ -6846,11 +6547,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               timestamp={chatConfig.showTimestamps ? msgTime : undefined}
               timestampTitle={msgTimeFull}
               renderContent={renderUserContentCb}
-              canEdit={!slotRunning && !regenerating && !!activeSlot}
+              canEdit={!slotRunning && !regenerating && !!activeSlot && !activeSlotRemoteBound}
               slotRunning={slotRunning}
               messageIndex={i}
               messageTs={m.ts || ''}
               onEditResend={handleEditResend}
+              doubleClickToEdit={chatConfig.doubleClickToEdit}
               slotKey={activeSlot || undefined}
               slotTitle={activeSlotTitle}
               mode={mode}
@@ -6860,18 +6562,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           ) : isInject ? (
             (() => {
               const cronLabel = (m.meta?.cronLabel as string) || ''
+              const appLabel = (m.meta?.appLabel as string) || ''
               // Strip wrapper tags — LLM needs them for context but user sees clean content
               const stripped = cronLabel
                 ? m.content.replace(/^\[Cron notification from ".*"\]\n/, '').replace(/\n\[End of cron notification\]$/, '')
-                : m.content
+                : appLabel
+                  ? stripAppEnvelope(m.content)
+                  : m.content
               // A note's marker is consumed into the pill row, so rendering it too would show
               // the same choices twice. Non-note inject rows keep it: there it is prose.
               const cleanContent = isNoteRow(m) ? parseOptions(stripped).text : stripped
               return <>
                 {cronLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1"><Clock className="lucide-inline" /> {cronLabel}</span>}
+                {!cronLabel && appLabel && <span className="text-muted text-[11px] leading-4 font-medium px-1 mb-1 cursor-help" title={i18nT('components.mcpApp.from_app_tooltip')}><AppWindow className="lucide-inline" /> {i18nT('components.mcpApp.from_app', { app: appLabel.split('/')[0] })}</span>}
                 {/* Same session wiring as the assistant branch. Without it `resolveSessionChip`
                     refuses at its first guard and a `/chat?sid=` link gains `target="_blank"`. */}
-                <div className="msg-content px-4 py-3 text-sm leading-6 rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} softBreaks /></MessageErrorBoundary></div>
+                <div className="mc-message-font-scope msg-content px-4 py-3 leading-relaxed rounded-lg bg-warn-subtle text-text ring-1 ring-inset forced-colors:border ring-warn/30 rounded-bl-[4px] overflow-hidden min-w-0" style={{ overflowWrap: 'anywhere', wordBreak: 'break-word', fontSize: 'var(--mc-message-font-size, 14px)' }}><MessageErrorBoundary rawContent={cleanContent}><MarkdownRenderer content={cleanContent} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} messageTs={m.ts} softBreaks /></MessageErrorBoundary></div>
                 {/* No `font-mono`: a formatted date is prose, and Tailwind's
                     `font-mono` pins `var(--mono)` — a token the Font Family
                     setting never writes, so it overrode the user's choice and
@@ -6884,7 +6590,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             })()
           ) : (
             <div className="flex flex-col gap-0">
-              <AssistantMessage suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} prevUserText={prevUserTextFor(messagesRef.current, i)} shareEnabled={socialShareOn} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
+              <AssistantMessage revealActions={!!activeSlot && voiceRecoverySlot === activeSlot} suppressSteerAck={turnHadPolicyBlock(messagesRef.current, i)} prevUserText={prevUserTextFor(messagesRef.current, i)} shareEnabled={socialShareOn} linkPreviews={linkPreviewsOn} content={m.content} isStreaming={isStreaming} isRegenerating={regenerating && i === lastTextIdxRef.current} onFileOpen={handleFileOpen} onFolderOpen={handleFolderOpen} onArtifactOpen={handleArtifactOpen} onSessionOpen={selectSessionTab} sessions={connected ? sessionTitles : undefined} activeSession={activeSlot || undefined} onQuote={handleQuote} onAsk={handleAsk} slotRunning={slotRunning} planTaskId={planTaskId} timestamp={chatConfig.showTimestamps ? msgTime : undefined} timestampTitle={msgTimeFull} messageTs={m.ts} slotKey={activeSlot || undefined} slotTitle={activeSlotTitle} mode={mode} fileChanges={(m.meta as Record<string, unknown> | undefined)?.file_changes as FileChangeEntry[] | undefined} fileChangesOmittedFiles={(m.meta as Record<string, unknown> | undefined)?.file_changes_omitted_files} blockedLinks={(m.meta as Record<string, unknown> | undefined)?.blocked_links} redactions={(m.meta as Record<string, unknown> | undefined)?.redactions} showRedactionCoach={!!m.ts && m.ts === redactionCoachTs} turnStats={chatConfig.showTurnStats ? (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined : undefined} decisionsStrip={decisionStripFieldOf(m)} onOpenDiff={handleOpenDiff} fileChipStyle={chatConfig.fileChipStyle} artifactPaths={artifactPaths} pinned={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? isPinned((m.meta as Record<string, unknown>).mid as string) : false} onTogglePin={m.ts && (m.meta as Record<string, unknown> | undefined)?.mid ? () => handleTogglePinForMessage((m.meta as Record<string, unknown>).mid as string, m.ts!, 'assistant', m.content) : undefined} showFooter={(() => {
                 // Show footer on the last assistant message of each completed turn
                 if (isStreaming) return false
                 // Find next message after this one that's assistant, user, or streaming
@@ -6894,6 +6600,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   // A hidden invisible-only row draws nothing, so it cannot
                   // host the footer; pass over it to the row that renders.
                   if (isHiddenInvisibleAssistantRow(later)) continue
+                  // A system-notice row (compaction / session reload) draws a
+                  // system card, not a reply, so it cannot end the turn either.
+                  if (isSystemNoticeRow(later)) continue
                   if (later.role === 'assistant' || later.role === 'streaming') return false // not last assistant in turn
                 }
                 // End of messages. A run still in progress has not produced this
@@ -6912,7 +6621,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 const stats = (m.meta as Record<string, unknown> | undefined)?.turn_stats as TurnStats | undefined
                 if (stats && (stats.elapsed_ms ?? 0) > 0) return true
                 return !slotRunning
-              })()} onSpeak={handleSpeak} onRegenerate={i === lastTextIdxRef.current && !slotRunning && !regenerating && activeSlot ? handleRegenerate : undefined} variants={m.variants} variantIdx={m.variant_idx} onSwitchVariant={i === lastTextIdxRef.current && m.variants && m.variants.length > 1 && activeSlot ? (idx: number) => { api.switchVariant(activeSlot, idx).catch((e: unknown) => {
+              })()} onSpeak={handleSpeak} onRegenerate={i === lastTextIdxRef.current && !slotRunning && !regenerating && activeSlot && !activeSlotRemoteBound ? handleRegenerate : undefined} variants={m.variants} variantIdx={m.variant_idx} onSwitchVariant={i === lastTextIdxRef.current && m.variants && m.variants.length > 1 && activeSlot ? (idx: number) => { api.switchVariant(activeSlot, idx).catch((e: unknown) => {
                 showRefusedPress('switch_variant', e)
               }) } : undefined} onFork={embedded && !popout ? undefined : handleFork} onPlanFromHere={embedded && !popout ? undefined : handlePlanFromHere} forkIndex={forkIndex} forkMessageId={canResolveOnServer ? messageId : undefined} onLoadEarlier={cursorIsForActiveSlot ? handleLoadEarlier : undefined} loadingOlder={loadingOlder} earlierRemaining={slotOldestIndex} onApplyPlan={handleApplyPlan} />
             </div>
@@ -6927,7 +6636,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // tool lines and launch cards, thinking block, nudge, recovery inject, the
     // two completion cards, the error card with Continue), wired with this
     // page's behaviours through its options; ChatPane calls the same factory
-    // with fewer. Only rows that are genuinely page-specific follow it.
+    // with fewer. Only rows that are genuinely page-specific follow it. The
+    // stop-event card, the notice card and the MCP OAuth banner are NOT among
+    // them: the SDK defaults draw each from the same component and the same
+    // inputs (`ctx.hideCardOwnedOAuth` is this page's `connectionsUiOn`), and
+    // this page's `ctx.row` is a keyed passthrough, so the page reads those
+    // three rows from the registry exactly as every pane does (P5-c).
     const shared = createTranscriptRenderers({
       slot: activeSlot || undefined,
       // An unparseable file row has always fallen through to the bubble on
@@ -6946,25 +6660,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       // The Loop button is offered only when this row's own loop is the one
       // still bound to the slot, so a historical card never opens a successor
       // loop's controls (the match rule lives in the factory).
-      activeNudgeLoopId: autoNudgeLoop?.id,
-      onOpenNudgeLoop: () => setAutoNudgeOpen(true),
+      activeNudgeLoopId: automationId,
+      onOpenNudgeLoop: () => setAutomationOpen(true),
       continuable,
       interrupted,
       continuing,
       onContinue: handleContinue,
+      onPickModel: openModelPickerFromError,
+      onOpenDefaultModel: embedded || popout ? undefined : openDefaultModelSetting,
+      onOpenSignIn: embedded || popout ? undefined : openKiroSignIn,
+      onOpenCapabilities: embedded || popout ? undefined : openMemberCapabilities,
       onSessionOpen: selectSessionTab,
       sessions: connected ? sessionTitles : undefined,
       activeSession: activeSlot || undefined,
     })
     const renderers = mergeRenderers([
       ...shared,
-      {
-        id: 'stop_event',
-        roles: ['*'],
-        match: m => m.kind === 'stop_event' || m.meta?.kind === 'stop_event',
-        render: (m, ctx) => <StopEventCard key={m.meta?.id as string ?? ctx.key} message={m} />,
-      },
-      { id: 'notice', roles: ['notice'], render: (m, ctx) => <NoticeCard key={ctx.key} content={m.content} /> },
       {
         // Approval flow: the permission cards own it; grouped, never a standalone row.
         id: 'permission',
@@ -6983,15 +6694,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         render: () => null,
       },
       {
-        id: 'mcp_oauth',
-        roles: ['mcp_oauth'],
-        render: (m, ctx) => {
-          const key = ctx.key
-      const banner = renderMcpOAuthMessage(m, connectionsUiOn)
-      return banner ? <div key={key}>{banner}</div> : null
-        },
-      },
-      {
         // A quiet monitor-loop cycle replies with a bare zero-width space
         // (U+200B): the content is truthy but renders as nothing, so the row
         // would draw as an empty bubble -- one per quiet cycle, historical
@@ -7005,7 +6707,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       bubble,
     ])
     return { renderers, fallback: bubble }
-  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, autoNudgeLoop, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, connectionsUiOn, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel])
+  }, [slotRunning, handleFileOpen, handleArtifactOpen, selectSessionTab, sessionTitles, connected, handleFork, handleQuote, handleAsk, chatConfig, activeSlot, regenerating, activeSlotRemoteBound, handleRegenerate, handleEditResend, slotHasMore, loadingOlder, cursorIsForActiveSlot, slotOldestIndex, handleLoadEarlier, renderUserContentCb, highlightTs, activeSlotTitle, mode, embedded, popout, handleOpenDiff, handlePlanFromHere, planTaskId, artifactPaths, automationId, toolDisclosure, setToolDisclosureFor, linkPreviewsOn, socialShareOn, voiceRecoverySlot, handleSubagentPanelOpen, isPinned, handleTogglePinForMessage, showRefusedPress, transcriptHot, revealAppInPanel, continuable, interrupted, continuing, handleContinue, openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, handleFolderOpen, handleSpeak, handleApplyPlan, mcpAppPanel, redactionCoachTs])
 
   const renderMessage = useCallback((i: number, m: ChatMessage) => {
     // Key identity rules (clientTs preference + streaming->assistant role
@@ -7045,7 +6747,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     // nothing for them, and the bare wrapper would still stack py-1 spacers,
     // one per quiet monitor cycle.
     if (it.kind === 'single' && isHiddenInvisibleAssistantRow(it.msg)) return null
-    return <div key={turnLeadKey(it, stableMsgKey)} className={`px-4 mx-auto w-full py-1`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+    return <div key={turnLeadKey(it, stableMsgKey)} data-content-column="" className={`px-4 mx-auto w-full py-1`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       {it.kind === 'group' ? (() => {
         const unresolvedPerms = it.msgs.filter(m => m.role === 'permission' && !m.meta?.resolved)
         // Skip group entirely if it only contains unresolved permissions (handled by ApprovalBar)
@@ -7083,7 +6785,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
       return <TurnBlock turn={item} renderItem={renderTurnItem} collapseAll={chatConfig.collapseAllSteps} appToolCallIds={appToolCallIds} disclosure={undefined} disclosureKey={`farm-${i}`} onDisclosureChange={() => {}} />
     }
     return (
-      <div className={`px-4 mx-auto w-full py-1`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+      <div data-content-column="" className={`px-4 mx-auto w-full py-1`} style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
         {item.kind === 'group' ? (() => {
           if (item.msgs.every(m => m.role === 'permission')) return null
           return (
@@ -7237,7 +6939,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     drawerEntryRef.current = false
     drawerPopRef.current = true
     navigate(-1)
-  }, [navigate])
+  }, [navigate, drawerPopRef])
   const openSidebar = useCallback(() => {
     if (drawerPhaseRef.current === 'open') return
     // Seat it offscreen before the mount so the first painted frame is the
@@ -7321,40 +7023,15 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // top-to-bottom. The header row ends at the slot's left edge,
   // so the top-bar right cluster (capsule, terminal, bell, gear) shifts left
   // when the panel opens. Null on mobile / embed frames -> inline fallback.
-  //
-  // Seed the portal slot SYNCHRONOUSLY so the very first render after a
-  // ChatPage remount (e.g. switching back to /chat) already targets the
-  // full-height actbar grid column. An effect-only seed leaves activitySlot
-  // null for render 1, which falls back to the inline panel (rendered below
-  // the header) and then flashes: below-header -> disappear -> portal opens.
-  // The App shell (and its #activity-bar-slot) lives outside the router, so on
-  // route-nav back it's already in the DOM. The effect below stays as the
-  // fallback for cold load / mobile->desktop crossings where it isn't yet.
-  const [activitySlot, setActivitySlot] = useState<HTMLElement | null>(
-    () => (isMobile || embedMode) ? null : document.getElementById('activity-bar-slot'),
-  )
-  useEffect(() => {
-    if (isMobile || embedMode) { setActivitySlot(null); return }
-    const el = document.getElementById('activity-bar-slot')
-    if (el) { setActivitySlot(el); return }
-    // Slot not in the DOM yet. On a mobile -> desktop crossing, this
-    // component's media-query subscription can flush (and run this effect)
-    // before the App shell re-renders the slot div -- a one-shot lookup here
-    // would miss it forever and strand the panel on the inline fallback
-    // (rendering below the header instead of in the full-height column).
-    // Watch the DOM until the slot appears, then latch it and stop.
-    setActivitySlot(null)
-    const mo = new MutationObserver(() => {
-      const found = document.getElementById('activity-bar-slot')
-      if (found) { setActivitySlot(found); mo.disconnect() }
-    })
-    mo.observe(document.body, { childList: true, subtree: true })
-    return () => mo.disconnect()
-  }, [isMobile, embedMode])
+  // `useShellSlot` seeds synchronously (no first-render flash into the inline
+  // fallback) and watches the DOM across a mobile -> desktop crossing; the
+  // phone top-bar slots below resolve through the same hook.
+  const activitySlot = useShellSlot('activity-bar-slot', !isMobile && !embedMode)
   /** The inline panel's mount predicate, shared by the overlay phase effect
    *  and the render below so the two cannot disagree. */
-  const sidePanelWantsMount = shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
-    && !isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
+  const hasTaskDashboard = tabsCtl.tabs.some(tab => tab.kind === 'command-center')
+  const sidePanelWantsMount = shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })
+    && !isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })
   // Mobile right-panel overlay: slide in when the panel wants the screen,
   // slide out (keeping it mounted for the travel) when it stops wanting it.
   useEffect(() => {
@@ -7410,8 +7087,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
    *  live app or browser tab keeps the panel mounted through a close, and the
    *  find pane hides it while owning the dock). */
   const inlineSidePanelShowing = !activitySlot
-    && shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
-    && !isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
+    && shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })
+    && !isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })
   // ONE binding per panel, each covering both of ITS directions: a rightward
   // drag opens the sessions drawer, a leftward drag on the open drawer closes
   // it. Which rule applies is read live from `open` inside the hook, so the
@@ -7598,6 +7275,17 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   const sidebarOpen = isMobile
     ? mobileSessions
     : (sidebarPinned || (filteredSlots.length === 0 && !previewExpanded))
+  // Whether the sidebar -- and with it the banner that says a failed
+  // folder-order read -- is on this screen right now. The same facts that mount
+  // it below: embed-chat never mounts one, embed-sessions always does, and the
+  // dashboard mounts it in the drawer while the drawer is (mobile) or the panel
+  // is open (desktop). The header menu and the folder-suggestion card say the
+  // failure themselves only when this is false: one screen, one notice.
+  const sidebarOnScreen = embedMode === 'chat'
+    ? false
+    : embedMode === 'sessions'
+      ? true
+      : (isMobile ? drawerMounted : sidebarOpen)
 
   // ── Collapsed-sidebar hover flyout ──────────────────────────────────────
   // Hovering the toggle while collapsed opens a recents list over the chat, so
@@ -7640,7 +7328,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // rect and appear to grow out of nothing.
   useEffect(() => { if (!sidebarOpen) setExpandFrom(null) }, [sidebarOpen])
   const flyoutSwitch = useCallback((key: string) => {
-    dispatch(switchSlot(key))
+    // User gesture on a listed session row (collapsed-sidebar flyout): the
+    // announced class, same as the expanded sidebar's own rows.
+    dispatch(switchSlot({ key, announceOnMissing: true }))
     setSplitMode(false)
     flyout.close()
   }, [dispatch, flyout])
@@ -7696,6 +7386,178 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
     isMobile,
   })
 
+  // The mobile sessions toggle, rendered inline by whichever header owns the
+  // surface's top-left: the single-chat title row, or in split view the grid's
+  // top-left pane (SessionGridView `leading`). Mirrors the desktop toggle
+  // exactly, state included: solid while the panel is hidden, light while it
+  // is showing.
+  const mobileSessionsToggle = (
+    <button className="mc-touch-hit p-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none pointer-events-auto shrink-0" onClick={() => mobileSessions ? closeSidebar() : openSidebar()} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
+      {mobileSessions ? <PanelLeftLight size={16} /> : <PanelLeftSolid size={16} />}
+    </button>
+  )
+  /**
+   * The same toggle for the shell's bar. `p-2` puts its 32px box at the bar's
+   * 8px inset, so the glyph's ink lands on the 16px page gutter the nav logo
+   * held before it (page-layout.md, "The title belongs to the content column").
+   */
+  const topbarSessionsToggle = (
+    <button className="mc-touch-hit p-2 rounded-md text-text hover:text-text-strong hover:bg-bg-hover cursor-pointer bg-transparent border-none shrink-0" onClick={() => mobileSessions ? closeSidebar() : openSidebar()} aria-label={i18nT('pages.chatPage.toggle_sessions')} aria-expanded={mobileSessions} data-testid="mobile-topbar-sessions-toggle">
+      {mobileSessions ? <PanelLeftLight size={18} /> : <PanelLeftSolid size={18} />}
+    </button>
+  )
+
+  // Unchanged from the inline WelcomeView handler; shared with the composer memory chip.
+  const switchMemoryMode = async (newMode: MemoryMode) => {
+    if (!activeSlot) return
+    // Create-first-then-delete: deleting the active slot first
+    // would make deleteSlot jump focus to a sibling. Creating
+    // first keeps the new slot active, so the delete skips the
+    // sibling navigation. Carry agent/project/folder/color so
+    // the recreated slot keeps its identity and placement.
+    const old = currentSlot
+    const opts = {
+      agent: old?.agent || defaultAgent || undefined,
+      model: old?.model || undefined,
+      mode,
+      memory_mode: newMode,
+      folder_id: old?.folder_id ?? null,
+      color_index: old?.color_index ?? null,
+      color_hex: old?.color_hex ?? null,
+      project: old?.project ?? null,
+      instanceId: old?.instance_id || undefined,
+    }
+    try { await dispatch(createSlot(opts)).unwrap() } catch (error) {
+      showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
+      return
+    }
+    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch (error) {
+      showActionError(errMessage(error) || i18nT('pages.chatPage.unknown_error'))
+    }
+  }
+  // The non-orchestrator welcome screen puts its memory chip directly above the composer.
+  const showComposerMemoryChip = isWelcomeState && (currentSlot?.mode || mode) !== 'orchestrator'
+
+  // Memoized so the composer's memo holds across page renders that change
+  // nothing it shows (a pin, a streamed frame): JSX written inline in the prop
+  // is a new element on every render. `langGen`: i18nT labels inside.
+  const composerAbove = useMemo(() => {
+    void langGen
+    return (
+    <>
+      {/* Session-control failures surface HERE, beside the chips they
+          are about, rather than on the chat. Both hooks fail closed —
+          a failed `/api/apps` renders no chips, a failed status probe
+          renders a stateless one — and either is indistinguishable
+          from "no app declares a control", so without this the user
+          sees a feature silently missing and has nothing to act on.
+          One notice covers both: they are the same feature to the
+          user, and the composer shares a row with the message input.
+          `askAgent` is on because nothing here holds an unsaved
+          draft, and a failed app-list or status route is squarely
+          something the agent can investigate.
+
+          The folder query rides along rather than getting its own
+          banner: it feeds the folder NAME handed to each control, and
+          on `/embed/chat` no sidebar is mounted to consume the shared
+          ['chat-folders'] cache — so this is the only place its
+          failure can be seen at all. It is gated on a control
+          actually existing, though: with no chips on screen a folder
+          failure is not a session-control problem, and calling it one
+          would put an unexplained notice on every composer. */}
+      {(sessionControlsError
+        || sessionControlStatusError
+        || (chatFoldersError && sessionControls.length > 0)) && (
+        <div className="pt-1.5" key="session-controls-error">
+          <ErrorNotice
+            title={i18nT('components.sessionControlHost.controls_unavailable')}
+            message={
+              (sessionControlsError || sessionControlStatusError || chatFoldersError)
+                ?.message
+            }
+            askAgent
+            variant="inline"
+          />
+        </div>
+      )}
+      {/* In-flow tip inside the composer's own width wrapper: shares
+       the composer's exact box geometry (Raymond 2026-07-21: tip
+       width must always match the input box) while still pushing
+       chat content up like QueueStack (team decision: never cover
+       thinking/output; queue and question card keep priority via
+       tipSuppressed). ChatInput renders this slot LAST in the
+       above-composer stack, so the card stays flush against the
+       input box and an options row sits above it. */}
+      <AnimatePresence>
+        {folderSuggestion && activeSlot ? (
+          <div className="pt-1.5" key="folder-suggestion">
+        {/* The card's option list follows the sidebar's folder
+            order. A failed read of that order is said once per
+            screen -- by the sidebar's banner while the sidebar is
+            on this screen, and here, above the card, only when it
+            is not (embed chat, the drawer closed, the panel
+            collapsed): otherwise the list is drawn in the stored
+            order with nothing on screen to say why.
+            No hand-off: the card's dropdown holds a pick that is
+            not saved until Accept, and the hand-off navigates
+            away and unmounts it -- so the line under the notice
+            is the one phrase every surface uses for this failure
+            plus where the hand-off lives. */}
+        {folderSortError !== null && !sidebarOnScreen && (
+          <ErrorNotice
+            title={i18nT('pages.chatSidebar.folder_order_unavailable')}
+            message={folderSortError}
+            messagePlacement="below"
+            footer={i18nT('pages.chatSidebar.folder_order_unavailable_detail_picker_ask')}
+            className="mb-1.5"
+            testId="folder-suggestion-order-unavailable"
+          />
+        )}
+            {/* Keyed by the suggestion's ts: a replacement card
+                remounts the component, so its dropdown re-prefills
+                and a selection made against the previous suggestion
+                cannot leak onto the new one. `chatFolders` is the
+                sidebar's own ['chat-folders'] cache (normalized to
+                [] on error above), so the dropdown costs no extra
+                request and degrades to a suggestion-only option
+                list when folders are unavailable. */}
+            <FolderSuggestionCard
+              key={folderSuggestion.ts}
+              suggestedFolderId={folderSuggestion.folderId}
+              suggestedFolderName={folderSuggestion.folderName}
+              suggestedFolderBreadcrumb={folderSuggestion.breadcrumb}
+              folders={chatFolders}
+          folderSortMode={folderSortMode}
+              onAccept={folderSuggestionAccept}
+              onDecline={folderSuggestionDecline}
+            />
+          </div>
+        ) : activeTip && (
+          <div className="pt-1.5" key="tip">
+            <TipCard tip={activeTip} onDismiss={dismissTip} />
+          </div>
+        )}
+      </AnimatePresence>
+    </>
+    )
+  }, [sessionControlsError, sessionControlStatusError, chatFoldersError, sessionControls.length, folderSuggestion, activeSlot, chatFolders, folderSortMode, folderSortError, sidebarOnScreen, folderSuggestionAccept, folderSuggestionDecline, activeTip, dismissTip, langGen])
+  const composerSessionControls = useMemo(() => sessionControls.map(sc => ({
+    key: sc.key,
+    label: sc.label,
+    icon: sc.icon,
+    active: openSessionControl?.key === sc.key && openSessionControl.slot === activeSlot,
+    state: sessionControlStatuses[sc.key]?.state,
+    statusTooltip: sessionControlStatuses[sc.key]?.tooltip,
+  })), [sessionControls, openSessionControl, activeSlot, sessionControlStatuses])
+  // `isRefused` keeps one identity per slot and reads the module-level latches,
+  // so the latch set it answers from (`latchedActions`, published after a Go /
+  // Cancel click) is what has to re-key this memo.
+  const planLatches = planActionMutation.latchedActions
+  const followUpRefusedOptions = useMemo(() => {
+    void planLatches
+    return new Set(followUpOptions.filter(planActionMutation.isRefused))
+  }, [followUpOptions, planActionMutation.isRefused, planLatches])
+
   return (
     <RowDisclosureProvider resetKey={activeSlot}>
     <TagPopoverProvider>
@@ -7726,13 +7588,21 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
          attribute carries a guarantee about a case it cannot affect. */
       data-owns-swipe={embedded ? undefined : 'left right'}
       className="flex flex-1 min-h-0 h-full overflow-hidden relative"
+      /* Published here, not on the chat pane, because the side panel (Activity,
+         Browser, SideChat's composer and follow-up chips) is this element's
+         child and the chat pane's SIBLING. Anything that reads the setting via
+         `var(--mc-message-font-size, 14px)` from inside the panel would
+         otherwise silently take the fallback and look right at the default
+         only. Content width stays on the pane: it is a column geometry, and the
+         panel has its own. */
+      style={{ '--mc-message-font-size': `${chatConfig.messageFontSize}px` } as React.CSSProperties}
     >
       <AnimatePresence>
         {isMobile && drawerMounted && (
           <motion.div
             key="sessions-backdrop"
             data-testid="sessions-backdrop"
-            className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-sm"
+            className="fixed inset-0 z-[46] bg-black/50 backdrop-blur-xs"
             // ^ Frosted, matching every other scrim in the app (App.tsx's own
             // mobile nav backdrop is the same three classes). Kept adjacent to
             // `key` — the composer-chrome occlusion guard anchors its z-order
@@ -7775,6 +7645,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           aria-expanded={flyoutEligible ? flyout.open : undefined}
           // Geometry mirrored by TOGGLE_RECT (chat/SessionFlyout) — every
           // surface in this interaction grows out of and back into this rect.
+          // In split view the grid's top-left pane reserves this column
+          // (SessionGridView `leading`); its title row is the same height as
+          // the single-chat row, so the toggle keeps this rect there too.
           className="pi-morph absolute top-[9px] left-2 z-[61] w-7 h-7 rounded-md flex items-center justify-center cursor-pointer text-muted hover:text-text hover:bg-bg-hover transition-colors bg-transparent border-none"
           title={sidebarOpen ? i18nT('pages.chatPage.hide_sessions') : i18nT('pages.chatPage.show_sessions')}
           aria-label={sidebarOpen ? i18nT('pages.chatPage.hide_sessions_sidebar') : i18nT('pages.chatPage.show_sessions_sidebar')}
@@ -7808,7 +7681,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         )}
       </AnimatePresence>
       {embedMode === 'chat' ? null : embedMode === 'sessions' ? (
-        <div className="flex-1 min-w-0 h-full overflow-hidden [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!border-0 [&_.sidebar-inner]:!rounded-none [&_.sidebar-inner]:!shrink [&_.sidebar-inner]:!bg-bg [&_.sidebar-resize-handle]:!hidden">
+        <div className="flex-1 min-w-0 h-full overflow-hidden [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!border-0 [&_.sidebar-inner]:!rounded-none [&_.sidebar-inner]:!shrink [&_.sidebar-inner]:!bg-bg [--folder-row-sticky-bg:var(--bg)] [&_.sidebar-resize-handle]:!hidden">
           <ChatSidebar
             slots={filteredSlots}
             activeSlot={null}
@@ -7841,7 +7714,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         // OverlayDrawer applies width and the x slide AFTER this style, so neither
         // can be overridden from here.
         slideStyle={isMobile ? { marginTop: vv.offsetTop, marginBottom: keyboardInset } : undefined}
-        morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? 'mobile-sessions-overlay fixed top-safe-offset-[42px] bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0' : ''}>
+        // Top edge: below the shell's bar while this page still draws its own
+        // title row under that bar, so the two bars stay visible above the
+        // panel; with the row IN the shell's bar (`titleInTopbar`) the panel
+        // covers the whole safe-area height like the App nav drawer it
+        // replaces on this route -- the rail's brand mark then sits where
+        // that drawer's did. Close: scrim tap, swipe, Back -- all unchanged.
+        morph={!isMobile} morphTarget={TOGGLE_RECT} expandFrom={expandFrom} contentH={Math.max(0, containerH - 8)} className={isMobile ? `mobile-sessions-overlay fixed ${titleInTopbar ? 'top-safe' : 'top-safe-offset-[42px]'} bottom-safe left-safe z-50 bg-bg-elevated !py-0 rounded-r-xl shadow-lg [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0` : ''}>
+        {/* Phone chat page: ONE drawer holds the shell's navigation rail (72px,
+            from MobileNavRailContext) beside the sessions pane, Discord-style, so
+            the bar above needs no second drawer trigger. The pane keeps its
+            `staticRows` content and takes the drawer's remaining width; the
+            drawer's own width, slide, scrim and keyboard inset are unchanged.
+            Row taps that stay on this page close the drawer (`closeSidebar`);
+            rows that leave it `replace` the duplicate history entry
+            `pushDrawerEntry` minted, so Back lands on the chat. */}
+        {(() => {
+        const sessionsPane = (
         <ChatSidebar
           slots={filteredSlots}
           activeSlot={activeSlot}
@@ -7863,16 +7752,185 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           chatDropTarget={canStageSessionRef ? chatPaneEl : null}
           onDropSessionRef={stageSessionRef}
         />
+        )
+        return isMobile && mobileNavRail ? (
+          <div className="flex h-full min-h-0 w-full" data-testid="mobile-split-drawer">
+            {mobileNavRail({ onActivate: closeSidebar })}
+            {/* The pane sits on the drawer's elevated surface so it reads apart
+                from the rail's `bg-bg-accent` (the sidebar's own shell paints
+                `bg-bg`, one step too close to the rail on the light themes). */}
+            {/* The drawer's `[&>*]` resets (no card border/radius/margin on the
+                sidebar root) reach only its direct child, which is now this
+                wrapper -- so the wrapper carries the same resets one level down. */}
+            <div className="flex-1 min-w-0 h-full min-h-0 flex flex-col overflow-hidden bg-bg-elevated [&_.sidebar-inner]:!bg-bg-elevated [&_.sidebar-inner]:!w-full [&_.sidebar-inner]:!min-w-0 [&_.sidebar-inner]:!shrink [&>*]:!rounded-none [&>*]:!border-0 [&>*]:!m-0">{sessionsPane}</div>
+          </div>
+        ) : sessionsPane
+        })()}
       </OverlayDrawer>
+      )}
+      {/* Phone: this page's share of the shell's single top bar. Leading cell:
+          [sessions toggle][session title][session menu]. The title is first and
+          the menu chevron trails it, as on the approved mock — one control the
+          eye reads as "the session, and its menu". Rendered whenever the slot
+          exists, so the sessions toggle is in the bar even with no session open
+          (the fixed corner button below stands down); the title half needs a
+          session and is not drawn in split view, whose grid names each pane. */}
+      {topbarSlot && createPortal(
+        <>
+          {embedMode !== 'chat' && topbarSessionsToggle}
+          {activeSlot && !(splitMode && splitFeatureEnabled) && (
+            <div className="group/header flex min-w-0 flex-1 items-center gap-0.5" data-testid="mobile-topbar-title">
+              {/* ONE control for title + menu: the session menu's trigger carries
+                  the title text with the chevron flush after its last character
+                  (the approved mock), so the bar's centre holds two controls --
+                  the sessions toggle and this -- and the title has one tap
+                  target, not a rename tap beside a menu tap. Rename lives in the
+                  menu (`onRename`) and swaps this trigger for the shared title
+                  editor while it is open; the memory-mode glyphs ride the label
+                  so an incognito/temporary session is still marked. */}
+              {editingTitle ? (
+                <SessionTitleControl
+                  slotKey={activeSlot}
+                  title={title}
+                  editing
+                  onEditingChange={open => setEditingTitleSlot(open ? activeSlot : null)}
+                  onError={showActionError}
+                  onAttempt={() => setActionError(null)}
+                />
+              ) : (
+                <ChatHeaderMenu
+                  activeSlot={activeSlot}
+                  agent={currentSlot?.agent}
+                  onReveal={() => {
+                    // Same as the inline row's reveal: the phone drives its own
+                    // drawer, and the store carries the request (#912).
+                    sidebarAutoHidden.current = null
+                    openSidebar()
+                    dispatch(requestSlotReveal(activeSlot))
+                  }}
+                  onRename={() => setEditingTitleSlot(activeSlot)}
+                  // The phone bar does not render the title row's hover-revealed
+                  // Auto-title button (an opacity-0 control has no touch home), so
+                  // the LLM rename is a menu item here. Same endpoint and same
+                  // store write as SessionTitleControl's button; the Undo window
+                  // that button offers is a hover-hold affordance and is not
+                  // offered from a menu -- Rename in the same menu is the way back.
+                  onAutoTitle={() => {
+                    if (menuAutoTitleInFlight.current) return
+                    menuAutoTitleInFlight.current = true
+                    setActionError(null)
+                    const slot = activeSlot
+                    api.generateTitle(slot).then(r => {
+                      /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */
+                      if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title }))
+                    }).catch(e => showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_generate_title')))
+                      .finally(() => { menuAutoTitleInFlight.current = false })
+                  }}
+                  mode={effectiveMode}
+                  sidebarOnScreen={sidebarOnScreen}
+                  // Pop out / focus the popped-out window live in the bar's
+                  // trailing ⋯ menu (below), the phone's window menu; the same
+                  // row in two adjacent menus read as two different actions.
+                  omitPopout
+                  triggerLabel={
+                    <>
+                      {currentSlot?.memory_mode === 'incognito' && <EyeOff size={13} className="lucide-inline shrink-0 text-warn" aria-label={i18nT('pages.chatPage.incognito_memory_writes_disabled')} />}
+                      {currentSlot?.memory_mode === 'temporary' && <VenetianMask size={13} className="lucide-inline shrink-0 text-aim" aria-label={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')} />}
+                      {title}
+                    </>
+                  }
+                />
+              )}
+              {/* The autopilot explainer rides the bar too: it is the only
+                  place the mode is explained, and the inline row that carried
+                  it is not rendered here. A tooltip disclosure, not an action. */}
+              {/* No Autopilot InfoTip here: it is a third button in a two-button
+                  cell. The session menu already names the mode (its
+                  Autopilot/Normal switch row) and the composer shows it. No
+                  InboundLinkChip either, for the same reason: a two-way link
+                  would make it a third trigger. Its actions are the session
+                  menu's "Linked surfaces" section (LinkedSurfacesSection). */}
+            </div>
+          )}
+        </>,
+        topbarSlot,
+      )}
+      {/* Trailing cell: the page's overflow menu, after the shell's bell — the
+          second of the two controls a row may hold. It carries what the inline
+          title row shows as icons: pop-out (or focus the popped-out window),
+          the activity panel, and split view. Nothing here is a hard swap: the
+          menu opens with DropdownMenu's own animation. */}
+      {topbarTrailSlot && activeSlot && !embedMode && createPortal(
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button type="button" className="mc-touch-hit w-8 h-8 rounded-md flex items-center justify-center text-text hover:text-text-strong hover:bg-bg-hover bg-transparent border-none cursor-pointer shrink-0" aria-label={i18nT('pages.chatPage.more_actions')} title={i18nT('pages.chatPage.more_actions')} data-testid="mobile-topbar-more">
+              <MoreHorizontal size={18} />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-[220px]">
+            {/* A pending update leads the menu (accent row, same lifecycle label
+                as the desktop pill: available → downloading N% → ready). The
+                phone bar has no cell with room for the pill without making a
+                three-control group, so this is its phone home. Renders nothing
+                when no update exists. */}
+            {/* Local boundary: this is a lazy chunk, and a chunk that fails to
+                load after the preload heal declined would otherwise reject up
+                to the ROUTE boundary and replace the whole chat page with an
+                error card. The fallback is the shared error surface, not
+                nothing: this menu is the update's only phone home, so a chunk
+                that never loads must SAY so here (`errors-use-error-notice`),
+                and the sibling item carries the agent hand-off through the
+                menu's roving focus. Settings › About still checks for updates. */}
+            <ErrorBoundary
+              scope="mobile-update-menu"
+              fallback={
+                <>
+                  <ErrorNotice
+                    id="mobile-update-menu-error"
+                    variant="inline"
+                    className="px-2 py-1.5"
+                    message={i18nT('pages.chatPage.update_entry_load_failed')}
+                  />
+                  <ErrorNoticeMenuItem Item={DropdownMenuItem} message={i18nT('pages.chatPage.update_entry_load_failed')} describedBy="mobile-update-menu-error" />
+                </>
+              }
+            ><Suspense fallback={null}><MobileUpdateMenuItem variant="menu-item" /></Suspense></ErrorBoundary>
+            {activePoppedOut ? (
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" onSelect={() => focusActivePopout(activeSlot)}>
+                <span className="flex items-center gap-2"><ExternalLink size={14} className="shrink-0 text-muted" /><span>{i18nT('pages.chatPage.focus_popped_out_window')}</span></span>
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" onSelect={() => openActivePopout(activeSlot, currentSlot?.title)}>
+                <span className="flex items-center gap-2"><ExternalLink size={14} className="shrink-0 text-muted" /><span>{i18nT('pages.chatPage.pop_out_to_window')}</span></span>
+              </DropdownMenuItem>
+            )}
+            {!activityOpen && (
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" onSelect={toggleAct}>
+                <span className="flex items-center gap-2"><PanelRightSolid size={14} className="shrink-0 text-muted" /><span>{i18nT('pages.chatPage.open_activity_panel')}</span></span>
+              </DropdownMenuItem>
+            )}
+            {splitFeatureEnabled && (splitAnchorForActive && !activeIsSplitAnchor ? (
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" onSelect={() => enterSplit(splitAnchorForActive)}>
+                <span className="flex items-center gap-2"><Columns2 size={14} className="shrink-0 text-muted" /><span>{i18nT('pages.chatPage.return_to_split_view')}</span></span>
+              </DropdownMenuItem>
+            ) : (
+              <DropdownMenuItem className="[@media(hover:none)]:min-h-10" onSelect={() => enterSplit(activeSlot)}>
+                <span className="flex items-center gap-2"><Columns2 size={14} className="shrink-0 text-muted" /><span>{i18nT('pages.chatPage.enter_split_view')}</span></span>
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>,
+        topbarTrailSlot,
       )}
 
       {/* Per-slot tag picker — a single connected popover, opened from any session
           menu (sidebar row or header) via the ChatPage-scoped TagPopover context. */}
       <SlotTagPopover />
+      <ComposerDraftSync store={composerDraft} inputRef={inputRef} onCommit={onComposerDraftCommit} />
 
       {/* Chat pane */}
       {embedMode !== 'sessions' && (
-      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: '-0.5rem' } : {}), '--mc-content-width': CONTENT_WIDTH[chatConfig.contentWidth].messages, '--mc-input-width': CONTENT_WIDTH[chatConfig.contentWidth].input } as React.CSSProperties}>
+      <div ref={setChatPaneEl} className={`relative flex flex-col bg-bg min-w-0 min-h-0 h-full overflow-hidden ${(activityOpen && !activitySlot) || search.isOpen ? 'flex-[1_1_60%]' : 'flex-1'}`} style={{ transition: 'flex 0.2s', ...(!sidebarOpen && !isMobile ? { marginLeft: -COLLAPSED_PANE_RECLAIM_PX } : {}), '--mc-content-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).messages, '--mc-input-width': scaleContentWidth(CONTENT_WIDTH[chatConfig.contentWidth], chatConfig.contentWidth, chatConfig.messageFontSize).input } as React.CSSProperties}>
         {snipFrame && (
           <SnipOverlay
             frame={snipFrame}
@@ -7906,6 +7964,13 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           className="mx-4 mt-2 mb-0 animate-rise"
           testId="sid-error"
         />
+        {/* No hand-off: navigating away would discard the unsent composer draft. */}
+        <ErrorNotice
+          message={activeSlot && provider.capabilities.reasoningEffort && selectionCapabilitiesQ.isError
+            ? i18nT('pages.chatPage.effort_options_unavailable') : ''}
+          className="mx-4 mt-2 mb-0 animate-rise"
+          testId="effort-capabilities-error"
+        />
         <ErrorNotice
           title={actionError?.title}
           message={actionError?.message}
@@ -7914,6 +7979,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           className="mx-4 mt-2 mb-0 animate-rise"
           testId="action-error"
         />
+        {/* A click on a listed-but-gone session (#6372): the fact at the click
+            locus, through the required ErrorNotice surface. The store carries
+            the NAME; the sentence resolves here so a locale switch re-renders it. */}
+        <ErrorNotice
+          message={switchSlotGone ? switchSlotNoticeCopy(switchSlotGone.kind, switchSlotGone.name) : ''}
+          report={switchSlotGone?.report}
+          onDismiss={() => dispatch(clearSwitchSlotGone())}
+          askAgent
+          className="mx-4 mt-2 mb-0 animate-rise"
+          testId="switch-slot-gone"
+        />
+        <VoicePlaybackNotice slot={activeSlot} onBlockedSlotChange={setVoiceRecoverySlot} />
         <ErrorNotice
           message={pinError}
           onDismiss={dismissPinStatus}
@@ -7958,6 +8035,22 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             />
           </div>
         )}
+        {undeletableHistory && (
+          <div className="mx-4 mt-2 mb-0" data-testid="undeletable-history-error">
+            {/* Same site and shape as the unresumable notice above: a sidebar
+                click the gateway answered with a refusal, narrated here because
+                the row it names is still in the sidebar and looks untouched.
+                The sentence is chosen from the gateway's `code`, so the remedy
+                matches the cause (release the cron jobs / retry / repair). */}
+            <ErrorNotice
+              message={historyDeleteRefusalMessage(undeletableHistory)}
+              report={undeletableHistory.report}
+              onDismiss={() => dispatch(clearUndeletableHistory())}
+              variant="block"
+              askAgent
+            />
+          </div>
+        )}
         {/* Floating sessions opener — mobile only, and only on a chat with
             nothing in it yet (a conversation gets the in-header control
             instead). Suppressed while the inline side panel is showing: it is
@@ -7974,9 +8067,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
             corner -- in Papyrus, on the toolbar's back button, giving two
             overlapping tap targets on the app's primary exit. A host that
             embeds one scoped conversation has no sessions list to open. */}
-        {isMobile && !embedded && !sidebarOpen && !inlineSidePanelShowing && !(activeSlot && (messages.length > 0 || slotRunning)) && (
+        {isMobile && !embedded && !sidebarOpen && !inlineSidePanelShowing && !titleInTopbar && !(activeSlot && (messages.length > 0 || slotRunning)) && (
           <div className="fixed top-safe-offset-[42px] left-safe ml-2 z-10">
-            <button className="p-2 rounded-lg text-muted hover:text-text bg-bg-elevated border border-border shadow-sm cursor-pointer" onClick={openSidebar} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
+            <button className="mc-touch-hit p-2 rounded-lg text-muted hover:text-text bg-bg-elevated border border-border shadow-sm cursor-pointer" onClick={openSidebar} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
               {/* Same glyph as the desktop toggle: a control is named by the SURFACE
                   it opens, and this opens the sessions panel. Solid rather than
                   `PanelLeftLight` because this form only renders while that panel is
@@ -8002,7 +8095,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         {activeSlot && ownsSessionTabs && !(splitMode && splitFeatureEnabled) && (
           // no-drag: on the desktop shell the top strip of the window is the
           // titlebar drag region, and a tab you cannot click is worse than no tab.
-          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+          //
+          // While the desktop sidebar is collapsed the shell insets the strip
+          // past the stationary toggle, gliding on the same 240ms curve as the
+          // panel morph and the title row so the tabs do not jump at the start
+          // of the slide. The shell owns the strip's bottom divider (the strip
+          // draws none of its own): an inset border on the strip's root would
+          // stop short of the gutter and leave a notch under the toggle, so
+          // the shell draws one continuous hairline across the full width.
+          // `empty:hidden` keeps the shell out of the layout when the strip
+          // renders nothing (fewer than two tabs), so the divider it owns
+          // appears only when the strip does.
+          <div
+            className="empty:hidden border-b border-border transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)]"
+            style={{
+              WebkitAppRegion: 'no-drag',
+              paddingLeft: !sidebarOpen && !isMobile ? COLLAPSED_SESSION_TABS_INSET : 0,
+            } as React.CSSProperties}
+          >
             <SessionTabStrip
               tabs={sessionTabs.tabs}
               activeKey={activeSlot}
@@ -8016,9 +8126,24 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
         {splitMode && splitFeatureEnabled ? (
           <SessionGridView
             seedSlot={splitAnchor ?? activeSlot}
+            openSideChat={connected ? openSideChatForPane : undefined}
+            // The single-chat title row is not rendered in split view, so the
+            // grid's top-left pane stands in for it: on desktop it clears the
+            // shell's stationary toggle while the sidebar is collapsed (the
+            // same columns the title row's 'pl-[60px]' rule reserves, measured
+            // from the pane's own edge); on mobile it carries the sessions
+            // toggle inline.
+            leading={
+              isMobile
+                ? (embedMode !== 'chat' && !titleInTopbar ? { control: mobileSessionsToggle } : undefined)
+                : (embedMode !== 'chat' && embedMode !== 'sessions' && filteredSlots.length > 0 && !sidebarOpen ? { inset: true } : undefined)
+            }
+            onFileOpen={handleFileOpen}
             onClose={() => setSplitMode(false)}
             onCollapse={(slot, anchorTs, anchorMid) => {
-              dispatch(switchSlot(slot))
+              // User gesture on a session reference (split-pane collapse): the
+              // announced class.
+              dispatch(switchSlot({ key: slot, announceOnMissing: true }))
               setSplitMode(false)
               // switchSlot.pending sets activeSlot synchronously, so the pending-jump
               // effect pages back to the anchor instead of landing on the newest turn.
@@ -8040,7 +8165,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   newSlotMutation.mutate()
                   return
                 }
-                dispatch(createSlot({ agent: pendingAgent || defaultAgent || undefined, model: pendingModel || undefined, mode }))
+                dispatch(createSlot({ agent: pendingAgent || defaultAgent || undefined, agent_kind: pendingAgent ? pendingAgentKindRef.current : undefined, model: pendingModel || undefined, mode }))
               }}
             >
               {i18nT('pages.chatPage.start_a_new_chat')}
@@ -8067,6 +8192,11 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   values on the same 320ms curve as the panel — an instant
                   class flip here reads as the title jumping sideways at the
                   start of the slide. */}
+              {/* Phone: the shell's single bar hosts this row (the portal above),
+                  so the inline copy stands down. The fold sentinel, the pinned
+                  prompt and the header fade stay: they belong to the transcript
+                  column, not to the bar. */}
+              {!titleInTopbar && (
               <div className={`relative pr-1.5 pt-[9px] pb-2 flex items-center gap-2 bg-bg pointer-events-none transition-[padding-left] duration-[240ms] [transition-timing-function:cubic-bezier(.32,.72,0,1)] ${!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && !sidebarOpen ? 'pl-[60px]' : isMobile ? (embedMode === 'chat' ? 'pl-4' : 'pl-3') : 'pl-5'}`}>
                 {/* Divider between toggle and title — ALWAYS mounted and
                     absolute (zero width, no flex-gap participation) so it can
@@ -8076,13 +8206,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 {!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && (
                   <span aria-hidden="true" className={`absolute left-[52px] top-[13px] w-px h-5 bg-border transition-opacity ${sidebarOpen ? 'opacity-0 duration-100' : 'opacity-100 duration-150 delay-[90ms]'}`} />
                 )}
-                {embedMode !== 'chat' && isMobile && (
-                  <button className="p-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none pointer-events-auto" onClick={() => mobileSessions ? closeSidebar() : openSidebar()} aria-label={i18nT('pages.chatPage.toggle_sessions')}>
-                    {/* Mirrors the desktop toggle exactly, state included: solid
-                        while the panel is hidden, light while it is showing. */}
-                    {mobileSessions ? <PanelLeftLight size={16} /> : <PanelLeftSolid size={16} />}
-                  </button>
-                )}
+                {embedMode !== 'chat' && isMobile && mobileSessionsToggle}
                 <div className="group/header flex min-w-0 items-stretch gap-0.5 pointer-events-auto">
                 <div className="flex items-center rounded-l-md rounded-r-[2px] px-1.5 py-0.5 group-hover/header:bg-bg-hover transition-colors">
                 <ChatHeaderMenu
@@ -8103,29 +8227,23 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                     else if (!sidebarPinned) setSidebarPinned(true)
                     dispatch(requestSlotReveal(activeSlot))
                   } : undefined}
-                  onRename={activeSlot ? () => { setEditingTitleSlot(activeSlot); setTitleDraft(title) } : undefined}
+                  onRename={activeSlot ? () => setEditingTitleSlot(activeSlot) : undefined}
                   mode={effectiveMode}
+                  sidebarOnScreen={sidebarOnScreen}
                 />
                 </div>
-              {editingTitle ? (
-                <div className="flex min-w-0 flex-1 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md bg-bg-hover">
-                  {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
-                  {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                  <Input className="session-header-title text-sm font-semibold text-muted font-body bg-transparent border-0 rounded-none p-0 m-0 min-w-0 flex-1 outline-none md:max-w-[50vw] focus:!shadow-none focus-visible:border-b focus-visible:border-accent" size={Math.min(Math.max(titleDraft.length + 2, 6), 80)} autoFocus value={titleDraft} onChange={e => setTitleDraft(e.target.value)} {...titleIme.bindComposition<HTMLInputElement>({ onBlur: () => { if (!cancelTitleRef.current && titleDraft.trim() && activeSlot && titleDraft !== title) { dispatch(sseSlotTitle({ key: activeSlot, title: titleDraft.trim() })); api.renameSlot(activeSlot, titleDraft.trim()).catch(e => showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_rename_session'))) } cancelTitleRef.current = false; setEditingTitleSlot(null) } })} onKeyDown={e => { if (e.key === 'Enter' && titleIme.claimEnter(e)) (e.target as HTMLInputElement).blur(); if (e.key === 'Escape') { titleIme.reset(); cancelTitleRef.current = true; setEditingTitleSlot(null) } }} />
-                </div>
-              ) : (
-                <div className="cursor-text flex min-w-0 items-center gap-1 px-1.5 py-0.5 rounded-l-[2px] rounded-r-md group-hover/header:bg-bg-hover transition-colors">
-                  <Clickable className="flex min-w-0 items-center gap-1" onClick={() => { if (activeSlot && generatingTitleSlots.has(activeSlot)) return; setEditingTitleSlot(activeSlot); setTitleDraft(title) }}>
-                    {currentSlot?.memory_mode === 'incognito' && <span title={i18nT('pages.chatPage.incognito_memory_writes_disabled')}><EyeOff size={13} className="shrink-0 text-warn" /></span>}
-                    {currentSlot?.memory_mode === 'temporary' && <span title={i18nT('pages.chatPage.temporary_no_memory_reads_or_writes')}><VenetianMask size={13} className="shrink-0 text-aim" /></span>}
-                    <TypewriterText text={title} className="session-header-title text-sm font-semibold text-muted font-body truncate min-w-0 md:max-w-[50vw]" />
-                    <Pen size={13} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-60 transition-opacity" />
-                  </Clickable>
-                  {activeSlot && (generatingTitleSlots.has(activeSlot) ? <Loader size={16} className="shrink-0 text-accent animate-spin" /> : <Btn aria-label={i18nT('pages.chatPage.regenerate_title_with_llm')} className="shrink-0 text-muted opacity-0 group-hover/header:opacity-40 hover:!opacity-100 hover:text-accent transition-all cursor-pointer bg-transparent border-none p-0" title={i18nT('pages.chatPage.regenerate_title_with_llm')} onClick={e => { e.stopPropagation(); if (!activeSlot || generatingTitleSlots.has(activeSlot)) return; const slot = activeSlot; setGeneratingTitleSlots(prev => new Set(prev).add(slot)); api.generateTitle(slot).then(r => { /* title is redacted server-side via redact_exfiltration_urls + redact_credentials */ if (r.title) dispatch(sseSlotTitle({ key: slot, title: r.title })) }).catch(e => {
-                    showActionError(errMessage(e) || i18nT('pages.chatPage.unknown_error'), i18nT('pages.chatPage.could_not_generate_title'))
-                  }).finally(() => setGeneratingTitleSlots(prev => { const next = new Set(prev); next.delete(slot); return next })) }}><Sparkles size={16} /></Btn>)}
-                </div>
-              )}
+                {/* Shared with every split-view pane header (#9727). The editor
+                    flag stays here, pinned to the slot it opened on. */}
+                {activeSlot && (
+                  <SessionTitleControl
+                    slotKey={activeSlot}
+                    title={title}
+                    editing={editingTitle}
+                    onEditingChange={open => setEditingTitleSlot(open ? activeSlot : null)}
+                    onError={showActionError}
+                    onAttempt={() => setActionError(null)}
+                  />
+                )}
                 </div>
               {effectiveMode === 'orchestrator' && <span className="pointer-events-auto"><InfoTip text={i18nT('pages.chatPage.autopilot_plans_before_executing_each_stage_need')} /></span>}
               <InboundLinkChip slotKey={activeSlot} />
@@ -8191,6 +8309,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   the transcript and the pinned card paints above it). */}
               <EdgeFade side="top" anchor="below" />
               </div>
+              )}
+              {titleInTopbar && <EdgeFade side="top" anchor="below" />}
               {/* Fold sentinel — zero-height, always mounted. Its top edge is the
                   line the pinned prompt sticks to (see updatePinnedPrompt). */}
               <div ref={pinFoldRef} aria-hidden className="h-0" />
@@ -8201,12 +8321,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   images={pinned.images}
                   bodyBeyondPreview={pinned.bodyBeyondPreview}
                   pushUp={pinned.push}
+                  liveH={pinned.liveH}
                   bannerH={pinned.bannerH}
                   expanded={pinExpanded}
                   onToggleExpanded={() => setPinExpanded(p => !p)}
                   onJump={() => scrollToPinnedPrompt(pinned.idx)}
                   cardRef={pinCardRef}
                   onCollapsedHeight={onPinCollapsedHeight}
+                  scrollTranscriptBy={scrollTranscriptBy}
                 />
               )}
             </div>
@@ -8216,6 +8338,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 key="welcome-hero"
                 layout
                 className="flex-1 flex flex-col items-center justify-center gap-6 px-8 min-h-0 overflow-y-auto"
+                // The dock floats over this box too, so the padding keeps the
+                // hero centred in the visible strip rather than behind the glass.
+                style={{ paddingBottom: dockH }}
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
@@ -8225,63 +8350,41 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   mode={currentSlot?.mode || mode}
                   setInput={setInput}
                   memoryMode={currentSlot?.memory_mode ?? 'persistent'}
-                  cleanMode={currentSlot?.clean_mode}
-                  onSwitchMode={async (newMode) => {
-                    if (!activeSlot) return
-                    // Create-first-then-delete: deleting the active slot first
-                    // would make deleteSlot jump focus to a sibling. Creating
-                    // first keeps the new slot active, so the delete skips the
-                    // sibling navigation. Carry agent/project/folder/color so
-                    // the recreated slot keeps its identity and placement.
-                    const old = currentSlot
-                    const opts = {
-                      agent: old?.agent || defaultAgent || undefined,
-                      model: old?.model || undefined,
-                      mode,
-                      memory_mode: newMode,
-                      folder_id: old?.folder_id ?? null,
-                      color_index: old?.color_index ?? null,
-                      color_hex: old?.color_hex ?? null,
-                      project: old?.project ?? null,
-                    }
-                    try { await dispatch(createSlot(opts)).unwrap() } catch { return }
-                    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch { /* new slot already active */ }
-                  }}
-                  onToggleClean={async (clean) => {
-                    if (!activeSlot) return
-                    const old = currentSlot
-                    const opts = {
-                      agent: old?.agent || defaultAgent || undefined,
-                      model: old?.model || undefined,
-                      mode,
-                      clean_mode: clean,
-                      folder_id: old?.folder_id ?? null,
-                      color_index: old?.color_index ?? null,
-                      color_hex: old?.color_hex ?? null,
-                      project: old?.project ?? null,
-                    }
-                    try { await dispatch(createSlot(opts)).unwrap() } catch { return }
-                    try { await dispatch(deleteSlot(activeSlot)).unwrap() } catch { /* new slot already active */ }
-                  }}
+                  onSwitchMode={switchMemoryMode}
                 />
               </motion.div>
             ) : (
+            <>
+            <TurnNavigationMinimap
+              items={chatNav.sections}
+              scrollerRef={scrollerRef}
+              onNavigate={navigateToTurn}
+              // The rail maps loaded turns only; while the server holds older
+              // rows its labels say "of N loaded" (#8221's disclosure).
+              windowed={slotHasMore && cursorIsForActiveSlot}
+              side={chatConfig.minimapSide}
+            />
             <TranscriptScrollShell
+              // The 64px spacer clears the inline title row; with the row in
+              // the shell's bar (phone) the transcript starts at the top of the
+              // column and the spacer would be a blank band under the bar.
+              headerSpacer={!titleInTopbar}
               scrollerRef={scrollerRef}
               onScroll={onScrollPin}
               virt={virt}
               loadingOlder={loadingOlder}
               spinnerNearTop={spinnerNearTop}
-              // Second half of the fade-band clearance, alongside
-              // TRANSCRIPT_TAIL_SPACER_PX. Unlike the tail spacer this one also
-              // applies to a transcript short enough not to scroll, so both are
-              // needed for the last line to clear the band in every state.
+              // The strip of the scroller the floating dock covers, plus
+              // DOCK_CLEARANCE_PX, alongside TRANSCRIPT_TAIL_SPACER_PX. Unlike
+              // the tail spacer this one also applies to a transcript short
+              // enough not to scroll, so both are needed for the last line to
+              // clear the dock in every state.
               // `visibility` is not one of the properties the shell claims, so
               // adding it here is inside its documented contract. Hiding rather
               // than unmounting keeps the scroller's geometry and the height
               // cache intact -- the restore needs to WRITE scrollTop while this
               // is up, which a display:none element cannot do.
-              scrollerStyle={{ paddingBottom: 16, ...(virt.restoreGate ? { visibility: 'hidden' as const } : null) }}
+              scrollerStyle={{ paddingBottom: dockH + DOCK_CLEARANCE_PX, ...(virt.restoreGate ? { visibility: 'hidden' as const } : null) }}
               aboveRows={<>
               {/* Mid-switch `slotHasMore` still describes the outgoing chat, so the cursor
                   key gates the bar to match the paging thunk's own precondition. */}
@@ -8316,7 +8419,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 scrollerEl={() => scrollerRef.current}
               />
               {/* Footer */}
-              <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} />
+              <ChatFooter running={slotRunning} stopping={slotStopping} state={slotState} lastRole={lastRole} streamTick={streamTick} regenerating={regenerating} stopState={currentSlot?.stop_state} sendUnconfirmed={sendUnconfirmed} />
               {activeSlot && !slotLoading && !embedded && !popout && slotSwitchTarget !== activeSlot && (
                 <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
                   <SessionPulseSurveyCard
@@ -8346,9 +8449,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               )}
               {/* Tail spacer, in px rather than vh. It plus the scroller's own
                   bottom padding is the clearance between the last line of the
-                  transcript and the FIXED-height fade band below, so expressing it
-                  in `vh` made that clearance viewport-dependent: at 2vh + 8px it
-                  cleared a 24px band by 1px at 844px tall and cut INTO the last
+                  transcript and the top of the floating composer dock, so
+                  expressing it in `vh` made that clearance viewport-dependent: at
+                  2vh + 8px it cleared by 1px at 844px tall and cut INTO the last
                   line on anything shorter (−1px at 740, −2px at 700, −5px at 560),
                   which is the sliced-glyph hairline reported from a phone and the
                   reason it looked mobile-only. */}
@@ -8369,17 +8472,37 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 if (item.kind === 'turn') {
                   return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx}><TurnBlock turn={item} renderItem={renderTurnItem} collapseAll={chatConfig.collapseAllSteps} appToolCallIds={appToolCallIds} disclosure={turnDisclosure[vi.key]} disclosureKey={vi.key} onDisclosureChange={setTurnDisclosureFor} /></div>
                 }
-                return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx} className={`px-4 mx-auto w-full py-1`} style={{
+                // This row's bubble is the one the pinned banner is standing in for
+                // (identity rule below): hide the row and mark it for index.css. The
+                // marker reads `folding` while the hook reports the row's re-shown
+                // action strip still UNCOVERED — some of it below the card's resting
+                // bottom, on screen. That is the whole fold and the strip's own
+                // height of scroll after it: the card rests at its clamp while the
+                // strip, hanging under the bubble, is still sliding under it, so a
+                // marker keyed on the fold alone dropped the strip out from under
+                // the pointer for that last stretch. Once the strip is under the card
+                // or behind the header the marker is empty and the strip hides with
+                // its row again, or Tab would stop on controls nobody can see.
+                const pinnedStandin = !!(pinned && (pinned.ts != null
+                  ? (item.kind === 'single' && item.msg.ts === pinned.ts)
+                  : pinned.idx === displayIdx))
+                return <div key={vi.key} ref={virt.measureRef(vi.index)} data-display-index={displayIdx} className={`px-4 mx-auto w-full py-1`} data-pinned-standin={pinnedStandin ? (pinned?.stripUncovered ? 'folding' : '') : undefined} style={{
                   maxWidth: 'var(--mc-content-width, 900px)',
                   // The pinned banner is styled as this row's own bubble and sits
-                  // at the exact position and width the bubble had when its bottom
-                  // edge reached the band's bottom, so leaving both visible is what
-                  // betrays them as two containers. Hide the real one (visibility,
-                  // NOT display — the virtualizer must keep measuring its height or
+                  // at the exact position and width the bubble had when its top
+                  // edge reached the fold, so leaving both visible is what betrays
+                  // them as two containers. Hide the real one (visibility, NOT
+                  // display — the virtualizer must keep measuring its height or
                   // the transcript would reflow under the reader) and the bubble
-                  // appears to simply stop travelling and stick. A row is only ever
-                  // hidden once it is entirely behind the band, so a tall prompt
-                  // never leaves a visible hole above the response.
+                  // appears to simply stop travelling and stick. The row hides the
+                  // moment its top crosses the fold (the top-edge hand-off), and
+                  // the card then folds down the BUBBLE's remaining height, so the
+                  // row's action strip beneath the bubble is never behind the card
+                  // — `data-pinned-standin` lets index.css re-show that strip
+                  // (visibility is inherited, so a `visible` descendant of a hidden
+                  // row is drawn and clickable). Without it a prompt taller than
+                  // the viewport never shows its copy / copy-link / pin row at all:
+                  // its bottom is only on screen once its top is above the fold.
                   //
                   // Match by message IDENTITY (ts), not display index. `pinned.idx`
                   // is computed in a scroll rAF against `displayItemsRef`, which is
@@ -8390,9 +8513,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   // alongside the banner — the "two stacked boxes" bug. The ts is
                   // stable across any index shift, so it hides the right row every
                   // frame; fall back to the index only for a message with no ts.
-                  visibility: (pinned && (pinned.ts != null
-                    ? (item.kind === 'single' && item.msg.ts === pinned.ts)
-                    : pinned.idx === displayIdx)) ? 'hidden' : undefined,
+                  visibility: pinnedStandin ? 'hidden' : undefined,
                 }}>{item.kind === 'group' ? (() => {
                 const unresolvedGroupPerms = item.msgs.filter(m => m.role === 'permission' && !m.meta?.resolved)
                 if (item.msgs.every(m => m.role === 'permission')) return null
@@ -8401,7 +8522,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   count={item.msgs.filter(m => m.role !== 'permission').length}
                   disclosureKey={`ctg-${vi.key}`}
                   hasPermission={false}
-                  isRunning={slotRunning && displayIdx === displayItems.length - 1}
+                  isRunning={slotRunning && displayIdx === renderedDisplayItems.length - 1}
                   permissionMeta={unresolvedGroupPerms.at(-1)?.meta as Record<string, unknown> | undefined}
                   pendingPermCount={unresolvedGroupPerms.length}
                   onApprove={(() => {
@@ -8419,6 +8540,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               })}
               
             </TranscriptScrollShell>
+            </>
             )}
             {/* Restore cover. A session left mid-history reopens on a transcript
                 that hydrates in chunks and is only positioned once its anchored
@@ -8433,50 +8555,31 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 ready -- looked like different events. A spinner also says only
                 "wait", where a skeleton previews the shape that is coming. */}
             {(slotLoading || virt.restoreGate) && <ChatTranscriptSkeleton />}
-            {/* Transcript bottom mask. Its box deliberately does NOT stop at the
-                scrollport's bottom edge — it reaches DOWN to the composer box, and
-                that overshoot is the point.
-
-                The band used to end exactly on that boundary, which left the
-                COMPOSER_MASK_OVERSHOOT_PX strip between it and the input box
-                unmasked and a hairline showed through there. So the box now spans
-                `above` px over the boundary — feathering the hard clip, since the
-                transcript is cut at the scrollport edge whenever the user is
-                scrolled up — PLUS that strip below it, kept opaque so the mask is
-                flush against the input box with nothing between them.
-
-                The three numbers are one arithmetic unit and must move together:
-                height = above + overshoot, and the two negative margins cancel the
-                whole box, so it paints over both regions while consuming ZERO
-                layout. A positive residual would push the composer down instead.
-
-                The solid stop runs from the bottom up through a few px ABOVE the
-                boundary on purpose: a ramp that reaches full opacity only AT the
-                clip edge leaves its topmost rows just shy of opaque, and the clipped
-                glyphs bleed through (measured over a blank control at 390px:
-                +7.6 / +5.2 / +1.9 mean channel at 3 / 2 / 1px above the edge, 0.00
-                once the bottom is solid). TRANSCRIPT_TAIL_SPACER_PX plus the
-                scroller's padding must stay >= `above`, the part that reaches up
-                into readable content. ChatPage.fadeClearance.test.tsx pins all of
-                it, including that the overshoot never covers the box's own top
-                border. */}
-            <div
-              aria-hidden
-              className="bg-gradient-to-t from-bg from-[62%] to-transparent pointer-events-none relative z-[1]"
-              style={{
-                height: TRANSCRIPT_MASK_ABOVE_PX + COMPOSER_MASK_OVERSHOOT_PX,
-                marginTop: -TRANSCRIPT_MASK_ABOVE_PX,
-                marginBottom: -COMPOSER_MASK_OVERSHOOT_PX,
-              }}
-            />
-            <div className="relative">
+            {/* Composer dock. Floats over the bottom of the transcript scroller
+                instead of sitting under it in the flex column, so the scroller
+                runs the full height of the pane and the conversation scrolls
+                UNDER the glass (iOS toolbar layout). The scroller pays for the
+                covered strip with `paddingBottom: dockH + DOCK_CLEARANCE_PX`,
+                measured from this box by `dockRef`. No z-index here on purpose:
+                a positioned box with `z-index: auto` forms no stacking context,
+                so SubagentProgressBar's wave chip keeps its `z-[46]` against
+                the theme-experience overlays it was lifted to clear, and the
+                dock still paints over the scroller because it follows it in
+                DOM order. `pointer-events-none` on the root, restored on the
+                CHILDREN of the two wrapper boxes (`dock-inert`, index.css) —
+                each child is its own 900px column, so the two wrappers, which
+                span the pane, never catch a wheel of their own — then the empty
+                width either side of the column lets wheel and touch reach the
+                transcript underneath, as the strip beside an iOS toolbar does.
+                `right: dockGutter` keeps the scrollbar column clear (above). */}
+            <div ref={dockRef} className="absolute left-0 bottom-0 pointer-events-none" style={{ right: dockGutter }} data-testid="composer-dock-root">
               <JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />
-              {/* Status chrome never claims more than half the pane. These bars
-                  are flex-flow siblings of the transcript scroller, which has an
-                  automatic minimum size of 0 and collapses under pressure — an
-                  opening keyboard shrinks the layout viewport, so an uncapped
-                  stack rises into the title band at the top of the pane and
-                  covers the rename editor. Capping makes the stack yield first.
+              {/* Status chrome never claims more than half the pane. The dock
+                  is anchored to the pane's bottom edge and grows upward, so an
+                  opening keyboard — which shrinks the layout viewport — would
+                  let an uncapped stack rise into the title band at the top of
+                  the pane and cover the rename editor. Capping makes the stack
+                  yield first.
                   `svh` not `%` (a percentage resolves against this wrapper's own
                   content-derived height, so it computes to none) and not `vh`
                   (which over-measures a phone showing its URL bar). Scoped to
@@ -8496,7 +8599,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   `overflow-y-auto overscroll-contain`): it replaces the global
                   always-visible `var(--border)` thumb with a hover-revealed
                   overlay one, so the capped box does not carry a permanent bar. */}
-              <div ref={composerBandRef} className="max-h-[50svh] overflow-y-auto overscroll-contain scrollbar-overlay pb-[11px] mb-[-11px]" data-testid="composer-status-stack">
+              <div ref={composerBandRef} className="max-h-[50svh] overflow-y-auto overscroll-contain scrollbar-overlay pb-[11px] mb-[-11px] dock-inert" data-testid="composer-status-stack">
               {/* Not gated on activityOpen (unlike the two bars below): the
                   activity sidebar has no TODO view, so hiding it there would
                   lose the information rather than de-duplicate it. */}
@@ -8513,11 +8616,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   calls and goes stale when the user clicks a tab in the panel. */}
               {!(activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'subagents') && <SubagentProgressBar slot={activeSlot} />}
               {!(activityOpen && !search.isOpen && tabsCtl.tabs.find(t => t.id === tabsCtl.activeId)?.kind === 'workflows') && <WorkflowProgressBar slot={activeSlot} />}
+              <CommandCenterDock slot={activeSlot} onOpen={() => { dispatch(openActivityPanel()); tabsCtl.openView('command-center') }} />
               <SubagentDeliveryProgress count={systemDeliveryCount} />
               <QueueStack messages={queuedMessages} onCancel={handleCancelQueued} onInterrupt={handleInterruptQueued} onEdit={handleEditQueued} onReorder={handleReorderQueued} pendingIds={queuePendingIds} fuseBelow={followUpOptions.length === 0 && !knowledgeFetch.pendingKnowledge} />
               </div>
-              {flyingQuote && <FlyingQuote text={flyingQuote.text} from={flyingQuote.from} targetRef={inputAreaRef} onComplete={() => setFlyingQuote(null)} />}
-              <div ref={inputAreaRef} className="relative z-10">
+              {flyingQuote && <FlyingQuote text={flyingQuote.text} from={flyingQuote.from} targetRef={inputAreaRef} onComplete={endQuoteFlight} />}
+              <div ref={inputAreaRef} className="relative z-10 dock-inert">
               {/* The refused-press answer sits directly above the composer,
                   adjacent to the message-footer controls that raised it, so the
                   press cannot fail silently. Shares the chat column's own
@@ -8606,15 +8710,49 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                       // No-ask_id card: the card IS the interaction, so answer
                       // and send in one click.
                       //
-                      // Offline, send() bails at its own !connected guard and
-                      // the card clears regardless — which would DROP the
-                      // answer. Fall back to the composer so it survives, the
+                      // Offline, both paths below would clear the card and drop
+                      // the answer, so keep it in the composer for retry — the
                       // same recovery the 404 path uses.
                       if (!connected) {
                         setInput((prev) => (prev.trim() ? `${prev}\n${text}` : text))
                         return
                       }
-                      void send(text, activeSlot || undefined)
+                      // A native AskUserQuestion card is raised WHILE its own
+                      // turn is still running and waiting on the answer, so a
+                      // plain send would queue behind that turn and the question
+                      // would never be consumed (#10634). When the slot's turn
+                      // is live, inject the answer INTO it through the same
+                      // receipt-aware steer path `steer()` uses:
+                      // `steerMutation` hands the text back and shows the
+                      // delivery-unconfirmed notice on a `response-late`, so a
+                      // busy steer whose bubble is suppressed can never silently
+                      // lose the answer (the loss a raw `send(…, steerNow)`
+                      // through send()'s bare `response-late` return would risk).
+                      // `selectComposerBusy` is the shared "turn is live for this
+                      // slot" rule (chatSlice) both surfaces key on, so the two
+                      // routes cannot drift.
+                      //
+                      // When the turn has already ended (the card outlived it),
+                      // there is nothing to steer into: fall back to an ordinary
+                      // next-turn send, exactly as the non-blocking `ask_question`
+                      // card always does.
+                      //
+                      // Steer ONLY the native card, which the server marks
+                      // `native` on the `question_card` frame and the /pending
+                      // row. The non-blocking `ask_question` MCP card carries
+                      // the same server `card_id` but no such mark: it can be
+                      // answered while sub-agents keep the slot busy, and it
+                      // must still start a next turn.
+                      const slot = activeSlot || undefined
+                      const isNativeCard = pendingQuestion?.native === true
+                      if (slot && isNativeCard && selectComposerBusy(store.getState(), slot)) {
+                        const steerSendId = mintSendId()
+                        drainPendingChunks()
+                        dispatch(appendMessage({ role: 'user', content: text, cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: steerSendId } }))
+                        steerMutation.mutate({ text, sendId: steerSendId, slot })
+                        return
+                      }
+                      void send(text, slot)
                     }}
                   />
                 </div>
@@ -8630,75 +8768,37 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   />
                 </div>
               )}
-              <ChatInput
-              aboveComposer={
-                <>
-                  {/* Session-control failures surface HERE, beside the chips they
-                      are about, rather than on the chat. Both hooks fail closed —
-                      a failed `/api/apps` renders no chips, a failed status probe
-                      renders a stateless one — and either is indistinguishable
-                      from "no app declares a control", so without this the user
-                      sees a feature silently missing and has nothing to act on.
-                      One notice covers both: they are the same feature to the
-                      user, and the composer shares a row with the message input.
-                      `askAgent` is on because nothing here holds an unsaved
-                      draft, and a failed app-list or status route is squarely
-                      something the agent can investigate.
-
-                      The folder query rides along rather than getting its own
-                      banner: it feeds the folder NAME handed to each control, and
-                      on `/embed/chat` no sidebar is mounted to consume the shared
-                      ['chat-folders'] cache — so this is the only place its
-                      failure can be seen at all. It is gated on a control
-                      actually existing, though: with no chips on screen a folder
-                      failure is not a session-control problem, and calling it one
-                      would put an unexplained notice on every composer. */}
-                  {(sessionControlsError
-                    || sessionControlStatusError
-                    || (chatFoldersError && sessionControls.length > 0)) && (
-                    <div className="pt-1.5" key="session-controls-error">
-                      <ErrorNotice
-                        title={i18nT('components.sessionControlHost.controls_unavailable')}
-                        message={
-                          (sessionControlsError || sessionControlStatusError || chatFoldersError)
-                            ?.message
-                        }
-                        askAgent
-                        variant="inline"
-                      />
-                    </div>
-                  )}
-                  {/* In-flow tip inside the composer's own width wrapper: shares
-                   the composer's exact box geometry (Raymond 2026-07-21: tip
-                   width must always match the input box) while still pushing
-                   chat content up like QueueStack (team decision: never cover
-                   thinking/output; queue and question card keep priority via
-                   tipSuppressed). ChatInput renders this slot LAST in the
-                   above-composer stack, so the card stays flush against the
-                   input box and an options row sits above it. */}
-                  <AnimatePresence>
-                    {folderSuggestion && activeSlot ? (
-                      <div className="pt-1.5" key="folder-suggestion">
-                        <FolderSuggestionCard
-                          folderName={folderSuggestion.folderName}
-                          breadcrumb={folderSuggestion.breadcrumb}
-                          onAccept={folderSuggestionAccept}
-                          onDecline={folderSuggestionDecline}
-                        />
-                      </div>
-                    ) : activeTip && (
-                      <div className="pt-1.5" key="tip">
-                        <TipCard tip={activeTip} onDismiss={dismissTip} />
-                      </div>
-                    )}
-                  </AnimatePresence>
-                </>
-              }
-              value={input}
-              onChange={setInput}
+              {showComposerMemoryChip && (
+                // No backdrop: the chip is glass and whatever scrolls under it is meant to show.
+                // `w-fit`, not a full-width flex row: the box is a `dock-inert` child, so
+                // it catches input, and it should be no wider than the chip it holds.
+                <div className="relative z-10 mx-auto w-fit px-4 pt-2 pb-2" data-testid="composer-memory-chip">
+                  <MemoryModeChip memoryMode={currentSlot?.memory_mode ?? 'persistent'} onSwitchMode={switchMemoryMode} />
+                </div>
+              )}
+              <Composer
+                ref={composerRef}
+                slotKey={activeSlot}
+                draft={composerDraft}
+                onChange={composerRootChange}
+                voice={composerVoiceOptions}
+              >
+              <StableChatInput
+              aboveComposer={composerAbove}
+              // No `value`: ChatInput reads the text from the root's `draft` store.
+              // `composerUserEdit` is what ChatInput calls for the user's own edits
+              // (typing, paste, undo, picker inserts), never for a parent-driven
+              // seed -- so it is the signal that arms the prefill hint's expiry.
+              onChange={composerUserEdit}
               onSend={() => send()}
               canSteer={composerBusy}
               onSteer={steer}
+              // AND a turn actually running. `composerBusy` is also true when only
+              // background sub-agents are working, and there is no turn to decide
+              // ABOUT in that state: the send starts a fresh turn and the point
+              // never runs, so offering the mode there would promise a decision
+              // nothing makes.
+              jevAutoAvailable={jevAutoConsented && !!slotRunning}
               onFollowUpSend={(text?: string, sourceKeyAtClick?: string | null) => {
                 // Double-click and Send-now share dispatchPlanFollowUp with
                 // single-click (#6240). First-click row identity refuses a
@@ -8718,6 +8818,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onDismissHint={() => setPrefillHint(false)}
               onScreenshot={handleCapture}
               onUploadFiles={uploadFiles}
+              /* Only while a real upload is abortable. `uploading` is shared
+                 with the screenshot path, which has no request to cancel. */
+              onCancelUpload={uploadCancellable ? cancelUpload : undefined}
               /* The one collapsible composer. Opt-in rather than default so the
                  shared preference key and the window-level expand event stay
                  correct by construction -- see ChatInput's `collapsible` prop. */
@@ -8728,24 +8831,155 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               resizedInfo={resizedInfo}
               onRemoveFile={p => {
                 setPendingFiles(prev => prev.filter(x => x !== p))
-                // A picker-picked file also inserted an `@rel` token into the
-                // composer, so its remove strips that token too — the same
+                // A picker-picked file also inserted `@rel` token(s) into the
+                // composer, so its remove strips ALL of them too — the same
                 // contract folder chips have, so the two chip kinds cannot
-                // disagree about what "remove" means. The exact token is
-                // recorded at pick time, but the ref is in-memory only: a
+                // disagree about what "remove" means. The recorded aliases can
+                // include more than one: a later pick under a changed project
+                // adds a second `@rel` form for the same file without
+                // replacing the first (fork GPT review) -- stripping only one
+                // would leave the other sitting in the text with no chip
+                // behind it. The aliases are in-memory only, though: a
                 // restored draft or a failed-send restore re-stages the file
-                // without it. Fall back to deriving the token from the path —
-                // the shortest boundary-checked `@suffix` present in the text
-                // (the same walk buildRelMap uses), which is exactly the form
-                // the picker inserts. Uploaded/dropped files have no token in
-                // the text, so the derivation finds nothing and their remove
-                // stays state-only. On no match the text is left alone —
-                // visible and editable is the safe fallback.
-                const token = pickedFileTokens.current[p] ?? [...buildRelMap([p], inputRef.current).keys()].map(s => `@${s}`)[0]
-                delete pickedFileTokens.current[p]
-                if (!token) return
-                const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                setInput(prev => prev.replace(new RegExp(`(^|\\s)${esc}(?: |(?=\\s)|$)`, 'g'), '$1'))
+                // without any. Fall back to deriving the file's EXACT rel
+                // under the current project -- the only form the picker ever
+                // inserts -- and strip that if it is mentioned. Never a
+                // suffix walk: a shortened
+                // spelling matches no recorded alias, so it is ordinary
+                // message text, not this chip's reference to delete.
+                // Uploaded/dropped files lie outside the project or have no
+                // token in the text, so the derivation finds nothing and
+                // their remove stays state-only. On no match the text is
+                // left alone -- visible and editable is the safe fallback.
+                const slotTokens = currentSlotTokens()
+                const projectIsWindowsShaped = isWindowsShapedPath(currentProjectRef.current || '')
+                const derivedRel = makeRelative(p, normalizeWindowsPath(currentProjectRef.current || ''))
+                const liveToken = derivedRel !== p && relMentionedHere(inputRef.current, derivedRel)
+                  ? `@${derivedRel}` : null
+                const tokens = [...new Set([
+                  ...(slotTokens?.[p] ?? []),
+                  ...(liveToken ? [liveToken] : []),
+                ])]
+                // A later pick under a changed project can compute the SAME
+                // rel for a DIFFERENT absolute path (fork GPT review) --
+                // both files then share the identical literal alias string,
+                // recorded independently under their own path. Stripping a
+                // shared alias here would delete the ONLY text occurrence
+                // both files' bookkeeping points at, and the reconciliation
+                // effect would then read the OTHER, untouched file as stale
+                // too and silently drop it. Any alias still claimed by
+                // another currently-staged path is left in the text.
+                const otherAliases = new Set<string>()
+                for (const otherPath of pendingFilesRef.current) {
+                  if (otherPath === p) continue
+                  slotTokens?.[otherPath]?.forEach(t => otherAliases.add(t))
+                  // A RESTORED sibling has no recorded aliases at all
+                  // (pickedFileTokens is in-memory, rebuilt empty per mount,
+                  // while pendingFiles rehydrates from the persisted draft)
+                  // -- so it contributed nothing here, and removing a chip
+                  // whose rel the sibling's name extends consumably
+                  // (`report` beside `report,`) selected the PERMISSIVE
+                  // boundary and stripped the removed file's form out of
+                  // the SIBLING's mention, corrupting text the sibling
+                  // still points at (fork GPT review). Mirror the removed
+                  // side's own `liveToken` fallback: a sibling's
+                  // staying-staged claim is exactly its derived rel under
+                  // the current project, so that form always joins the
+                  // guard -- recorded aliases or not.
+                  const otherRel = makeRelative(otherPath, normalizeWindowsPath(currentProjectRef.current || ''))
+                  if (otherRel !== otherPath) otherAliases.add(`@${otherRel}`)
+                }
+                if (slotTokens) delete slotTokens[p]
+                if (!tokens.length) return
+                // On a Windows-shaped project a chip's OWN mention can have
+                // been hand-edited to another separator spelling of the SAME
+                // file after it was staged (rounds 9-12), uniform or mixed
+                // (`@src\foo/bar.ts`). The reconciliation keeps the chip
+                // staged through that edit, but the RECORDED alias still says
+                // the old spelling, so stripping only that literal would leave
+                // the edited mention behind as a stale, unattached `@rel`
+                // (fork GPT review). Separator identity is therefore folded
+                // ONCE (`foldWinSep`): the token, the sibling guard and the
+                // text are compared with `\` read as `/`. The fold is a 1:1
+                // character substitution, so each match found on the folded
+                // copy is cut from the ORIGINAL at the same indices, and the
+                // user's own spelling of everything else is untouched. The
+                // sibling guard folds too (round 14): another staged file's
+                // alias recorded in a different spelling is the same text
+                // occurrence and must still protect it.
+                const fold = foldWinSep(projectIsWindowsShaped)
+                const foldedOthers = new Set([...otherAliases].map(fold))
+                const cutFolded = (orig: string, re: RegExp): string => {
+                  // Keeps group 1 (the leading boundary) of each match, like
+                  // a `'$1'` replace, but locates matches on the folded copy.
+                  const folded = fold(orig)
+                  let out = ''
+                  let last = 0
+                  re.lastIndex = 0
+                  for (let m = re.exec(folded); m !== null; m = re.exec(folded)) {
+                    out += orig.slice(last, m.index + m[1].length)
+                    last = m.index + m[0].length
+                    if (m[0].length === 0) re.lastIndex++
+                  }
+                  return out + orig.slice(last)
+                }
+                setInput(prev => tokens.reduce((text, token) => {
+                  const candidate = fold(token)
+                  if (foldedOthers.has(candidate)) return text
+                  // Shares `mentionBoundary` (via `mentionBoundaryFor`, which also
+                  // takes the sibling aliases -- round 18) and
+                  // `leadingMentionBoundary` (round 19) with
+                  // `mentionRegex` (round 16) -- a mention followed
+                  // directly by punctuation (`@file.ts,`, no space) or
+                  // wrapped in parens (`(@file.ts)`) survives
+                  // reconciliation as still-mentioned (rounds 15/19), but
+                  // this replace used the OLD, stricter boundaries and
+                  // never matched it: the chip disappeared from the list
+                  // while its text reference was left behind and sent as
+                  // a stale, unattached `@rel`.
+                  const esc = candidate.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                  const boundarySrc = mentionBoundaryFor(candidate, foldedOthers)
+                  // A wrapping bracket pair is stripped WITH the mention,
+                  // not left behind (fork Opus review): matching only
+                  // `leadingMentionBoundary`'s optional OPENING bracket
+                  // and re-emitting it via `$1` left the never-consumed
+                  // CLOSING bracket stranded -- `(@file.ts)` -> `()`, a
+                  // stray, empty pair sent as real message text. Tried
+                  // for each bracket kind BEFORE the general strip below,
+                  // so a genuinely wrapping pair is removed as a unit;
+                  // an unpaired or mismatched bracket still falls through
+                  // to the general strip and is left in place, same as
+                  // any other punctuation this PR doesn't try to erase.
+                  let stripped = text
+                  // The optional `:line` suffix is consumed with the token,
+                  // bare and wrapped alike -- but ONLY under the permissive
+                  // boundary (fork Opus review): under `strictMentionBoundary`
+                  // a LONGER sibling alias extends this one with `:\d`, so a
+                  // trailing `:42` can be the sibling's own name and eating it
+                  // (even inside `(@a.ts:42)`) would strip the sibling's
+                  // wrapped mention and unstage its chip. One definition gates
+                  // every consumption site in this strip. A regex literal's
+                  // `.source`, not a string constant -- the same AST-shape
+                  // i18n exemption the shared boundary constants rely on.
+                  // ONE suffix grammar (fork First Principles review): the
+                  // shared MENTION_LINE_SUFFIX is the definition; this site
+                  // only wraps it optional and gates it on the permissive
+                  // boundary, same as replaceTokens' drop form. The shared
+                  // regex is anchored for its exec() consumers, so the `^`
+                  // is sliced off for mid-pattern embedding here.
+                  const lineSuffix = boundarySrc === mentionBoundary ? `(?:${MENTION_LINE_SUFFIX.source.slice(1)})?` : ''
+                  // ONE wrapper-pair table (fork First Principles review):
+                  // shared with replaceTokens' drop form in fileTokens.ts.
+                  for (const [open, close] of Object.entries(WRAPPER_CLOSER)) {
+                    const openEsc = open.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    const closeEsc = close.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+                    // `(@src/main.ts:42)` is one wrapped mention: stripping
+                    // only `(@src/main.ts)`'s bytes would leave `:42)`
+                    // stranded as message text (fork GPT review).
+                    stripped = cutFolded(stripped, new RegExp(`(^|\\s)${openEsc}${esc}${lineSuffix}${closeEsc}(?: |(?=${boundarySrc})|$)`, 'g'))
+                  }
+                  return cutFolded(stripped, new RegExp(`(${leadingMentionBoundary})${esc}${lineSuffix}(?: |(?=${boundarySrc})|$)`, 'g'))
+                }, prev))
               }}
               onRemoveDir={rel => {
                 // The chip derives from the `@rel/` token, so removing the
@@ -8768,64 +9002,52 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 // twice. Token bookkeeping keys on the staged form so remove
                 // finds it.
                 const canon = normalizeWindowsPath(path)
-                if (token) pickedFileTokens.current[canon] = token
+                if (token) recordSlotToken(canon, token)
                 setPendingFiles(prev => addPendingFile(prev, canon))
               }}
               onFileOpen={handleFileOpen}
+              // A tree row dropped on the composer is "Add to chat" by drag.
+              onTreeEntryDrop={handleAddToContext}
+              clampDropOffset={clampOutOfTokens}
               project={currentSlot?.project || ''}
               projectBranch={projectBranch}
               projectDetached={!projectGitError && !!projectGit?.detached}
-              projectGitDirty={gitBadge?.dirty ?? 0}
-              projectGitAhead={gitBadge?.ahead ?? 0}
-              projectGitBehind={gitBadge?.behind ?? 0}
               isMac={isMac}
               onDrop={dropTargetProps.onDrop}
               onDragOver={dropTargetProps.onDragOver}
               onDragLeave={dropTargetProps.onDragLeave}
-              voiceRecording={voiceOwned && voice.recording}
-              voiceTranscribing={voiceOwned && voice.transcribing}
-              /* Ungated: `startVoice` refuses on `voice.transcribing` outright,
-                 so the voice controls have to read the same global fact. */
-              voiceTranscribeActive={voice.transcribing}
-              voiceError={voice.error}
-              voiceLevel={voiceOwned ? voice.level : 0}
-              voiceDeviceLabel={voiceOwned ? voice.deviceLabel : ''}
-              voiceDeviceId={voiceOwned ? voice.deviceId : ''}
-              onSelectVoiceDevice={voice.switchDevice}
-              voiceDeviceSwitchIsLive={voiceOwned && voice.deviceSwitchIsLive}
-              onClearVoiceError={voice.clearError}
-              voiceDictationPanel={sttDictationPanel}
-              voiceStreaming={voice.streamEnabled}
-              voiceSampleRef={voice.sampleRef}
-              voicePartial={voiceOwned ? voice.partial : ''}
-              voiceDownload={voiceOwned ? voice.download : null}
-              voiceCaretRef={voiceCaretRef}
-              voicePendingCaretRef={voicePendingCaretRef}
-              onVoiceToggle={voiceInputSupported ? toggleVoice : undefined}
-              onVoiceCancel={voiceInputSupported ? cancelVoice : undefined}
-              onVoicePrewarm={voiceInputSupported ? voice.prewarm : undefined}
-              onVoiceStart={voiceInputSupported ? startVoice : undefined}
-              onVoiceStop={voiceInputSupported ? stopVoice : undefined}
-              voiceCaptureActive={voice.recording}
               agentName={activeAgentName}
+              // The chip shows the inherited-default marker; `agentName` stays
+              // the raw resolved alias for the skills query and switch title.
+              // Uses the SLOT's stored agent (not `activeAgentName`, which has
+              // already collapsed empty->default) so an agent-less slot reads
+              // `<default> · default` and a pinned one reads the bare alias (#8770).
+              agentLabel={agentOrDefaultLabel(currentSlot?.agent, effectiveDefaultAgent)}
+              agentIsInheritedDefault={!currentSlot?.agent && !!effectiveDefaultAgent}
               agentSource={effectiveAgents.find(a => a.name === activeAgentName)?.source}
               modelName={shownModel}
-              onAgentClick={provider.capabilities.agentTemplates ? (rect) => { setAgentBtnRect(rect); setAgentDropdown(!agentDropdown) } : undefined}
-              onModelClick={(rect) => { setModelBtnRect(rect); setModelDropdown(!modelDropdown) }}
-              onProjectClick={(rect) => {
-                setProjectBtnRect(rect)
+              // The served default is shown exactly when the pin alone would
+              // have read `auto`; that is the inherited case the marker names.
+              modelIsInheritedDefault={shownModel !== 'auto' && shownModel !== _pinShownModel}
+              // The turn's model is Jev's to pick exactly when the routing gate
+              // says so: the slot names no model, and the preview is on. Reads the
+              // slot's RAW model, not `shownModel` -- that one substitutes the
+              // served id for an inheriting slot, so it is almost never `auto` and
+              // would hide every routed turn. Same `jevRouteOn` the picker's row is
+              // drawn from, so chip, menu and gate cannot disagree.
+              modelIsJevRouted={jevRouteOn && isUnpinnedModel(currentSlot?.model)}
+              onAgentClick={provider.capabilities.agentTemplates ? (rect, trigger) => { anchorAgentBtn(rect, trigger); setAgentDropdown(!agentDropdown) } : undefined}
+              onModelClick={(rect, trigger, composerHadFocus) => {
+                modelPickerReturnsFocusRef.current = !!composerHadFocus
+                anchorModelBtn(rect, trigger); setModelDropdown(!modelDropdown)
+              }}
+              onProjectClick={(rect, trigger) => {
+                anchorProjectBtn(rect, trigger)
                 setProjectPickerOpen(o => !o)
               }}
-              sessionControls={sessionControls.map(sc => ({
-                key: sc.key,
-                label: sc.label,
-                icon: sc.icon,
-                active: openSessionControl?.key === sc.key && openSessionControl.slot === activeSlot,
-                state: sessionControlStatuses[sc.key]?.state,
-                statusTooltip: sessionControlStatuses[sc.key]?.tooltip,
-              }))}
-              onSessionControlClick={(key, rect) => {
-                setSessionControlRect(rect)
+              sessionControls={composerSessionControls}
+              onSessionControlClick={(key, rect, trigger) => {
+                anchorSessionControl(rect, trigger)
                 // Two independent setState calls, not one updater with a side
                 // effect: React may run an updater twice (StrictMode does in
                 // dev), which would bump the refresh token twice per toggle and
@@ -8862,8 +9084,19 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                  the one shape `_is_interrupted` cannot see. That slot loses its
                  one-click nudge; typing anything still resumes it. Closing that
                  hole needs a persisted turn-in-flight marker (backend), not a
-                 louder button here. */
-              continuable={continuable && interrupted}
+                 louder button here.
+
+                 `featureRequestRefused` is the one case where the card and the
+                 composer would otherwise disagree (#13342): the newest row is
+                 the plan's refusal of a feature request, the card has withheld
+                 Resume because a retry replays that rejection and offered the
+                 issue form instead, and a composer beneath it saying "press
+                 Resume" would argue with the card. The composer falls back to
+                 the ordinary Send button; typing still works.
+                 `sessionStartRepeated` is the same rule for a session start
+                 that failed twice in a row: the card names the remedy and
+                 withholds Resume, so the composer falls back to Send. */
+              continuable={continuable && interrupted && !featureRequestRefused && !sessionStartRepeated}
               continueIsRecovery={interrupted}
               onContinue={handleContinue}
               continuing={continuing}
@@ -8893,14 +9126,29 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               approvalMode={displayMode}
               providerId={provider.id}
               reasoningEffort={effectiveEffort}
-              onReasoningEffortClick={provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) ? (rect) => { setReasoningEffortBtnRect(rect); setReasoningEffortDropdown(!reasoningEffortDropdown) } : undefined}
-              onAutoNudgeClick={setAutoNudgeOpen}
-              autoNudgeLoop={autoNudgeLoop}
-              autoNudgeOpen={autoNudgeOpen}
-              onAutoNudgeChange={setAutoNudgeLoop}
+              effortIsDefault={!currentSlot?.reasoning_effort && !legacyCodexEffort(currentSlot?.model || '', '', codexPairModels) && !!defaultEffort}
+              // Effort is edited INSIDE the model picker (one control, see
+              // docs/decisions/2026-06-14-chat-composer-model-and-effort-are-one-control.md);
+              // the chip only names the level in force.
+              hasEffort={effortSupported}
+              onAutomationClick={setAutomationOpen}
+              automation={automation}
+              automationOpen={automationOpen}
+              automationCreationReady={automationCreationReady}
+              automationSnapshotFailed={automationSnapshotFailed}
+              sessionMode={currentSlot?.mode || mode}
+              onAutomationChange={(next: AutomationRecord | null) => {
+                if (next) {
+                  queryClient.setQueryData(['session-automation', next.slotKey], next)
+                  dispatch(sseAutomation(next))
+                }
+                else if (automation?.kind === 'legacy_goal_loop') {
+                  queryClient.setQueryData(['session-automation', automation.slotKey], null)
+                  dispatch(sseAutomation({ ...automation, active: false }))
+                }
+              }}
               onOptimizeResult={handleOptimizeResult}
               memoryMode={currentSlot?.memory_mode ?? 'persistent'}
-              cleanMode={currentSlot?.clean_mode}
               sentMessages={sentMessages}
               sendOnEnter={isMobile ? 'ctrl-enter' : chatConfig.sendOnEnter}
               followUpOptions={followUpOptions}
@@ -8908,6 +9156,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               quickSend={dashCfg?.quick_send}
               followUpLayout={chatConfig.followUpLayout}
               followUpSourceKey={followUpSourceKey}
+              followUpPendingOptions={planActionMutation.latchedActions}
+              followUpRefusedOptions={followUpRefusedOptions}
+              followUpError={planActionMutation.failure}
               onFollowUpSelect={(o: string, e: React.MouseEvent, sourceKeyAtClick?: string | null) => {
                 // Plan options (Go / Go All / Cancel) dispatch directly — no input fill.
                 // Non-protocol labels on a plan-shaped message keep the composer path:
@@ -8920,45 +9171,35 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 // text so it no longer matches, leave text alone — the chip
                 // still un-highlights for consistency).
                 if (followUpPickedRef.current.has(o)) {
-                  const pickedSuffix = Array.from(followUpPickedRef.current).join(', ')
                   const next = new Set(followUpPickedRef.current); next.delete(o)
-                  const remainingSuffix = Array.from(next).join(', ')
                   followUpPickedRef.current = next
-                  setInput(prev => {
-                    // Options are appended as one ordered suffix. Remove only
-                    // from that complete generated structure: searching for a
-                    // last occurrence still corrupts an earlier ", Go" if the
-                    // user has already deleted the appended ", Go" by hand.
-                    if (prev === pickedSuffix) return remainingSuffix
-                    const delimitedSuffix = ', ' + pickedSuffix
-                    if (!prev.endsWith(delimitedSuffix)) return prev
-                    const draft = prev.slice(0, -delimitedSuffix.length)
-                    return remainingSuffix ? draft + ', ' + remainingSuffix : draft
-                  })
+                  // Synchronous transform on the live draft + ownership refs
+                  // (#7616): advance both refs and set the value in the click
+                  // handler, never in a render-time updater, so StrictMode's
+                  // double-invocation cannot rebase ownership on stale state.
+                  const r = removeFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+                  followUpInsertedRef.current = r.owned
+                  inputRef.current = r.value
+                  setInput(r.value)
                   setFollowUpPicked(next)
                 } else {
                   const next = new Set(followUpPickedRef.current); next.add(o)
                   followUpPickedRef.current = next
-                  setInput(prev => prev.trim() ? prev.trimEnd() + ', ' + o : o)
+                  const r = appendFollowUpOption(inputRef.current, followUpInsertedRef.current, o)
+                  followUpInsertedRef.current = r.owned
+                  inputRef.current = r.value
+                  setInput(r.value)
                   setFollowUpPicked(next)
                 }
               }}
               pasteBlocks={pasteBlocks}
               onPasteBlocksChange={setPasteBlocks}
+              showFullPastes={chatConfig.showFullPastes}
               knowledgeChip={knowledgeFetch.pendingKnowledge ? <div className="flex items-start gap-1"><KnowledgeBubbleChip knowledge={{ items: knowledgeFetch.pendingKnowledge.items.length, tokens: knowledgeFetch.pendingKnowledge.totalTokens, titles: knowledgeFetch.pendingKnowledge.items.map(i => i.title), content: knowledgeFetch.pendingKnowledge.items.map(i => ({ title: i.title, text: i.content.slice(0, 2000) })) }} /><button type="button" onClick={() => knowledgeFetch.clearPending()} className="shrink-0 mt-0.5 p-0.5 text-muted hover:text-danger bg-transparent border-none cursor-pointer rounded hover:bg-danger/10 transition-colors" aria-label={i18nT('pages.chatPage.remove_knowledge_context')} title={i18nT('pages.chatPage.remove_knowledge_context')}>&times;</button></div> : undefined}
               connected={connected}
             />
+              </Composer>
             </div>
-            <VoiceDisabledModal
-              open={voiceSetupOpen}
-              reason={sttEnabled && !sttAvailable ? 'unavailable' : 'disabled'}
-              provider={sttProvider}
-              onClose={() => setVoiceSetupOpen(false)}
-              onOpenSettings={() => {
-                setVoiceSetupOpen(false)
-                navigate(embedded ? '/embed/settings' : settingsPath({ tab: 'voice' }))
-              }}
-            />
             {/* Agent dropdown portal — triggered from input bar */}
             {agentDropdown && agentBtnRect && createPortal(
               // The keydown handler routes arrow/Enter navigation to the inner
@@ -8970,14 +9211,14 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                   <Input ref={agentInputRef} type="text" aria-label={i18nT('pages.chatPage.filter_agents')} placeholder={i18nT('pages.chatPage.type_to_filter')} value={agentFilter} onChange={e => setAgentFilter(e.target.value)} className="w-full px-2 py-1 text-[13px]" />
                 </div>
                 <div role="listbox" aria-label={i18nT('pages.chatPage.agent_list')} className="overflow-y-auto max-h-[280px]">
-                <AgentDropdownList agents={filteredAgents} activeAgent={activeAgentName} defaultAgent={defaultAgent} onSelect={(name) => { switchAgent(name); setAgentDropdown(false) }} filter={agentFilter} />
+                <AgentDropdownList agents={filteredAgents} activeAgent={activeAgentName} activeKind={currentSlot?.agent_kind} defaultAgent={defaultAgent} onSelect={(name, kind) => { switchAgent(name, kind); setAgentDropdown(false) }} filter={agentFilter} />
                 </div>
                 {/* Embedded chat gets neither half of the default-agent affordance: it has
                     no /capabilities route for the footer, and the footer is what carries the
                     failed-write alert — offering the write without its error path would make
                     a rejected request indistinguishable from a successful one. */}
                 {!embedded && <DefaultAgentRow agentName={activeAgentName} isDefault={activeAgentName === defaultAgent} onSetDefault={() => toggleDefaultAgent(activeAgentName)} />}
-                {!embedded && <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { setAgentDropdown(false); navigate('/capabilities?tab=templates') }} />}
+                {!embedded && <ManageAgentsFooter error={defaultAgentFailed} onManage={() => { setAgentDropdown(false); navigate('/capabilities?tab=crews') }} />}
               </div>,
               document.body
             )}
@@ -8989,23 +9230,37 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 inputRef={modelInputRef}
                 onListKeyDown={onModelListKeyDown}
                 models={filteredModels}
-                activeModel={shownModel}
-                onSelectModel={name => switchModel(name)}
+                activeModel={jevRouteShownModel(shownModel, currentSlot)}
+                onSelectModel={pickModel}
+                modelsLoading={remoteCrew.modelsPending}
+                modelsFailed={remoteCrew.failed}
+                retryingModels={remoteCrew.retrying}
+                onRetryModels={() => remoteCrew.refetch()}
                 filter={modelFilter}
                 setFilter={setModelFilter}
                 onClose={() => setModelDropdown(false)}
-                hasEffort={!!(activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel))}
+                modelVisibilityError={hiddenModelsQ.isError}
+                onRetryModelVisibility={() => hiddenModelsQ.refetch()}
+                // The embedded effort slider is fed by the slot's ACP
+                // capability read (#13637): the agent's own answer wins over
+                // the static model-name heuristic, and its level list replaces
+                // this machine's when it reports one.
+                hasEffort={!!(activeSlot && effortSupported)}
                 slot={activeSlot}
-                currentEffort={currentSlot?.reasoning_effort || ''}
+                currentEffort={currentSlot?.reasoning_effort || legacyCodexEffort(currentSlot?.model || '', '', codexPairModels)}
                 defaultEffort={defaultEffort}
-                effortLevelsOverride={remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined}
+                effortLevelsOverride={effortLevelsOverride}
+                onManageModels={modelPickerConfigured ? undefined : () => {
+                  setModelDropdown(false)
+                  navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: 'key:dashboard.model_picker_hidden_models' }))
+                }}
                 onSetDefault={() => {
                   setModelDropdown(false)
-                  navigate(settingsPath({ tab: 'chat', highlight: SETTINGS_DEFAULT_MODEL_ID }))
+                  navigate(settingsPath({ tab: 'chat', sub: 'models', highlight: SETTINGS_DEFAULT_MODEL_ID }))
                 }}
                 agentName={_modelPinAgent}
                 pinModelName={_modelPinActive || 'auto'}
-                pinModelUnavailable={pinIsWithheld(_modelPinActive, shownModel)}
+                pinModelUnavailable={pinIsWithheld(_modelPinActive, _pinShownModel)}
                 pinnedToAgent={_modelPinPinned}
                 onPinToAgent={() => {
                   setModelDropdown(false)
@@ -9026,6 +9281,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               onOpenChange={setProjectPickerOpen}
               anchorRect={projectBtnRect}
               onSelect={path => { setProject(path); setProjectPickerOpen(false) }}
+              errorHandoff
             />
             {/* App-contributed session control popover — triggered from input bar.
                 Only the open one is mounted, so an app's control costs nothing
@@ -9067,13 +9323,6 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 />
               )
             })()}
-            {/* Reasoning effort dropdown portal */}
-            {reasoningEffortDropdown && reasoningEffortBtnRect && activeSlot && provider.capabilities.reasoningEffort && modelSupportsEffort(shownModel === 'auto' ? '' : shownModel) && createPortal(
-              <div ref={reasoningEffortDropdownRef} className="fixed z-[9999] animate-slide-up" style={(() => { const left = Math.max(8, Math.min(reasoningEffortBtnRect.left, window.innerWidth - 220)); return { bottom: window.innerHeight - reasoningEffortBtnRect.top + 4, left: isMobile ? 8 : left, ...(isMobile ? { right: 8, maxWidth: 'calc(100vw - 16px)' } : {}) } })()}>
-                <ReasoningEffortDropdown slot={activeSlot} currentEffort={currentSlot?.reasoning_effort || ''} defaultEffort={defaultEffort} levelsOverride={remoteCrew.isRemote ? (remoteCrew.capabilities?.effort_levels ?? []) : undefined} onClose={() => setReasoningEffortDropdown(false)} />
-              </div>,
-              document.body
-            )}
             </div>
           </div>
           </SearchHighlightContext.Provider>
@@ -9120,9 +9369,9 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           // below) so its iframe — and the drawing inside it — survives the
           // close, exactly as the width-reveal branch always did.
           ? (sideOverlayPhase !== 'closed'
-              || (shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })
-                  && isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }))) && !activitySlot
-          : shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) && !activitySlot) && (
+              || (shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })
+                  && isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen }))) && !activitySlot
+          : shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen }) && !activitySlot) && (
           <motion.div
             key="side-panel-inline"
             ref={isMobile ? sideOverlayPanelRef : undefined}
@@ -9145,12 +9394,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               ? (sideOverlayPhase === 'closed'
                   ? { display: 'none' } // keep-alive: mounted for the iframe, invisible
                   : { x: sideOverlayX })
-              : (isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined)}
+              : (isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen }) ? { display: 'none' } : undefined)}
           >
             <SidePanel
               tabsCtl={tabsCtl}
               slot={activeSlot || ''}
-              panelHidden={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })}
+              panelHidden={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })}
               onFileOpen={handleFileOpen}
               onArtifactOpen={handleArtifactOpen}
               onAddToContext={handleAddToContext}
@@ -9163,6 +9412,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               slotTitle={activeSlotTitle} chatMode={mode}
               expanded={panelMaximized}
               fillWidth={panelFillWidth}
+              extraReserveW={!isMobile && sidebarOpen ? effectiveSidebarWidth : 0}
               canDockBottom={false}
             />
           </motion.div>
@@ -9177,7 +9427,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
           the window edge — both sides move together instead of snapping. */}
       {activitySlot && createPortal(
         <AnimatePresence initial={false}>
-          {shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) && (
+          {shouldMountSidePanel({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen }) && (
             <motion.div
               key="side-panel"
               initial={sidePanelDockAnim.initial}
@@ -9185,12 +9435,12 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               exit={sidePanelDockAnim.exit}
               transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
               className={sidePanelDock === 'bottom' ? 'w-full overflow-visible flex flex-col justify-end' : 'h-full overflow-visible flex justify-end'}
-              style={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
+              style={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen }) ? { display: 'none' } : undefined}
             >
               <SidePanel
                 tabsCtl={tabsCtl}
                 slot={activeSlot || ''}
-                panelHidden={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, searchOpen: search.isOpen })}
+                panelHidden={isSidePanelHidden({ activityOpen, hasLiveAppTab, hasBrowserTab, hasTaskDashboard, searchOpen: search.isOpen })}
                 onFileOpen={handleFileOpen}
                 onArtifactOpen={handleArtifactOpen}
                 onAddToContext={handleAddToContext}
@@ -9203,6 +9453,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
                 slotTitle={activeSlotTitle} chatMode={mode}
                 expanded={panelMaximized}
                 fillWidth={panelFillWidth}
+                extraReserveW={!isMobile && sidebarOpen ? effectiveSidebarWidth : 0}
               />
             </motion.div>
           )}

@@ -254,7 +254,7 @@ class TestSessionStartImageGuard:
             extra_env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"},
         )
         c._write_claude_local_settings()
-        data = _json.loads((tmp_path / "settings.local.json").read_text())
+        data = _json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
         assert data.get("model") == "deepseek-v4-flash"  # raw pin
         assert "ComputerUse" in data.get("disabledTools", [])
         assert "browser_screenshot" in data.get("disabledTools", [])
@@ -272,7 +272,7 @@ class TestSessionStartImageGuard:
             extra_env={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8317"},
         )
         c._write_claude_local_settings()
-        data = _json.loads((tmp_path / "settings.local.json").read_text())
+        data = _json.loads((tmp_path / ".claude" / "settings.local.json").read_text())
         assert not data.get("disabledTools")
 
     def test_prompt_blocks_allow_image_false_for_text_only(self) -> None:

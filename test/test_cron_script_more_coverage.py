@@ -201,9 +201,7 @@ class TestResolveSafePgid:
     def test_missing_pid_attribute_is_refused(self, posix_kill_stubs):
         assert _resolve_safe_pgid(SimpleNamespace()) is None
 
-    @pytest.mark.parametrize(
-        "exc", [ProcessLookupError(), PermissionError(), OSError("boom")]
-    )
+    @pytest.mark.parametrize("exc", [ProcessLookupError(), PermissionError(), OSError("boom")])
     def test_getpgid_failure_falls_back_to_none(self, posix_kill_stubs, exc):
         posix_kill_stubs.getpgid_exc = exc
         assert _resolve_safe_pgid(_FakeProc(pid=4242)) is None
@@ -234,9 +232,7 @@ class TestKillRunningProcess:
         assert kill_running_process("j1") is False
         assert "j1" not in cron_script._CANCELLED_PROC_JOBS
 
-    def test_group_sigterm_marks_cancelled_and_arms_escalation(
-        self, posix_kill_stubs, monkeypatch
-    ):
+    def test_group_sigterm_marks_cancelled_and_arms_escalation(self, posix_kill_stubs, monkeypatch):
         proc = _FakeProc(pid=4242, returncode=None)
         posix_kill_stubs.pgids[4242] = 777
         cron_script._RUNNING_PROCS["j2"] = proc
@@ -521,7 +517,7 @@ class TestScriptContextPost:
 
         req = captured["req"]
         # Full-value comparison: a prefix check would also match another host.
-        assert req.full_url == "http://localhost:7788/api/send-message"
+        assert req.full_url == "http://127.0.0.1:7788/api/send-message"
         assert req.get_method() == "POST"
         assert req.get_header("X-internal-secret") == "tok"
         assert req.get_header("X-session-key") == "cron:abc"
@@ -536,9 +532,7 @@ class TestScriptContextPost:
             lambda req, timeout=None: (_ for _ in ()).throw(OSError("connection refused")),
         )
 
-        assert ctx._post("/api/send-message", {"text": "hi"}) == {
-            "error": "connection refused"
-        }
+        assert ctx._post("/api/send-message", {"text": "hi"}) == {"error": "connection refused"}
 
 
 class TestScriptContextCallTool:
@@ -548,9 +542,7 @@ class TestScriptContextCallTool:
         client.call_tool.return_value = "tool output"
         monkeypatch.setattr(cron_script, "McpToolClient", lambda server, **kw: client)
         audits: list[tuple] = []
-        monkeypatch.setattr(
-            ctx, "_audit_tool_call", lambda *a, **k: audits.append((a, k))
-        )
+        monkeypatch.setattr(ctx, "_audit_tool_call", lambda *a, **k: audits.append((a, k)))
 
         assert ctx.call_tool("kirocrew-core", "browse_search", {"query": "x"}) == "tool output"
 
@@ -657,12 +649,12 @@ class TestMcpToolClientSpawn:
         assert Path(client._stderr_file.name).exists()
         client.close()
 
-    def test_spawn_failure_cleans_up_stderr_and_sandbox_files(self, mcp_spawn, tmp_path, monkeypatch):
+    def test_spawn_failure_cleans_up_stderr_and_sandbox_files(
+        self, mcp_spawn, tmp_path, monkeypatch
+    ):
         cleanup = tmp_path / "sandbox-profile.sb"
         cleanup.write_text("(deny default)", newline="\n")
-        monkeypatch.setattr(
-            cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup))
-        )
+        monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup)))
         mcp_spawn.popen_exc = FileNotFoundError("srv-bin missing")
         before = set(os.listdir(tmp_path))
 
@@ -729,9 +721,7 @@ class TestMcpToolClientCallTool:
 
     def test_text_content_is_returned(self, mcp_spawn, monkeypatch):
         client = self._client(mcp_spawn)
-        monkeypatch.setattr(
-            client, "_rpc", lambda m, p: {"result": {"content": [{"text": "hi"}]}}
-        )
+        monkeypatch.setattr(client, "_rpc", lambda m, p: {"result": {"content": [{"text": "hi"}]}})
         assert client.call_tool("t", {}) == "hi"
         client.close()
 
@@ -832,9 +822,7 @@ class TestMcpToolClientClose:
 
         assert client._proc.kill_calls == 0
 
-    def test_stderr_close_failure_still_unlinks_and_cleans_sandbox(
-        self, mcp_spawn, tmp_path
-    ):
+    def test_stderr_close_failure_still_unlinks_and_cleans_sandbox(self, mcp_spawn, tmp_path):
         client = self._client(mcp_spawn)
         real_stderr = client._stderr_file
         stub = tmp_path / "stub-stderr.log"
@@ -902,15 +890,13 @@ class TestResolveMcpServer:
 
 
 class TestPathAndSecretResolution:
-    def test_sensitive_path_is_blocked_before_the_allowed_dir_check(
-        self, tmp_path, monkeypatch
-    ):
+    def test_sensitive_path_is_blocked_before_the_allowed_dir_check(self, tmp_path, monkeypatch):
         crons = tmp_path / "crons"
         crons.mkdir()
         script = crons / "job.py"
         script.write_text("def run(ctx): pass\n", newline="\n")
         monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
-        monkeypatch.setattr(cron_script, "is_sensitive_path", lambda p: True)
+        monkeypatch.setattr(cron_script, "sensitive_path_refusal", lambda p: "Blocked: x")
 
         with pytest.raises(PermissionError, match="blocked by security policy"):
             resolve_script_path(f"{script}:run")
@@ -921,7 +907,7 @@ class TestPathAndSecretResolution:
         script = crons / "job.py"
         script.write_text("def run(ctx): pass\n", newline="\n")
         monkeypatch.setattr(cron_script, "config_dir", lambda: tmp_path)
-        monkeypatch.setattr(cron_script, "is_sensitive_path", lambda p: False)
+        monkeypatch.setattr(cron_script, "sensitive_path_refusal", lambda p: None)
 
         resolved, func = resolve_script_path(f"{script}:run")
 
@@ -930,12 +916,12 @@ class TestPathAndSecretResolution:
 
     def test_internal_secret_prefers_the_environment(self, monkeypatch):
         monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "env-secret")
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-secret")
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port, **_kw: "file-secret")
         assert _resolve_internal_secret(5476) == "env-secret"
 
     def test_internal_secret_falls_back_to_the_local_secret_file(self, monkeypatch):
         monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
-        monkeypatch.setattr(cron_script, "read_local_secret", lambda port: "file-secret")
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port, **_kw: "file-secret")
         assert _resolve_internal_secret(5476) == "file-secret"
 
     def test_internal_secret_reads_the_port_it_is_given(self, monkeypatch):
@@ -946,7 +932,7 @@ class TestPathAndSecretResolution:
         monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
         seen = {}
 
-        def _fake_read(port):
+        def _fake_read(port, **_kw):
             seen["port"] = port
             return "file-secret"
 
@@ -963,18 +949,29 @@ def script_run(monkeypatch, tmp_path):
     """Patch run_script_sandboxed's spawn chain; expose the recorded Popen call."""
     script = tmp_path / "job.py"
     script.write_text("def run(ctx): pass\n", newline="\n")
-    monkeypatch.setattr(
-        cron_script, "resolve_script_path", lambda spec: (str(script), "run")
-    )
+    # Records the keywords the launcher passes, so the stub cannot silently
+    # absorb a signature change: `resolved_kwargs` is asserted below.
+    resolved_kwargs: dict = {}
+
+    def _resolve(spec, **kw):
+        resolved_kwargs.clear()
+        resolved_kwargs.update(kw)
+        return (str(script), "run")
+
+    monkeypatch.setattr(cron_script, "resolve_script_path", _resolve)
     monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
     monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
     monkeypatch.setattr(cron_script, "_resolve_internal_secret", lambda port: "unit-secret")
     restricted: list[str] = []
-    monkeypatch.setattr(
-        cron_script.platform_compat, "restrict_to_owner", restricted.append
-    )
+    monkeypatch.setattr(cron_script.platform_compat, "restrict_to_owner", restricted.append)
     state = SimpleNamespace(
-        script=script, proc=None, argv=[], env={}, launcher_src="", restricted=restricted
+        script=script,
+        proc=None,
+        argv=[],
+        env={},
+        launcher_src="",
+        restricted=restricted,
+        resolved_kwargs=resolved_kwargs,
     )
 
     def _popen(argv, **kw):
@@ -989,6 +986,20 @@ def script_run(monkeypatch, tmp_path):
 
 
 class TestRunScriptSandboxed:
+    def test_the_launcher_resolves_a_persisted_spec_with_bundle_roots(self, script_run):
+        """The launcher re-resolves a spec that was ALREADY vetted and persisted.
+
+        An app cron's stored spec is an absolute path into the app's bundle, so
+        the launcher must opt into the bundle roots. Authoring paths (`cron_add`,
+        the CLI, the vault-grant sites) pass neither keyword and stay confined to
+        `crons/`; asserting the flag here is what keeps those two apart.
+        """
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+
+        run_script_sandboxed("spec:run", "job-roots", "the message")
+
+        assert script_run.resolved_kwargs == {"allow_bundle_roots": True}
+
     def test_the_dial_port_is_resolved_exactly_once(self, script_run, monkeypatch):
         # The credential write and the child's _KIROCREW_DIAL_PORT must come from
         # ONE resolution. Two calls are a TOCTOU: a --port auto gateway binding
@@ -1011,6 +1022,61 @@ class TestRunScriptSandboxed:
         run_script_sandboxed("spec:run", "job-once")
 
         assert len(calls) == 1, f"_resolve_dial_port called {len(calls)} times, expected 1"
+
+    def test_provider_secret_beats_stale_env_and_stale_per_port_file(
+        self, script_run, monkeypatch, tmp_path
+    ):
+        # The in-process scheduler hands the gateway's LIVE secret via a
+        # provider. It must win over BOTH a stale KIROCREW_INTERNAL_SECRET in
+        # the environment AND a stale per-port .secret file, which is exactly
+        # the boot-time 403 this fix addresses.
+        monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "stale-env-secret")
+        monkeypatch.setattr(cron_script, "_resolve_dial_port", lambda: 7788)
+        monkeypatch.setattr(
+            cron_script, "read_local_secret", lambda port, **_kw: "stale-file-secret"
+        )
+        # Use the real credential path (the fixture stubs it) so the provider
+        # actually competes with env/file derivation.
+        monkeypatch.setattr(cron_script, "_resolve_internal_secret", _resolve_internal_secret)
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+
+        run_script_sandboxed("spec:run", "job-live", internal_secret_provider=lambda: "live-secret")
+
+        assert script_run.secret_seen == "live-secret"
+
+    def test_without_a_provider_the_env_then_file_order_is_unchanged(self, script_run, monkeypatch):
+        # No provider: derivation must be the pre-existing env-first, file-second
+        # order. env present -> env wins.
+        monkeypatch.setattr(cron_script, "_resolve_dial_port", lambda: 7788)
+        monkeypatch.setenv("KIROCREW_INTERNAL_SECRET", "env-wins")
+        monkeypatch.setattr(cron_script, "read_local_secret", lambda port, **_kw: "file-loses")
+        # Use the real derivation (the fixture stubs it).
+        monkeypatch.setattr(cron_script, "_resolve_internal_secret", _resolve_internal_secret)
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+
+        run_script_sandboxed("spec:run", "job-env")
+        assert script_run.secret_seen == "env-wins"
+
+        # env absent -> file is used.
+        monkeypatch.delenv("KIROCREW_INTERNAL_SECRET", raising=False)
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+        run_script_sandboxed("spec:run", "job-file")
+        assert script_run.secret_seen == "file-loses"
+
+    def test_provider_secret_is_written_nowhere_but_the_temp_file(self, script_run, monkeypatch):
+        # The live secret must reach only the 0600 temp file the child reads —
+        # never the child's env, its argv, or the launcher source.
+        monkeypatch.setattr(cron_script, "_resolve_internal_secret", _resolve_internal_secret)
+        monkeypatch.setattr(cron_script, "_resolve_dial_port", lambda: 7788)
+        secret = "provider-only-secret"
+        script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
+
+        run_script_sandboxed("spec:run", "job-noleak", internal_secret_provider=lambda: secret)
+
+        assert script_run.secret_seen == secret
+        assert secret not in json.dumps(script_run.env)
+        assert secret not in " ".join(script_run.argv)
+        assert secret not in script_run.launcher_src
 
     def test_ok_result_and_temp_file_cleanup(self, script_run):
         script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}\n', "")])
@@ -1088,9 +1154,7 @@ class TestRunScriptSandboxed:
     def test_sandbox_cleanup_file_is_removed(self, script_run, monkeypatch, tmp_path):
         cleanup = tmp_path / "profile.sb"
         cleanup.write_text("(deny default)", newline="\n")
-        monkeypatch.setattr(
-            cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup))
-        )
+        monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup)))
         script_run.proc = _FakeProc(comm_results=[('{"status": "ok"}', "")])
 
         assert run_script_sandboxed("spec:run", "job-9")["status"] == "ok"
@@ -1130,9 +1194,7 @@ class TestResolveCommandShell:
     def test_a_brace_expanding_shell_is_skipped(self, monkeypatch):
         monkeypatch.setattr(cron_script.platform_compat, "IS_WINDOWS", False)
         monkeypatch.setattr(cron_script.os.path, "isfile", lambda p: True)
-        monkeypatch.setattr(
-            cron_script, "_shell_is_posix_strict", lambda p: p == "/usr/bin/sh"
-        )
+        monkeypatch.setattr(cron_script, "_shell_is_posix_strict", lambda p: p == "/usr/bin/sh")
         assert _resolve_command_shell() == "/usr/bin/sh"
 
     def test_no_candidate_present_returns_none(self, monkeypatch):
@@ -1195,9 +1257,7 @@ class TestShellIsPosixStrict:
     def test_sandbox_profile_is_unlinked_even_when_gone(self, monkeypatch, tmp_path):
         cleanup = tmp_path / "profile.sb"
         cleanup.write_text("(deny default)", newline="\n")
-        monkeypatch.setattr(
-            cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup))
-        )
+        monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup)))
         monkeypatch.setattr(
             cron_script,
             "run_limited",
@@ -1347,9 +1407,7 @@ class TestRunCommandSandboxed:
     def test_sandbox_profile_is_cleaned_up(self, command_run, monkeypatch, tmp_path):
         cleanup = tmp_path / "profile.sb"
         cleanup.write_text("(deny default)", newline="\n")
-        monkeypatch.setattr(
-            cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup))
-        )
+        monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), str(cleanup)))
         command_run.proc = _FakeProc(comm_results=[("ok\n", "")])
 
         assert run_command_sandboxed("echo ok")["status"] == "ok"

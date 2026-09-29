@@ -11,6 +11,89 @@ conventions around them (a11y, data fetching, typography) live in
 
 ## Page skeleton
 
+### Dynamic Dashboard in chat and Crew
+
+Long-run status uses the existing side-panel dock, expansion and narrow-screen
+overlay, not another drawer. In chat, a collapsible summary above the composer
+opens the Dynamic Dashboard tab; the panel's + menu remains the empty-state
+entry. Crew reuses its single permanent **Dashboard** tab instead: its compact
+entrance focuses that tab, and its + menu withholds the parallel chat view.
+The existing member publication and task artifacts share a Published view selector, with
+human-readable titles, while retaining their separate renderer sandboxes. A
+pipeline board is one publication, not another product. Visited Crew dashboards
+stay mounted across Notes/Work log switches and panel hiding; a pending member
+thread revalidation hides controls without discarding the last confirmed body.
+The task
+page itself is model-authored HTML and may choose any appropriate responsive
+layout. Host chrome owns scope, current activity, questions and one-shot tool
+approvals. Keep native answer drafts mounted when hiding the panel or switching
+tabs, but unload model-authored iframe documents while inactive to cap resources.
+This does not change the existing Crew protected-template renderer's lifecycle.
+Approval counts and exact session identity stay outside the
+sandboxed page, so a model redesign cannot hide or impersonate those controls.
+The panel keeps its approval count on the Approvals tab; the compact entrance
+retains its Needs you count while collapsed.
+
+The Sessions header's three-dot menu offers **All Dynamic Dashboards**, a standalone
+`/session-dashboards` page with currently open sessions' saved summaries and authored
+dashboards. Native pending questions and approvals appear in a central **Needs
+you** inbox above the summary gallery, with each request labeled by its exact
+session. Approval headings name the requested action, with the secondary session
+name explicitly labeled “From session”. Both the fleet inbox and task panel show
+recorded session context when available, never an invented approval reason.
+Dashboard questions use “Send answer”;
+the shared chat control retains its default label. Unverified requests explain
+that this view cannot verify the request and offer
+Open session, without in-page approval or submission guidance. Native approvals
+carry the host permission-row identity bound to the current request, not just a
+reusable connection ID. Replacements get separate card keys and cannot inherit
+a previous card's submitted or expired state. Snapshots missing this identity
+use the same Open session fallback. Verified approvals
+share a per-request rejection explanation without changing permission mode.
+Successfully responding resolves the same shared request; other views show the result when
+refreshed, not necessarily immediately.
+Summary cards do not repeat these controls. Unavailable inventory shows
+a stale notice rather than an empty-inbox claim. Input-needed sessions appear
+first in the gallery, then blocked and running ones.
+Search and Needs you filter the cards and inbox without discarding answer drafts.
+The filter and inbox count pending requests, not distinct sessions. The
+current page of at most 12 active summaries reads summary/dashboard contents;
+Next sessions and Previous sessions move between pages. Wrappers remain mounted for
+the bounded live inventory (`MAX_LIVE_SLOTS`, 500), preserving published-view
+selection. There are at most 24 iframe documents, including both frame types.
+Each session can have one automatic status frame and one selected saved view.
+The task panel mounts at most twelve status frames. Needs you precedes status
+cards in both surfaces. The explicit **Automatic cards for all sessions** opt-in
+leads with summaries of recent work and next steps. Secondary copy retains the
+default-off state, background model use and shared attempt limits, including
+failures; merely opening the page never starts generation. Each
+frame shows its successful content publication time, separate from host runtime
+state and inventory read freshness. The model may reuse HTML and update only
+text data; host-native answer and approval controls are never inside the frame.
+Automatic-card CSS is parsed in detached CSSOM, never attached to the host.
+Parsed `content`, `list-style`, `list-style-type`, `quotes` and
+`hyphenate-character` declarations are removed,
+including nested rules and keyframes; custom counter styles and rules that
+cannot be inspected are omitted. Inline styles use the same generated-text
+boundary; native quotation and hyphenation cannot consume model-authored strings.
+Ordinary browser quotation and hyphenation defaults remain available.
+Safe layout styles and literal text bindings remain available. If
+isolated parsing fails, the affected model style is omitted, not passed through.
+Saved published views retain their existing CSS behavior. This is a rendering
+restriction, not a claim that the backend cache contains no encoded text.
+This is an explicit fleet view, never a fallback for an unresolved task scope.
+It uses the standard page header and scroll container, with one column narrow
+and two wide, and never generates a summary merely because the page opened.
+Verify at both 320px and 390px: keep native approval targets at least 44px tall
+and the page free of horizontal overflow. Main labels use meaningful names or
+localized numbered session/task labels; opaque IDs remain routing data, not
+headings. The artifact authoring contract asks models for the same readable,
+phone-friendly treatment without prescribing their layout.
+The Crew entry remains **Dashboard**. The agent-authored publication's collapsed
+and expanded chrome says **published view**, including loading and error states.
+
+### Standard page composition
+
 ```tsx
 <>
   <PageHeader title="PageName" subtitle="Short description" />
@@ -217,6 +300,38 @@ arguing with the rule.
 | The nav-drawer swipe contract and `data-owns-swipe` | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
 | Binding a panel's gesture live to its offset | [narrow-viewport.md](narrow-viewport.md#a-panel-that-gains-a-gesture-must-be-bound-live-to-its-offset) |
 | Horizontal insets below the breakpoint, and `Card`'s measured budget | [narrow-viewport.md](narrow-viewport.md#horizontal-insets-below-the-breakpoint) |
+| The phone chat page's single top bar (`topbar-single`), its portal slots and the drawer rail | [narrow-viewport.md](narrow-viewport.md#the-phone-chat-page-has-one-top-bar) |
+
+### The chat transcript scroller and who moves it
+
+The chat transcript is a page's scrolling region like any other, with one
+difference: it is windowed. Only the rows near the viewport are real DOM, and
+spacers stand in for the rest. The hook that does this,
+`website/src/hooks/virtualizer/useVirtualChat.ts`, keeps the reader's position
+through every change to that window, so a host wires it rather than working
+around it.
+
+A host provides the scroller (`scrollerRef`), one `measureRef(index)` element
+per mounted row, the two sentinels at the list ends, and the `offsetBefore` /
+`offsetAfter` spacers. Chrome it renders inside the scroller above the rows (a
+paging bar, a header band) needs nothing extra: the hook measures that leading
+offset itself and carries a bottom-parked reader through it. A host that steers
+toward a row that may not be mounted (the pinned-prompt glide) asks the hook
+through `mountIndex` and `estimateRowTop`. The page keeps `overflow-anchor: auto`
+on the scroller as the browser's own stabiliser. WebKit ships none, so the hook
+carries its own anchors as well.
+
+| What moves the scroller | Owner (`website/src/hooks/virtualizer/`) |
+|---|---|
+| Following the live turn, the jump-to-latest pill, scrolling to a row | `followPolicy.ts` (every write goes through its `writeScrollTop`) |
+| Holding a scrolled-up reader still when rows or heights change above them | `shiftCompensation.ts` |
+| Reopening a session where the reader left it, and re-placing after a hidden tab returns | `readingPosition.ts` |
+| Which rows are mounted as the reader scrolls, and the spacer heights around them | `windowRange.ts` over `measurement.ts` |
+| When a new row height is allowed to move the page | `geometryScheduling.ts` |
+| Listening to the scroller, its rows and its own box | `observers.ts` |
+
+The full owner map is in
+[history](../../docs/system-specs/modules/history.md#the-dashboard-transcript-window-frontend).
 
 ## Stat cards
 
@@ -323,16 +438,19 @@ Inline within a `Card`, built from the shared primitives:
 
 ## Errors
 
-A dismissible banner above the content:
+Render through the shared notice instead of hand-rolling a banner:
 
 ```tsx
-<div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
+<ErrorNotice message={error} onDismiss={() => setError(null)} askAgent />
 ```
+
+Enable `askAgent` only when navigating away cannot discard an unsaved draft; otherwise
+leave it off and document what must stay in place.
 
 ## Animations
 
 `animate-rise` on cards and banners, `animate-scale-in` on inline reveals. Both
-are Tailwind utilities defined in `tailwind.config.js`, and both use
+are Tailwind utilities declared in `src/tailwind-theme.css`, and both use
 `backwards` fill so an `animationDelay` holds the element hidden until its turn.
 
 ## Do NOT
@@ -348,3 +466,31 @@ are Tailwind utilities defined in `tailwind.config.js`, and both use
 - Use raw status text. Use `Badge` or `SourceBadge`.
 - Use `text-xs`. Use `text-[13px]`.
 - Add a new CSS `@keyframes`. Use Framer Motion, or an existing utility.
+
+
+### Split view: leading edge and focus
+
+The surface's top-left is the sessions-sidebar toggle's. In single chat the
+title row carries it (mobile) or clears the shell's stationary button with a
+60px inset and a hairline at 52px (desktop, sidebar collapsed). Split view does
+not render that row, so `SessionGridLayout` hands `ownsTopLeft` to the one
+geometric top-left leaf and `SessionGridView` gives that pane `leading`:
+`inset` reserves the toggle's column on the pane's own row (`ChatPane`:
+`pl-[49px]`, hairline at 41px; the picker card: `pl-[44px]`, hairline at 36px —
+both are container x 52 and 44, the single-chat row's columns, measured from
+where each pane's content starts), `control` renders the toggle inline ahead
+of the title. The shell's toggle keeps its normal rect (`TOGGLE_RECT`) in split
+view: the pane title row is the same height as the single-chat row, so it
+already centres on it.
+
+Split view marks focus by dimming every other pane as well as by the pane's
+accent border: `PaneDim` lays a background-coloured rectangle over the pane at
+`--pane-dim-opacity` (0.4), the way Ghostty fades an unfocused split, so
+message text, code highlighting and status colours keep their own values
+underneath and only the whole pane reads as "not the one with focus". The
+overlay is always mounted while the pane knows its focus state (opacity 0 when
+focused, so the cue fades both ways), sits at `z-20` above the message chrome
+and below the drop overlay and every shell layer, and takes no pointer events,
+so the click that claims focus lands on the pane. A pane outside split view
+(`focused` undefined) never mounts it. The placeholder pane keeps its accent
+dot as well.

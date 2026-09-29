@@ -8,13 +8,13 @@ Telegram is the quickest channel to set up: just a bot token, no plugins, and it
 works from behind a firewall — Kiro Crew reaches out to Telegram, so there's
 nothing to expose.
 
-## The easy way: just ask Kiro Crew
+## The easy way: use Settings
 
-You don't have to edit anything by hand. In any Kiro Crew session — the
-dashboard, Slack, or the CLI — say something like *"set up the Telegram
-channel."* Kiro Crew walks you through creating the bot, then writes the token
-and your user ID into `~/.kiro/crew/.env` and `config.json` and restarts the
-gateway for you. You just hand it the bot token when it asks.
+Open **Settings → Messaging Channels → Telegram**. Paste the BotFather token and add your
+numeric user ID there; the panel verifies the token, stores the credential in
+`~/.kiro/crew/.env`, and writes the non-secret channel settings to `config.json`.
+Restart when the panel asks. Because the bot token is a credential, do not paste
+it into a chat message.
 
 Prefer to wire it up yourself? The manual steps are below.
 
@@ -98,15 +98,17 @@ At startup the bot publishes the menu commands from `COMMAND_SPEC` through `setM
 - `/session [search words]` (or `/sessions [search words]`) — with no words,
   show the ten most recent eligible conversations; with words, use the same ranked
   title-and-message-content search as dashboard history. Results are inline buttons:
-  tap one and ordinary messages in this DM immediately continue that dashboard
-  conversation. The bot replaces its outbound-only native mirror automatically, so
-  no preparatory `/unlink` is required. `/new` leaves the resumed session and starts
-  a fresh Telegram conversation; `/unlink` returns to the existing Telegram
-  conversation. Incognito and temporary transcripts stay excluded. **Direct message
-  only**: a forum Topic is readable by the whole supergroup, so listing or resuming
-  there would expose host-wide titles to members outside `allowed_user_ids`. It also
-  refuses when `allowed_user_ids` contains several people, because the bot cannot
-  tell which one owns the host-wide history.
+  tap one and ordinary messages in this DM immediately continue it. Eligible rows are
+  dashboard conversations plus generations from this exact Telegram DM bucket; native
+  sessions belonging to another user, agent, forum Topic, or messaging channel are
+  excluded. The bot replaces its outbound-only native mirror automatically, so no
+  preparatory `/unlink` is required. `/new` leaves the resumed session, durably
+  records the fresh Telegram generation before replying, and starts that conversation;
+  its first real turn adds it to `/sessions`. `/unlink` returns to the existing Telegram
+  conversation. Incognito and temporary transcripts stay excluded. **Direct message only**: a forum Topic is readable by the
+  whole supergroup, so listing or resuming there would expose host-wide titles to
+  members outside `allowed_user_ids`. It also refuses when `allowed_user_ids` contains
+  several people, because the bot cannot tell which one owns the host-wide history.
 - `/title <text>` — rename this conversation, so its dashboard sidebar row reads
   as something other than the first forty characters you happened to type. On a
   resumed dashboard session the live sidebar row and durable metadata change

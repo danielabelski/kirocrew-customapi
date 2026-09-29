@@ -1,27 +1,17 @@
 import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import type { useScrollManager } from './useScrollManager'
-import { parseNudgeMessage, nudgeLabel } from './NudgeCard'
-import { parseSubagentCompletionMessage } from './subagentCompletion'
-import { headline as subagentHeadline } from './SubagentCompletionCard'
-import type { DisplayItem } from './types'
-import type { PasteBlock } from '../../utils/pasteTokens'
-import {
-  DEFAULT_PINNED_CARD_H,
-  computePinPush,
-  findNextPromptIdx,
-  findPinnedPromptIdx,
-  jumpAnchorIdx,
-  nextPinnedPromptState,
-  pinHandoffY,
-  pinPushTravel,
-  type PinnedPromptState,
-} from '../../utils/pinnedPrompt'
+import { usePinnedPrompt } from './usePinnedPrompt'
+import { jumpAnchorIdx } from '../../utils/pinnedPrompt'
 import { attachUserScrollIntent, glideOnceStep, pollRowSettled } from '../../utils/searchScroll'
+import { glideDurationMs, runConvergingGlide } from '../../utils/convergingGlide'
 
 export interface UseChatPageTranscriptEarlyControllerOptions {
   activeTip: unknown
-  mountIndexRef: MutableRefObject<(index: number) => boolean>
+  mountIndexRef: MutableRefObject<(index: number, opts?: { unionOnly?: boolean }) => boolean>
+  /** The virtualizer's height-index estimate of a row's top, for steering a
+   *  jump toward a row that is not mounted yet. */
+  estimateRowTopRef: MutableRefObject<(index: number) => number | null>
   scrollerRef: ReturnType<typeof useScrollManager>['scrollerRef']
   scrollToDisplayIndex: ReturnType<typeof useScrollManager>['scrollToDisplayIndex']
   slotRunningRef: MutableRefObject<boolean>
@@ -36,6 +26,7 @@ export interface UseChatPageTranscriptEarlyControllerOptions {
 export function useChatPageTranscriptEarlyController({
   activeTip,
   mountIndexRef,
+  estimateRowTopRef,
   scrollerRef,
   scrollToDisplayIndex,
   slotRunningRef,
@@ -135,12 +126,21 @@ export function useChatPageTranscriptEarlyController({
   // the same reason as the tip/survey effect above. A callback ref (not
   // useRef + effect) so the observer re-attaches when the chat column
   // unmounts and remounts.
+  //
+  // The same observer marks the band while it OVERFLOWS its `max-h` cap
+  // (`data-overflowing`, read by the `.dock-inert` rule in index.css). The band
+  // is a `dock-inert` box: it passes input through so the strip beside its
+  // column reaches the transcript, which also drops its own scrollbar as a hit
+  // target — and a scrollbar belongs to the box, not to a child. The band
+  // crosses the cap only by changing height, so every crossing is a resize
+  // this observer already sees; while it sits at the cap, the mark holds.
   const composerBandObserverRef = useRef<ResizeObserver | null>(null)
   const composerBandRef = useCallback((el: HTMLDivElement | null) => {
     composerBandObserverRef.current?.disconnect()
     composerBandObserverRef.current = null
     if (!el || typeof ResizeObserver === 'undefined') return
     const ro = new ResizeObserver(() => {
+      el.dataset.overflowing = el.scrollHeight > el.clientHeight ? 'true' : 'false'
       if (autoFollowAllowed()) scrollBottom(true)
     })
     ro.observe(el)
@@ -236,197 +236,100 @@ export function useChatPageTranscriptEarlyController({
     cancelAnimationFrame(navScrollRafRef.current)
   }, [])
 
-  const displayItemsRef = useRef<DisplayItem[]>([])
-  // Pinned-prompt banner. `pinFoldRef` is a zero-height sentinel sitting
-  // directly under the title row: its top edge is the fold line the banner
-  // sticks to, and it is always mounted so the fold stays measurable even when
-  // nothing is pinned yet. `pinCardRef` is measured for the push geometry.
-  const pinFoldRef = useRef<HTMLDivElement | null>(null)
-  const pinCardRef = useRef<HTMLDivElement | null>(null)
-  const pinEnabledRef = useRef(true)
-  const [pinned, setPinned] = useState<PinnedPromptState | null>(null)
-  const [pinExpanded, setPinExpanded] = useState(false)
-  // Collapsed card height — the hand-off line is derived from it, so it must be
-  // known even while nothing is pinned (no card mounted to measure). Seeded with
-  // the computed default and then reported by PinnedPrompt itself, which is the
-  // only place the SETTLED height is knowable: measuring the card from here would
-  // sample the expand/collapse morph mid-flight and drag the line with it.
-  const pinCollapsedHRef = useRef(DEFAULT_PINNED_CARD_H)
-  const onPinCollapsedHeight = useCallback((h: number) => {
-    if (h > 0) pinCollapsedHRef.current = h
-  }, [])
-  // Recompute which prompt is pinned, and how far the incoming prompt has
-  // pushed it out, from the current scroll position.
-  const updatePinnedPrompt = useCallback(() => {
-    const el = scrollerRef.current
-    if (!el) return
-    // Measure with getBoundingClientRect (viewport-relative) so the origin
-    // matches the scroller regardless of which ancestor is the items'
-    // offsetParent — consistent with useScrollManager, which also deliberately
-    // avoids offsetTop. The fold sits BELOW the scroller's top edge (under the
-    // title row), which is what the sentinel gives us.
-    const items = el.querySelectorAll('[data-display-index]')
-    const foldY = pinFoldRef.current?.getBoundingClientRect().top
-      ?? el.getBoundingClientRect().top
-    // A prompt hands over to the banner only once it is entirely behind the band
-    // (bottom edge at or above the band's bottom), so a prompt taller than the
-    // band scrolls away line by line instead of collapsing the moment it is sent.
-    const handoffY = pinHandoffY(foldY, pinCollapsedHRef.current)
-    // First row whose bottom is still below that line = the topmost row not yet
-    // fully scrolled behind the band.
-    let handoffIdx = -1
-    for (const item of items) {
-      const htmlItem = item as HTMLElement
-      if (htmlItem.getBoundingClientRect().bottom > handoffY) {
-        handoffIdx = parseInt(htmlItem.getAttribute('data-display-index') || '0', 10)
-        break
-      }
-    }
-
-    if (!pinEnabledRef.current || handoffIdx < 0) { setPinned(null); return }
-    const list = displayItemsRef.current
-    const pinIdx = findPinnedPromptIdx(list, handoffIdx)
-    const pinItem = pinIdx >= 0 ? list[pinIdx] : undefined
-    if (!pinItem || pinItem.kind !== 'single') { setPinned(null); return }
-    // The incoming prompt pushes the banner out; when its row is not mounted it
-    // is still far below the fold, so there is nothing to push against yet. Its
-    // TOP edge against the fold drives the push (see computePinPush) — an earlier
-    // line than the hand-off, so a tall prompt shoves the card fully out while it
-    // scrolls in, and only takes the pin once its own bottom clears the band.
-    const nextIdx = findNextPromptIdx(list, pinIdx)
-    const nextEl = nextIdx >= 0
-      ? el.querySelector(`[data-display-index="${nextIdx}"]`) as HTMLElement | null
-      : null
-    const nextTop = nextEl ? nextEl.getBoundingClientRect().top : null
-    // Measure the live card when it is mounted, and otherwise fall back to the
-    // last SETTLED collapsed height PinnedPrompt reported: the push threshold
-    // below has to be decidable even while nothing is mounted, or dropping the
-    // banner would zero the height, zero the push, re-mount it, and oscillate at
-    // frame rate.
-    const measured = pinCardRef.current?.getBoundingClientRect().height ?? 0
-    const bannerH = measured > 0 ? measured : pinCollapsedHRef.current
-    const push = computePinPush(bannerH, foldY, nextTop)
-    // Fully pushed out: DROP the banner instead of rendering it clipped to
-    // nothing. A tall incoming prompt holds this state for its whole length (it
-    // takes the pin only once its own bottom clears the band), and a card clipped
-    // to zero still shows a hairline of its bottom edge under sub-pixel rounding
-    // and browser zoom — a bubble fragment parked over the prompt being read.
-    if (push >= pinPushTravel(bannerH)) { setPinned(null); return }
-    const full = pinItem.msg.content
-    // A nudge's content is a machine-facing instruction payload behind an
-    // `[auto-nudge cycle N]` tag, and a subagent completion's is a header block
-    // plus digest. Quoting either verbatim would park kilobytes of machine text
-    // over the transcript, so both reuse the compact label their transcript card
-    // already shows and keep the body for the expanded state.
-    const nudge = pinItem.msg.role === 'nudge' ? parseNudgeMessage(pinItem.msg) : null
-    // Detected by PARSING, not by role: the same completion event reaches the
-    // transcript under `subagent`, `assistant` (delivery-timeout variant) and
-    // `user` (older scrollback), and the parser already tolerates all three.
-    // Matching on the role here would both miss those variants and duplicate
-    // dispatch knowledge this file has no business holding.
-    const sub = nudge ? null : parseSubagentCompletionMessage(pinItem.msg)
-    const machineLabel = nudge
-      ? nudgeLabel(nudge.cycle)
-      : sub
-        ? subagentHeadline(sub)
-        : null
-    // Stored content is COLLAPSED (recollapsePastes), so a big paste is a
-    // `[ Paste #N ]` token; the reducer unwraps it and decides whether to derive.
-    setPinned(prev => nextPinnedPromptState(prev, {
-      idx: pinIdx,
-      ts: pinItem.msg.ts,
-      raw: full,
-      pastes: (pinItem.msg.meta?.pastes as PasteBlock[] | undefined) || [],
-      machineLabel,
-      machineBody: nudge ? nudge.body : (sub ? full : undefined),
-      push,
-      bannerH,
-    }))
-  }, [scrollerRef])
-  // rAF-throttle the per-scroll recompute: updatePinnedPrompt does a
-  // querySelectorAll + getBoundingClientRect loop (a forced layout read), and a
-  // fling fires scroll dozens of times/sec. Coalesce to at most once per frame,
-  // mirroring the virtualizer's own scroll-listener throttle so this handler
-  // doesn't reintroduce scroll-time main-thread cost.
-  // Cancel-and-reschedule, never latch-on-pending: a handle whose callback
-  // never fires (bfcache-dropped frame) would block every later signal
-  // permanently (frameSchedulerLatch guard). Coalesces identically.
-  const pinRafRef = useRef(0)
-  const onScrollPin = useCallback(() => {
-    if (pinRafRef.current) cancelAnimationFrame(pinRafRef.current)
-    pinRafRef.current = requestAnimationFrame(() => {
-      pinRafRef.current = 0
-      updatePinnedPrompt()
-    })
-  }, [updatePinnedPrompt])
+  // Pinned-prompt banner: geometry, expanded state and the fold/card refs live
+  // in the shared usePinnedPrompt hook (also worn by ChatPane). Only the JUMP is
+  // page-specific — a virtualized transcript must mount the target row before
+  // it can scroll to it — so that stays here, on top of the hook's chrome math.
+  const {
+    displayItemsRef,
+    pinFoldRef,
+    pinCardRef,
+    pinEnabledRef,
+    pinned,
+    setPinned,
+    pinExpanded,
+    setPinExpanded,
+    onPinCollapsedHeight,
+    scrollTranscriptBy,
+    updatePinnedPrompt,
+    onScrollPin,
+    pinnedJumpChrome,
+  } = usePinnedPrompt({ scrollerRef, requiresMountedHandoff: true })
   /** Jump the transcript back to the pinned prompt, landing it just below the
    *  banner so the prompt is read in context — which also un-pins the banner,
-   *  since its prompt is no longer above the fold. */
-  /** Landing inset for a pinned-prompt jump, solved from the banner's own
-   *  push geometry so the PREVIOUS turn's banner pins COMPLETELY at the
-   *  landing — the chained-jump flow: click the banner, land on the prompt's
-   *  start, the previous prompt's banner is already fully formed above it,
-   *  click again to keep walking back. computePinPush returns 0 (no push, no
-   *  clipping) iff the landed row's top clears the fold by at least
-   *  pinPushTravel(bannerH). The incoming banner's height is unknowable until
-   *  it pins (different prompt, different wrap), so reserve for the SETTLED
-   *  collapsed height (pinCollapsedHRef, what a clamped card measures) with a
-   *  slack margin absorbing wrap variance and mid-glide shifts — over-reserving
-   *  only shows a little more of the turn above; under-reserving clips the
-   *  banner and breaks the chain. */
-  const PINNED_JUMP_SLACK_PX = 24
-  const pinnedJumpChrome = useCallback(() => {
-    const el = scrollerRef.current
-    const foldTop = pinFoldRef.current?.getBoundingClientRect().top
-    const srTop = el?.getBoundingClientRect().top
-    const fold = (foldTop != null && srTop != null) ? (foldTop - srTop) : 48
-    // The banner that must fit is the PREVIOUS turn's, which pins mid-glide —
-    // its height is unknowable at launch (different prompt, different wrap:
-    // measured 69.5-92.3px across the same session). Read the LIVE card when
-    // one is pinned (after the mid-glide swap that is already the incoming
-    // banner), floored by the settled collapsed height for the gap while
-    // nothing is pinned. The converging glide re-reads this every frame, so
-    // the reserve tracks the swap instead of freezing at the old banner.
-    const live = pinCardRef.current?.getBoundingClientRect().height ?? 0
-    const bannerH = Math.max(live, pinCollapsedHRef.current)
-    return fold + pinPushTravel(bannerH) + PINNED_JUMP_SLACK_PX
-  }, [scrollerRef])
+   *  since its prompt is no longer above the fold.
+   *
+   *  One converging glide for every distance (utils/convergingGlide): smooth
+   *  travel to a destination re-derived every frame, then convergence until
+   *  the destination holds still. What differs by distance is only how the
+   *  destination is read before the target row is mounted. */
   const scrollToPinnedPrompt = useCallback((target: number) => {
-    const chrome = pinnedJumpChrome()
     cancelAnimationFrame(navScrollRafRef.current)
     navPollCancelRef.current?.()
+    const sc0 = scrollerRef.current
+    if (!sc0) return
     // The jump lands at the head of the target's consecutive prompt run — a
-    // steer pair, a subagent fan-out, an unanswered nudge run — so the row on
-    // the hand-off line is a non-prompt and the previous turn's banner
-    // survives the landing. Rationale and near/far interaction: see
-    // jumpAnchorIdx's docblock (utils/pinnedPrompt.ts).
+    // steer sent before any output, a double-send — so the row on the hand-off
+    // line is a non-prompt and the previous turn's banner survives the landing.
+    // Rationale and near/far interaction: see jumpAnchorIdx's docblock
+    // (utils/pinnedPrompt.ts).
     const anchor = jumpAnchorIdx(displayItemsRef.current, target)
-    const jumpedFar = mountIndexRef.current(anchor)
-    if (jumpedFar) {
-      // Far target: the window was REPLACED, the path between is unmounted
-      // spacer — a glide would scrub blank. Teleport via the convergence
-      // path, same as every other far jump.
-      navToDisplayIndex(anchor, { behavior: 'auto', align: 'start', offset: -chrome })
-      return
-    }
-    // NEAR jump — the common case: the pinned prompt is the previous turn.
-    // mountIndex UNIONED the whole path above, so every row between here and
-    // the target is now mounting. Wait the few frames those rows take to
-    // measure (reading, not scrolling), then compute the distance ONCE from
-    // live geometry and glide in a single smooth scroll. Measuring first is
-    // what makes the one glide land exactly (no estimatedHeight rows left on
-    // the path); gliding once is what keeps it a real scroll — a convergence
-    // poll's per-frame auto writes would cancel the animation and read as a
-    // teleport. A user scroll or a newer navigation aborts the wait.
+    // NEAR: the window is unioned up to the target, so every row on the path
+    // mounts and measures before the glide starts and the destination is exact
+    // from the first frame. FAR: nothing is mounted — replacing the window at
+    // the target would blank the rows under the reader for a frame — and the
+    // glide steers by the height index's estimate instead, the window following
+    // each write as under a fling. The estimate refines as rows measure in, and
+    // the goal is re-read every frame, so the glide converges on the true
+    // position rather than the estimate. A teleport was the previous far path;
+    // it read as the banner "jumping to the top", and a far landing that then
+    // shifted was never corrected.
+    const far = mountIndexRef.current(anchor, { unionOnly: true })
     window.dispatchEvent(new Event('mc-chat-scroll-jump'))
     const rowEl = (): HTMLElement | null =>
       (scrollerRef.current?.querySelector(`[data-display-index="${anchor}"]`) as HTMLElement | null)
+    // Live destination: the row's top from the DOM once it is mounted, the
+    // height index's estimate until then, less the chrome the previous turn's
+    // banner needs to pin completely at the landing.
+    const goal = (): number | null => {
+      const sc = scrollerRef.current
+      if (!sc) return null
+      const row = rowEl()
+      const rowTop = row
+        ? sc.scrollTop + (row.getBoundingClientRect().top - sc.getBoundingClientRect().top)
+        : estimateRowTopRef.current(anchor)
+      if (rowTop == null) return null
+      return Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, rowTop - pinnedJumpChrome()))
+    }
+    const reduced = typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    let cancelled = false
+    let detach = attachUserScrollIntent(sc0, () => { cancelled = true; navPollCancelRef.current?.() })
+    const startGlide = () => {
+      const first = goal()
+      if (first == null) { detach(); navPollCancelRef.current = null; return }
+      const cancelGlide = runConvergingGlide({
+        goal,
+        read: () => scrollerRef.current?.scrollTop ?? 0,
+        write: (top) => { const sc = scrollerRef.current; if (sc) sc.scrollTop = top },
+        durationMs: glideDurationMs(first - sc0.scrollTop),
+        reduced,
+        raf: (cb) => (navScrollRafRef.current = requestAnimationFrame(cb)),
+        cancelRaf: (id) => cancelAnimationFrame(id),
+        onEnd: () => { detach(); navPollCancelRef.current = null },
+      })
+      navPollCancelRef.current = () => { cancelled = true; cancelGlide() }
+    }
+    if (far) { startGlide(); return }
+    // NEAR: wait the few frames the unioned rows take to commit and measure
+    // (reading, not scrolling) so the travel's endpoint is exact from its first
+    // frame. 2 stable frames is enough: rows measure synchronously on mount via
+    // measureRef; the wait only covers React committing the window. The frame
+    // cap (~0.5s) guarantees the glide still happens if some row never stops
+    // moving (an animated widget) — convergence absorbs whatever is left.
     let lastH: number | null = null
     let stable = 0
     let frames = 0
-    let cancelled = false
-    let detach2: (() => void) | null = null
-    const detach = attachUserScrollIntent(scrollerRef.current ?? undefined, () => { cancelled = true })
     navPollCancelRef.current = () => { cancelled = true; detach() }
     const tick = () => {
       if (cancelled) { detach(); return }
@@ -436,55 +339,21 @@ export function useChatPageTranscriptEarlyController({
       else stable = 0
       lastH = h
       frames += 1
-      // 2 stable frames is enough: rows measure synchronously on mount via
-      // measureRef; the wait only covers React committing the unioned window.
-      // The frame cap (~0.5s) guarantees the glide still happens if some row
-      // never stops moving (e.g. an animated widget).
       if ((h != null && stable >= 2) || frames >= 30) {
-        // SELF-DRIVEN converging glide, not a native smooth scroll. A native
-        // animation is cancelled by ANY other scrollTop write — and writes DO
-        // land mid-glide: the upward window expansion's anchor compensation,
-        // the height-sync compensation, a re-measuring row. Each cancellation
-        // strands the scroll wherever the write happened (the probe showed
-        // landings at 34-61px with the banner clipped or dropped — the exact
-        // "some fixed spots never reach the previous message" report). Owning
-        // every frame's write makes the glide uncancellable, and re-deriving
-        // the destination each frame from LIVE geometry (row rect + the
-        // banner currently pinned) absorbs those same mid-flight shifts —
-        // mid-glide image loads and the banner swap included — so the glide
-        // CONVERGES on the true landing instead of a stale one. One motion,
-        // no post-landing correction. User scroll intent still aborts.
+        // Hand the abort listener to the glide: the wait's is detached here and
+        // a fresh one is attached so the glide's own cancel owns it.
         detach()
-        detach2 = attachUserScrollIntent(scrollerRef.current ?? undefined, () => { cancelled = true })
-        navPollCancelRef.current = () => { cancelled = true; detach2?.() }
-        const GLIDE_MS = 450
-        const t0 = performance.now()
-        const sc0 = scrollerRef.current
-        const from = sc0 ? sc0.scrollTop : 0
-        const reduced = typeof window.matchMedia === 'function'
-          && window.matchMedia('(prefers-reduced-motion: reduce)').matches
-        const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
-        const glide = () => {
-          if (cancelled) { detach2?.(); return }
-          const sc = scrollerRef.current
-          const row = rowEl()
-          if (!sc || !row) { detach2?.(); navPollCancelRef.current = null; return }
-          const liveTarget = sc.scrollTop
-            + (row.getBoundingClientRect().top - sc.getBoundingClientRect().top)
-            - pinnedJumpChrome()
-          const goal = Math.max(0, Math.min(sc.scrollHeight - sc.clientHeight, liveTarget))
-          const t = reduced ? 1 : Math.min(1, (performance.now() - t0) / GLIDE_MS)
-          sc.scrollTop = from + (goal - from) * easeOutCubic(t)
-          if (t >= 1) { detach2?.(); navPollCancelRef.current = null; return }
-          navScrollRafRef.current = requestAnimationFrame(glide)
-        }
-        navScrollRafRef.current = requestAnimationFrame(glide)
+        detach = attachUserScrollIntent(scrollerRef.current ?? undefined, () => {
+          cancelled = true
+          navPollCancelRef.current?.()
+        })
+        startGlide()
         return
       }
       navScrollRafRef.current = requestAnimationFrame(tick)
     }
     navScrollRafRef.current = requestAnimationFrame(tick)
-  }, [navToDisplayIndex, pinnedJumpChrome, scrollerRef, mountIndexRef])
+  }, [pinnedJumpChrome, scrollerRef, mountIndexRef, estimateRowTopRef, displayItemsRef])
 
   return {
     scrollBottom,
@@ -501,6 +370,7 @@ export function useChatPageTranscriptEarlyController({
     pinExpanded,
     setPinExpanded,
     onPinCollapsedHeight,
+    scrollTranscriptBy,
     updatePinnedPrompt,
     onScrollPin,
     scrollToPinnedPrompt,

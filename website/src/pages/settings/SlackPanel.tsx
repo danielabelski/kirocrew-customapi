@@ -3,9 +3,6 @@ import { useImeGuard } from '../../hooks/useImeGuard'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Plus, X, Lock } from 'lucide-react'
 import { SlackIcon } from '../../components/SlackIcon'
-
-/** Brand name — do-not-translate; also the default session folder name. */
-const CHANNEL_NAME = "Slack"
 import { SettingsSection, SettingsCard, SettingsInput, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
 import { Input, Btn } from '../../components/ui'
@@ -13,8 +10,13 @@ import { api, type SlackConfigData, type SlackConfigSave } from '../../api/clien
 import { copyToClipboard } from '../../utils/clipboard'
 
 import { i18nT } from '../../i18n/t'
+import { ChannelFolderBackfill } from './ChannelFolderBackfill'
 import ErrorNotice from '../../components/ErrorNotice'
-const SETUP_GUIDE = 'https://github.com/encomjp/kirocrew-customapi/blob/main/docs/guides/slack-setup.md'
+import { SchemaRestartBadge } from '../../components/settingRef/RestartRequiredBadge'
+/** Brand name — do-not-translate, so it lives here rather than in the catalog;
+ *  also the default session folder name. */
+const CHANNEL_NAME = "Slack"
+const SETUP_GUIDE = 'https://github.com/encomjp/kirocrew-customapi/blob/main/src/kiro_crew/docs/slack-integration.md'
 
 type Draft = {
   owner_id: string
@@ -415,6 +417,10 @@ export function SlackPanel() {
             placeholder={i18nT('pages.settings.slackPanel.kirocrew')}
             disabled={ro}
           />
+          {/* The one slack.* field that cannot hot-apply: the slash command is
+              registered in the Slack app manifest. The badge answers from the
+              schema, so it disappears by itself if that ever changes. */}
+          <div className="-mt-1 pb-1"><SchemaRestartBadge configKey="slack.command" /></div>
           <SettingsToggle
             label={i18nT('pages.settings.slackPanel.phase_reactions')}
             description={i18nT('pages.settings.slackPanel.show_phase_aware_emoji_reactions_queued_thinking')}
@@ -451,6 +457,14 @@ export function SlackPanel() {
                 />
               </div>
             )}
+            {!!data.session_folder && (
+              <ChannelFolderBackfill
+                namespace="slack"
+                folderName={data.session_folder}
+                disabled={ro}
+                testId="session-folder-backfill"
+              />
+            )}
           </div>
         </SettingsCard>
       </SettingsSection>
@@ -462,7 +476,7 @@ export function SlackPanel() {
         </Btn>
         {saved && (
           <span className="inline-flex items-center gap-1.5 text-[12px] text-ok">
-            <Check size={14} /> {tokensVerified ? i18nT('pages.settings.slackPanel.verified_with_slack_and_saved_restart_the_gatewa') : restartHint ? i18nT('pages.settings.slackPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.slackPanel.saved')}
+            <Check size={14} /> {tokensVerified ? (restartHint ? i18nT('pages.settings.slackPanel.verified_with_slack_and_saved_restart_the_gatewa') : i18nT('pages.settings.slackPanel.verified_and_saved')) : restartHint ? i18nT('pages.settings.slackPanel.saved_restart_the_gateway_to_apply') : i18nT('pages.settings.slackPanel.saved')}
           </span>
         )}
         {saved && verifyWarning && (

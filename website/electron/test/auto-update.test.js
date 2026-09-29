@@ -2,6 +2,11 @@ const { test } = require("node:test");
 const assert = require("node:assert");
 const {
   initAutoUpdate,
+  channelForFlavor,
+  channelForVersion,
+  resolveChannel,
+  isNewerVersion,
+  shouldAutoOffer,
   buildFeedBase,
   configureUpdater,
   manualDownloadUrl,
@@ -9,7 +14,136 @@ const {
   canRewriteMarker,
   DOWNLOAD_BASE,
   SUPPORTED_PLATFORMS,
+  resolveMacDistArch,
 } = require("../auto-update");
+
+// ---------------------------------------------------------------------------
+// Pure channel helpers (unchanged surface from the hand-rolled updater).
+// ---------------------------------------------------------------------------
+
+test("channelForVersion: nightly stamp -> nightly feed", () => {
+  assert.strictEqual(channelForVersion("0.1.0-nightly.20260721042000"), "nightly");
+});
+
+test("channelForVersion mirrors release.yml: any non-nightly prerelease -> insider", () => {
+  assert.strictEqual(channelForVersion("0.1.0-insider.1"), "insider");
+  assert.strictEqual(channelForVersion("1.2.3-rc.1"), "insider");
+});
+
+test("channelForVersion: bare semver -> stable, unstamped/missing -> null", () => {
+  assert.strictEqual(channelForVersion("1.2.3"), "stable");
+  assert.strictEqual(channelForVersion(undefined), null);
+});
+
+test("channelForFlavor maps beta -> insider", () => {
+  assert.strictEqual(channelForFlavor("beta"), "insider");
+});
+
+test("channelForFlavor maps stable -> stable", () => {
+  assert.strictEqual(channelForFlavor("stable"), "stable");
+});
+
+test("channelForFlavor defaults non-beta to stable", () => {
+  assert.strictEqual(channelForFlavor(undefined), "stable");
+  assert.strictEqual(channelForFlavor("anything"), "stable");
+});
+
+test("resolveChannel: nightly stamp is pinned -- preference ignored", () => {
+  assert.strictEqual(resolveChannel("nightly", "stable"), "nightly");
+  assert.strictEqual(resolveChannel("nightly", "insider"), "nightly");
+  assert.strictEqual(resolveChannel("nightly", ""), "nightly");
+});
+
+test("resolveChannel: dev (null stamp) has no lane -- preference cannot conjure one", () => {
+  assert.strictEqual(resolveChannel(null, "insider"), null);
+  assert.strictEqual(resolveChannel(null, ""), null);
+});
+
+test("resolveChannel: production stamps follow the preference when set", () => {
+  assert.strictEqual(resolveChannel("stable", "insider"), "insider");
+  assert.strictEqual(resolveChannel("insider", "stable"), "stable");
+});
+
+test("resolveChannel: no/invalid preference defaults to STABLE, not to the stamp", () => {
+  // A stable release is PROMOTED, not rebuilt: the stable and insider downloads
+  // of a promoted version are the same file carrying the same prerelease stamp,
+  // so the stamp cannot say which feed to follow. Insider is an explicit opt-in.
+  assert.strictEqual(resolveChannel("stable", ""), "stable");
+  assert.strictEqual(resolveChannel("insider", undefined), "stable");
+  assert.strictEqual(resolveChannel("stable", "nightly"), "stable"); // nightly is not a valid opt-in
+  assert.strictEqual(resolveChannel("insider", "bogus"), "stable");
+});
+
+// Fork: one lane. The pure helpers above keep upstream's contract, but the
+// updater is handed the single-lane policy, so neither a prerelease stamp nor a
+// stored preference moves an install off the fork's GitHub-releases feed.
+test("fork: stamps and preferences all follow the single stable GitHub lane", async () => {
+  for (const [appVersion, pref] of [
+    ["0.3.0-insider.13", ""],
+    ["0.3.0-insider.13", "insider"],
+    ["0.1.0-nightly.20260728t112233", "stable"],
+    ["0.9.0-1.0", "insider"],
+  ]) {
+    const { deps, calls } = makeDeps({ appVersion });
+    deps.getChannelPreference = () => pref;
+    const u = initAutoUpdate(deps);
+    await u.check();
+    assert.ok(calls.setFeedURL.length >= 1);
+    assert.ok(
+      calls.setFeedURL.every((o) => o.provider === "github" && o.owner === "encomjp" && o.repo === "kirocrew-customapi"),
+      `expected the fork's GitHub feed for ${appVersion}/${pref}, got: ${JSON.stringify(calls.setFeedURL)}`,
+    );
+    const info = u.getInfo();
+    assert.strictEqual(info.channel, "stable");
+    assert.strictEqual(info.stampedChannel, "stable");
+    assert.strictEqual(info.channelSwitchable, false);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Fork: the fork publishes ONE universal DMG to its GitHub release, and the
+// GitHub provider has no per-arch directory seam, so a single-arch stamp
+// changes neither the feed nor the reinstall link.
+// ---------------------------------------------------------------------------
+
+test("fork: every mac build reads the GitHub feed and is offered the universal DMG", async () => {
+  for (const macDistArch of ["", "arm64", "x64"]) {
+    const { deps, calls } = makeDeps({ appVersion: "1.0.0" });
+    deps.macDistArch = macDistArch;
+    deps.osArch = "arm64";
+    const u = initAutoUpdate(deps);
+    await u.check();
+    assert.ok(calls.setFeedURL.every((o) => o.provider === "github"));
+    assert.strictEqual(u.getInfo().downloadUrl, `${DOWNLOAD_BASE}/KiroCrew-1.0.0-universal.dmg`);
+  }
+});
+
+test("manualDownloadUrl: the fork's mac DMG ignores the host arch", () => {
+  for (const arch of ["arm64", "x64"]) {
+    assert.strictEqual(
+      manualDownloadUrl("0.9.0-1.0", "darwin", arch, ""),
+      `${DOWNLOAD_BASE}/KiroCrew-0.9.0-1.0-universal.dmg`,
+    );
+  }
+  assert.strictEqual(
+    manualDownloadUrl("0.9.0-1.0", "linux", "x64", "deb"),
+    `${DOWNLOAD_BASE}/kirocrew-customapi-0.9.0-1.0-amd64.deb`,
+  );
+});
+
+test("resolveMacDistArch: the stamp, and nothing but the two known values", () => {
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "arm64" }) }), "arm64");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "x64" }) }), "x64");
+  // Unstamped = universal. So is anything the build never writes: an unknown
+  // value or an unreadable package.json must fall back to the universal feed
+  // (which every mac install can run), never throw on the update path.
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({}) }), "");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "universal" }) }), "");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => ({ desktopDistArch: "x86_64" }) }), "");
+  assert.strictEqual(resolveMacDistArch({ readPackageJson: () => { throw new Error("boom"); } }), "");
+  // The repo's own package.json carries no stamp: a dev run is universal.
+  assert.strictEqual(resolveMacDistArch(), "");
+});
 
 // ---------------------------------------------------------------------------
 // buildFeedBase: the generic-provider DIRECTORY url. The trailing slash is
@@ -1401,7 +1535,8 @@ test("managed command env is CONSTRUCTED: nothing the shell reads as code is inh
   // Derived, not inherited: the launching executable's absolute path, from
   // process.execPath (kernel command line), never from process.env.
   assert.strictEqual(env.KIROCREW_MANAGED_ARGV0, process.execPath);
-  const src = require("node:fs").readFileSync(require.resolve("../auto-update"), "utf8");
+  // The managed lane owns the executor: its spawn and its pinned shell live together.
+  const src = require("node:fs").readFileSync(require.resolve("../runtime/update/managed-lane"), "utf8");
   assert.match(src, /shell: managedShell\(\)/, "spawn must take its shell from managedShell()");
   assert.match(src, /System32\\\\cmd\.exe`/, "managedShell() must pin the system cmd.exe on win32");
   assert.strictEqual(optsList[0].cwd, "/");
@@ -2305,4 +2440,238 @@ test("a genuine install failure after a straddling check settles still fires rec
   assert.strictEqual(calls.quitAndInstall.length, 1, "the retry must commit once the check has settled");
   emit("error", new Error("Squirrel could not validate the update"));
   assert.strictEqual(installFailedCalls, 2, "recovery must remain armed for a real install failure after the check settles");
+});
+
+// ---------------------------------------------------------------------------
+// Characterization of the updater's owners. The facade keeps the policy
+// (channels, feeds, markers, install-shape probes) and composes the lanes and
+// the state reporter; these pin the observable shapes and orderings any move
+// between those owners must keep.
+// ---------------------------------------------------------------------------
+
+const nodePath = require("node:path");
+const nodeFs = require("node:fs");
+const NodeModule = require("node:module");
+
+const AUTO_UPDATE_EXPORTS = [
+  "initAutoUpdate",
+  "channelForFlavor",
+  "channelForVersion",
+  "resolveChannel",
+  "isNewerVersion",
+  "shouldAutoOffer",
+  "buildFeedBase",
+  "configureUpdater",
+  "classifyError",
+  "manualDownloadUrl",
+  "resolveLinuxInstall",
+  "resolveMacDistArch",
+  "readExternallyManaged",
+  "canRewriteMarker",
+  "DOWNLOAD_BASE",
+  "GITHUB_OWNER",
+  "GITHUB_REPO",
+  "SUPPORTED_PLATFORMS",
+];
+
+test("the facade exports exactly its eighteen names, in order", () => {
+  assert.deepStrictEqual(Object.keys(require("../auto-update")), AUTO_UPDATE_EXPORTS);
+});
+
+test("the update runtime loads without Electron and without load-time effects", () => {
+  const electronDir = nodePath.join(__dirname, "..");
+  const updateFiles = [nodePath.join(electronDir, "auto-update.js")];
+  const runtimeDir = nodePath.join(electronDir, "runtime", "update");
+  const owners = nodeFs.readdirSync(runtimeDir).filter((name) => name.endsWith(".js")).sort();
+  assert.deepStrictEqual(owners, ["feed-lane.js", "managed-lane.js", "state-reporter.js"]);
+  const facade = nodeFs.readFileSync(updateFiles[0], "utf8");
+  for (const owner of owners) {
+    updateFiles.push(nodePath.join(runtimeDir, owner));
+    assert.match(facade, new RegExp(`require\\("\\./runtime/update/${owner.replace(/\.js$/, "")}"\\)`));
+    assert.doesNotMatch(
+      nodeFs.readFileSync(nodePath.join(runtimeDir, owner), "utf8"),
+      /__dirname|require\(\s*["'](?:\.\.\/\.\.\/)?auto-update["']\s*\)/,
+      `${owner} must neither anchor on its own directory nor require the facade`,
+    );
+  }
+  const cached = new Map();
+  for (const file of updateFiles) {
+    cached.set(file, require.cache[file]);
+    delete require.cache[file];
+  }
+  const originalLoad = NodeModule._load;
+  const timers = [];
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  NodeModule._load = function load(request, ...rest) {
+    if (request === "electron") throw new Error("electron must not load at module scope");
+    return originalLoad.call(this, request, ...rest);
+  };
+  global.setTimeout = (...args) => { timers.push(args); return originalSetTimeout(() => {}, 0); };
+  global.setInterval = (...args) => { timers.push(args); return originalSetInterval(() => {}, 1e9); };
+  try {
+    const fresh = require("../auto-update");
+    assert.deepStrictEqual(Object.keys(fresh), AUTO_UPDATE_EXPORTS);
+    assert.strictEqual(timers.length, 0, "loading arms no timer");
+  } finally {
+    NodeModule._load = originalLoad;
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+    for (const [file, entry] of cached) {
+      if (entry) require.cache[file] = entry;
+      else delete require.cache[file];
+    }
+  }
+});
+
+test("the baked marker defaults to EXTERNALLY-MANAGED beside main.js", (t) => {
+  const looked = [];
+  t.mock.method(nodeFs, "lstatSync", (target) => {
+    looked.push(target);
+    const error = new Error("absent");
+    error.code = "ENOENT";
+    throw error;
+  });
+  assert.strictEqual(
+    readExternallyManaged({ env: {}, resourcesPath: "/virtual/resources", isPackaged: true }),
+    null,
+  );
+  assert.deepStrictEqual(looked, [
+    nodePath.join(__dirname, "..", "EXTERNALLY-MANAGED"),
+    nodePath.join("/virtual/resources", "EXTERNALLY-MANAGED"),
+  ]);
+});
+
+test("every lane hands back the handle shape its callers read", () => {
+  const keys = (opts) => {
+    const { deps } = makeDeps(opts);
+    const handle = initAutoUpdate(deps);
+    return { keys: Object.keys(handle), disabled: handle.disabled };
+  };
+  const stub = ["check", "download", "install", "getInfo", "disabled"];
+  assert.deepStrictEqual(keys({ externallyManaged: { managedBy: "m", updateCommand: "" } }),
+    { keys: stub, disabled: "externally-managed" });
+  assert.deepStrictEqual(keys({ isPackaged: false }), { keys: stub, disabled: "dev" });
+  assert.deepStrictEqual(keys({ osPlatform: "freebsd" }), { keys: stub, disabled: "platform" });
+  assert.deepStrictEqual(keys({ appVersion: "1.0.0" }).keys, ["check", "download", "install", "getInfo", "isReady"]);
+
+  const restoreTimers = (() => {
+    const originalSetTimeout = global.setTimeout;
+    const originalSetInterval = global.setInterval;
+    global.setTimeout = () => ({ unref() {} });
+    global.setInterval = () => ({ unref() {} });
+    return () => {
+      global.setTimeout = originalSetTimeout;
+      global.setInterval = originalSetInterval;
+    };
+  })();
+  try {
+    assert.deepStrictEqual(
+      keys({ externallyManaged: { managedBy: "m", updateCommand: "apply", checkCommand: "check" } }),
+      { keys: ["check", "download", "install", "getInfo"], disabled: undefined },
+    );
+  } finally {
+    restoreTimers();
+  }
+
+  assert.deepStrictEqual(
+    keys({ resourcesPath: "/Volumes/Kiro Crew/Kiro Crew.app/Contents/Resources", bundleWritable: false }),
+    { keys: stub, disabled: "volume" },
+  );
+});
+
+test("getInfo and every lifecycle payload keep their key order", async () => {
+  const { deps, states } = makeDeps();
+  const u = initAutoUpdate(deps);
+  assert.deepStrictEqual(Object.keys(u.getInfo()), [
+    "version",
+    "channel",
+    "stampedChannel",
+    "channelSwitchable",
+    "channelPreference",
+    "laneVersion",
+    "runningAheadOfLane",
+    "autoDownload",
+    "managedBy",
+    "updateCommand",
+    "platform",
+    "packaged",
+    "downloadUrl",
+    "lastState",
+  ]);
+  await u.check();
+  assert.deepStrictEqual(Object.keys(states[0]), [
+    "state",
+    "channel",
+    "version",
+    "installHandoff",
+    "laneVersion",
+    "runningAheadOfLane",
+  ]);
+  assert.strictEqual(states[0].state, "checking");
+});
+
+test("the feed lane arms policy, events, feed and timers in one fixed order", () => {
+  const order = [];
+  const { deps } = makeDeps();
+  const updater = {};
+  for (const flag of ["autoDownload", "autoInstallOnAppQuit", "allowDowngrade", "allowPrerelease", "logger"]) {
+    Object.defineProperty(updater, flag, {
+      configurable: true,
+      set(value) { order.push(`set ${flag}=${flag === "logger" ? "log" : value}`); },
+      get() { return undefined; },
+    });
+  }
+  updater.on = (event) => order.push(`on ${event}`);
+  updater.setFeedURL = (options) => order.push(
+    `setFeedURL ${options.url || `${options.provider}:${options.owner}/${options.repo}`}`,
+  );
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  global.setTimeout = (_fn, ms) => { order.push(`setTimeout ${ms}`); return { unref() {} }; };
+  global.setInterval = (_fn, ms) => { order.push(`setInterval ${ms}`); return { unref() {} }; };
+  try {
+    initAutoUpdate({ ...deps, autoUpdater: updater });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+  }
+  assert.deepStrictEqual(order, [
+    "set autoDownload=false",
+    "set autoInstallOnAppQuit=false",
+    "set allowDowngrade=true",
+    "set allowPrerelease=true",
+    "set logger=log",
+    "on error",
+    "on checking-for-update",
+    "on update-not-available",
+    "on update-available",
+    "on download-progress",
+    "on update-downloaded",
+    "setFeedURL github:encomjp/kirocrew-customapi",
+    "setTimeout 30000",
+    "setInterval 14400000",
+  ]);
+});
+
+test("the managed lane arms only its launch check and poll, never the feed", () => {
+  const order = [];
+  const { deps } = makeDeps({
+    externallyManaged: { managedBy: "m", updateCommand: "/usr/bin/apply", checkCommand: "/usr/bin/check" },
+  });
+  const updater = {
+    on: (event) => order.push(`on ${event}`),
+    setFeedURL: () => order.push("setFeedURL"),
+  };
+  const originalSetTimeout = global.setTimeout;
+  const originalSetInterval = global.setInterval;
+  global.setTimeout = (_fn, ms) => { order.push(`setTimeout ${ms}`); return { unref() { order.push("unref"); } }; };
+  global.setInterval = (_fn, ms) => { order.push(`setInterval ${ms}`); return { unref() { order.push("unref"); } }; };
+  try {
+    initAutoUpdate({ ...deps, autoUpdater: updater });
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.setInterval = originalSetInterval;
+  }
+  assert.deepStrictEqual(order, ["setTimeout 30000", "setInterval 14400000", "unref", "unref"]);
 });

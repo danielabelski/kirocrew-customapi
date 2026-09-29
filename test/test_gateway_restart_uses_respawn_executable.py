@@ -23,11 +23,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew import platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.handlers import updates as dashboard_updates
 from kiro_crew.slack import gateway as gw
 from kiro_crew.slack.gateway import GatewayOrchestrator
 
-_STABLE_INTERPRETER = "/managed/current/bin/python-sentinel"
+#: Basename of the stand-in interpreter ``respawn_executable`` is made to answer.
+#: It must be a REAL executable file on disk, not a synthetic pathname: the restart
+#: paths establish that the interpreter exists before they tear anything down, so a
+#: path that resolves to nothing exercises the deferral branch instead of the exec
+#: these tests are about. The fixture below creates it under ``tmp_path`` and it stays
+#: distinguishable from ``sys.executable``, which is the whole point of the assertion.
+_STABLE_INTERPRETER_NAME = "managed-current-python-sentinel"
 
 
 def _make_orchestrator() -> GatewayOrchestrator:
@@ -42,15 +50,23 @@ def _make_orchestrator() -> GatewayOrchestrator:
 
 
 @pytest.fixture
-def exec_seams(monkeypatch):
-    """Replace the interpreter lookup and the exec; return both recorders."""
-    respawn = MagicMock(return_value=_STABLE_INTERPRETER)
+def exec_seams(monkeypatch, tmp_path):
+    """Replace the interpreter lookup and the exec; return both recorders.
+
+    The interpreter is a real executable file, so the restart paths' existence
+    check passes and they proceed to the exec. ``.exe`` keeps it executable on
+    Windows too, where a POSIX mode bit says nothing.
+    """
+    interpreter = tmp_path / f"{_STABLE_INTERPRETER_NAME}.exe"
+    interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    platform_compat.chmod_safe(interpreter, 0o700)
+    respawn = MagicMock(return_value=str(interpreter))
     monkeypatch.setattr("kiro_crew.platform.wheel_engine.respawn_executable", respawn)
     reexec = MagicMock()
     monkeypatch.setattr("kiro_crew.platform_compat.reexec_python_module", reexec)
     # The breadcrumb drain hits the real safety-override store; not under test.
     monkeypatch.setattr(gw, "flush_breadcrumb_writes", lambda *_a, **_k: None)
-    return respawn, reexec
+    return respawn, reexec, str(interpreter)
 
 
 @pytest.fixture
@@ -70,14 +86,20 @@ def update_info():
     updates._update_info.update(original)
 
 
-def _assert_execs_the_respawn_interpreter(respawn: MagicMock, reexec: MagicMock) -> None:
+def _assert_execs_the_respawn_interpreter(
+    respawn: MagicMock, reexec: MagicMock, interpreter: str
+) -> None:
     reexec.assert_called_once()
     args, kwargs = reexec.call_args
     assert args[0] == "kiro_crew"
     assert list(args[1]) == sys.argv[1:]
-    assert kwargs.get("executable") == _STABLE_INTERPRETER, (
+    assert kwargs.get("executable") == interpreter, (
         "restart exec'd sys.executable instead of respawn_executable(); after an "
-        "update pruned the old install that path no longer exists"
+        "update pruned the old install that path does not exist"
+    )
+    assert interpreter != sys.executable, (
+        "the fixture interpreter must differ from sys.executable or the assertion "
+        "above cannot tell the two resolutions apart"
     )
     respawn.assert_called_once_with()
 
@@ -85,12 +107,12 @@ def _assert_execs_the_respawn_interpreter(respawn: MagicMock, reexec: MagicMock)
 class TestRestartAfterUpdate:
     @pytest.mark.asyncio
     async def test_execs_the_respawn_interpreter(self, exec_seams):
-        respawn, reexec = exec_seams
+        respawn, reexec, interpreter = exec_seams
         orch = _make_orchestrator()
 
         await orch._restart_after_update(respawn)
 
-        _assert_execs_the_respawn_interpreter(respawn, reexec)
+        _assert_execs_the_respawn_interpreter(respawn, reexec, interpreter)
 
 
 class TestResolverIsLoadedBeforeTheApply:
@@ -190,12 +212,42 @@ class TestResolverIsLoadedBeforeTheApply:
         )
 
 
+class TestDashboardResolverIsLoadedBeforeTheApply:
+    @pytest.mark.parametrize(
+        ("method", "apply_names"),
+        [
+            ("api_update_apply", {"apply_policy_update", "_venv_pip_install"}),
+            ("api_update_approve", {"apply_wheel_update"}),
+        ],
+    )
+    def test_import_precedes_every_apply(self, method, apply_names):
+        tree = ast.parse(inspect.getsource(dashboard_updates))
+        fn = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == method
+        )
+        imports = TestResolverIsLoadedBeforeTheApply._resolver_import_lines(fn)
+        assert len(imports) == 1, f"{method}: expected one resolver import, got {imports}"
+        applies = [
+            node.lineno
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in apply_names
+        ]
+        assert applies, f"{method}: no apply reference found"
+        assert imports[0] < min(
+            applies
+        ), f"{method}: resolver import at line {imports[0]} follows apply at {min(applies)}"
+
+
 class TestAutoApplyWheelUpdate:
     @pytest.mark.asyncio
     async def test_successful_install_execs_the_respawn_interpreter(
         self, exec_seams, update_info, monkeypatch
     ):
-        respawn, reexec = exec_seams
+        respawn, reexec, interpreter = exec_seams
         orch = _make_orchestrator()
 
         update_info.clear()
@@ -232,7 +284,7 @@ class TestAutoApplyWheelUpdate:
         await orch._auto_apply_wheel_update()
 
         spawn.assert_awaited_once()
-        _assert_execs_the_respawn_interpreter(respawn, reexec)
+        _assert_execs_the_respawn_interpreter(respawn, reexec, interpreter)
 
 
 class TestAutoApplyGitUpdate:
@@ -276,7 +328,7 @@ class TestAutoApplyGitUpdate:
     async def test_successful_update_execs_the_respawn_interpreter(
         self, exec_seams, monkeypatch, tmp_path
     ):
-        respawn, reexec = exec_seams
+        respawn, reexec, interpreter = exec_seams
         orch = _make_orchestrator()
 
         monkeypatch.setenv("KIROCREW_PROJECT_DIR", str(tmp_path))
@@ -293,6 +345,9 @@ class TestAutoApplyGitUpdate:
         )
         monkeypatch.setattr(gw, "commits_ahead", lambda _proj, _target: 0)
         monkeypatch.setattr(gw, "hidden_worktree_edits", lambda _proj: [])
+        # The floor gate reads the pinned commit with a real `git show`, which
+        # fails against this non-repo, and a failed read refuses.
+        monkeypatch.setattr(gw.dep_sync, "incoming_python_floor_breach", lambda *a, **k: None)
         spawn = self._scripted_git(monkeypatch)
         # Post-reset rebuild steps: no optional backend, frontend and deps sync
         # come back clean, and the package reload is a no-op (reloading the real
@@ -308,4 +363,4 @@ class TestAutoApplyGitUpdate:
         # restart after a real apply, not an early return.
         spawned = [[str(a) for a in call.args[1:3]] for call in spawn.await_args_list]
         assert ["reset", "--hard"] in spawned
-        _assert_execs_the_respawn_interpreter(respawn, reexec)
+        _assert_execs_the_respawn_interpreter(respawn, reexec, interpreter)

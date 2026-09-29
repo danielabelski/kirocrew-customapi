@@ -12,11 +12,15 @@ regressing back into the old blind spot.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from skill_script_helpers import load_skill_script
+
+from kiro_crew.platform.update_governance import _GIT_LOCATION_VARS
 
 SCRIPT = (
     Path(__file__).resolve().parents[1]
@@ -161,6 +165,7 @@ class TestVerdictPrecedence:
                     "author": "someone",
                     "is_cross_repository": True,
                     "untrusted_fork": False,
+                    "closes_item": True,
                 }
             ]
         )
@@ -180,7 +185,12 @@ class TestVerdictPrecedence:
         )
 
     def test_landed_merged_pr_outranks_an_open_one(self, mod):
-        """Precedence 1 before 2: already-fixed is triage debt, not a skip."""
+        """Precedence 1 before 2: already-fixed is triage debt, not a skip.
+
+        The open hit claims closure, so rule 2 WOULD fire on it. Without that the
+        comparison is vacuous -- a mention-only open hit reaches no verdict at
+        all, so rule 1 would win by default rather than by rank.
+        """
         checks = clean_checks(
             merged_prs=[
                 {
@@ -190,7 +200,14 @@ class TestVerdictPrecedence:
                     "closes_item": True,
                 }
             ],
-            open_prs=[{"number": 8100, "author": "x", "is_cross_repository": False}],
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "x",
+                    "is_cross_repository": False,
+                    "closes_item": True,
+                }
+            ],
         )
         assert mod.verdict(checks)[:2] == ("CLOSE", "already-fixed")
 
@@ -350,7 +367,14 @@ class TestVerdictPrecedence:
         """Precedence 6 sits BELOW the positive findings: a partial view of one
         question does not erase a definite answer to another."""
         checks = clean_checks(
-            open_prs=[{"number": 8100, "author": "x", "is_cross_repository": False}],
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "x",
+                    "is_cross_repository": False,
+                    "closes_item": True,
+                }
+            ],
             recency={"error": "rate-limited"},
         )
         assert mod.verdict(checks)[:2] == ("SKIP", "open-pr")
@@ -1372,7 +1396,7 @@ class TestNoClosurePatternShipsUnguarded:
         assert unguarded == []
 
     def test_the_declared_set_does_not_drift_from_the_list(self, mod):
-        """A pattern declared item-scoped but no longer present would leave the
+        """A pattern declared item-scoped but missing from the list would leave the
         ratchet passing over a phrase nobody ships."""
         assert mod.ITEM_SCOPED_CLOSURE_RES <= set(mod.CLOSURE_RES)
 
@@ -1549,6 +1573,7 @@ class TestUntrustedForkAnnotation:
                         "author": "stranger",
                         "is_cross_repository": True,
                         "untrusted_fork": untrusted,
+                        "closes_item": True,
                     }
                 ]
             )
@@ -1565,6 +1590,7 @@ class TestUntrustedForkAnnotation:
                     "author": "stranger",
                     "is_cross_repository": True,
                     "untrusted_fork": True,
+                    "closes_item": True,
                 }
             ]
         )
@@ -1574,6 +1600,32 @@ class TestUntrustedForkAnnotation:
         assert mod.human_line(ITEM, name, reason, evidence, mod.risk_of(checks)) == (
             f"SKIP {ITEM} open-pr=#8100 fork=true author=stranger untrusted-fork=true risk=high"
         )
+
+    def test_a_mention_only_fork_is_not_reported_as_a_suppression(self, mod):
+        """The marker names a suppression, so it must not fire where none happens.
+
+        A fork PR that merely MENTIONS the item leaves it in the queue, so calling
+        that an untrusted-fork SKIP would name a suppression that does not occur.
+        The doubt is not dropped -- the mention path raises the risk on its own --
+        but it is reported as what it is.
+        """
+        checks = clean_checks(
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "stranger",
+                    "is_cross_repository": True,
+                    "untrusted_fork": True,
+                    "closes_item": False,
+                }
+            ]
+        )
+        assert mod.untrusted_fork_skip(checks) is None
+        assert mod.mention_only_open_prs(checks) == [8100]
+        assert mod.risk_of(checks) == "high"
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("CLAIM", "clean")
+        assert evidence["open_pr_mention_only"] == [8100]
 
     def test_a_routine_skip_carries_no_marker(self, mod):
         """A marker on every SKIP is noise; this exists so the one that needs a
@@ -1585,6 +1637,7 @@ class TestUntrustedForkAnnotation:
                     "author": "teammate",
                     "is_cross_repository": False,
                     "untrusted_fork": False,
+                    "closes_item": True,
                 }
             ]
         )
@@ -1597,7 +1650,12 @@ class TestUntrustedForkAnnotation:
 
     def test_the_marker_names_no_user_authored_text(self, mod):
         """Same rule as everywhere else here: an association is a forge enum and
-        is used to DECIDE, but only metadata is printed."""
+        DECIDES the outcome, but only metadata is printed.
+
+        The hit claims closure so this reads the SKIP evidence it is about. A
+        mention-only hit would take the CLAIM branch and pass without ever
+        building the dict under test.
+        """
         checks = clean_checks(
             open_prs=[
                 {
@@ -1606,10 +1664,12 @@ class TestUntrustedForkAnnotation:
                     "is_cross_repository": True,
                     "author_association": "NONE",
                     "untrusted_fork": True,
+                    "closes_item": True,
                 }
             ]
         )
         name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("SKIP", "open-pr")
         assert "author_association" not in evidence
         assert "NONE" not in mod.human_line(ITEM, name, reason, evidence, "high")
 
@@ -1651,7 +1711,7 @@ class TestClosingReference:
         assert not mod.closing_reference_re(REPO, ITEM).search(text)
 
     def test_a_prefix_number_does_not_match(self, mod):
-        """`#802` must not satisfy a pattern aimed at `#8029`, and `#80291`
+        """`#802` must not satisfy a pattern aimed at `8029`, and `80291`
         must not either."""
         assert not mod.closing_reference_re(REPO, 802).search("Fixes #8029")
         assert not mod.closing_reference_re(REPO, ITEM).search("Fixes #80291")
@@ -1908,8 +1968,177 @@ def run_main(mod, monkeypatch, forge: Forge, extra: list[str] | None = None) -> 
     return mod.main(["--repo", REPO, "--item", str(ITEM), *(extra or [])])
 
 
+class TestADisclaimedOpenPrDoesNotSuppress:
+    """Rule 2 demands a closing keyword, the same thing rule 1 demands.
+
+    The defect these pin: the timeline event rule 2 reads is ``cross-referenced``,
+    which is keyword-free by construction -- it fires on a bare mention -- so an
+    open PR that said in plain words it was NOT fixing an item took that item out
+    of the dispatch queue anyway. ``Refs #N`` is this repository's own idiom for
+    referenced-but-deliberately-not-closed and its PR template keeps
+    ``Related Issues`` apart from a closing trailer, so the clearest signal an
+    author can give that they are leaving an item for somebody else was read as
+    the reason to skip it. Silently: the item never appeared as
+    refused-for-a-reason, it simply never came up.
+
+    Measured over one real candidate list, of 21 (item, covering PR) pairs 18
+    carried a closing keyword and 3 did not, and all 3 of those PRs disclaimed the
+    fix in their own words.
+
+    Both directions are here. Declining to suppress is only safe because the
+    decline is REPORTED -- a bare reference can still be work in flight whose
+    author never spelled a keyword -- so the risk goes high and the item takes the
+    live recheck instead of the batch.
+    """
+
+    def test_an_open_pr_claiming_closure_is_annotated_and_skips(self, mod, monkeypatch, capsys):
+        """The 18-of-21 majority, unchanged. This is the half that must NOT move:
+        a PR carrying ``Fixes #N`` is coverage and the item leaves the queue."""
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: a_pull(8100)})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 10
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "SKIP"
+        assert payload["reason"] == "open-pr"
+        assert payload["checks"]["open_prs"][0]["closes_item"] is True
+
+    def test_an_open_pr_that_only_mentions_the_item_claims_instead(self, mod, monkeypatch, capsys):
+        """The defect, end to end. ``a_pull(closes=None)`` writes
+        ``Related to #N`` -- a reference with no closing keyword -- and the item
+        is dispatched rather than dropped."""
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: a_pull(8100, closes=None)})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "CLAIM"
+        assert payload["checks"]["open_prs"][0]["closes_item"] is False
+
+    def test_the_declined_suppression_is_reported_not_dropped(self, mod, monkeypatch, capsys):
+        """Declining silently would trade one blind spot for another, so the
+        finding is published and forces the live recheck."""
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: a_pull(8100, closes=None)})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["evidence"]["open_pr_mention_only"] == [8100]
+        assert payload["risk"] == "high"
+
+    def test_the_repositorys_own_refs_idiom_does_not_suppress(self, mod, monkeypatch, capsys):
+        """The sharpest measured case, in the words the author actually used: a PR
+        whose only reference is ``Refs #N`` and which says the real fix is a
+        follow-up tracked in that very item."""
+        disclaiming = dict(
+            a_pull(8100, closes=None),
+            body=f"Refs #{ITEM} -- the amplifier problem and the follow-up are tracked there.",
+        )
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: disclaiming})
+        assert run_main(mod, monkeypatch, forge) == 0
+        assert f"CLAIM {ITEM} risk=high" in capsys.readouterr().out
+
+    def test_a_closing_pr_is_chosen_over_a_mentioning_one(self, mod, monkeypatch, capsys):
+        """Rule 2 reports the PR that actually covers the item, not whichever
+        reference the timeline happened to list first. The mentioning PR comes
+        first here, so a rule that returned the first hit would name it."""
+        forge = Forge(
+            timeline=[a_xref(8100), a_xref(8101)],
+            pulls={8100: a_pull(8100, closes=None), 8101: a_pull(8101)},
+        )
+        assert run_main(mod, monkeypatch, forge) == 10
+        assert f"SKIP {ITEM} open-pr=#8101" in capsys.readouterr().out
+
+    def test_a_mention_only_hit_is_kept_rather_than_discarded(self, mod):
+        """The report needs the number, so the hit stays on the check. A filter
+        that dropped it would leave nothing to publish and the decline would be
+        as silent as the suppression it replaced."""
+        checks = clean_checks(
+            open_prs=[
+                {
+                    "number": 8100,
+                    "author": "someone",
+                    "is_cross_repository": False,
+                    "closes_item": False,
+                }
+            ]
+        )
+        assert mod.covering_open_prs(checks) == []
+        assert mod.mention_only_open_prs(checks) == [8100]
+        name, reason, evidence = mod.verdict(checks)
+        assert (name, reason) == ("CLAIM", "clean")
+        assert evidence["open_pr_mention_only"] == [8100]
+        assert mod.EXIT_CODES[name] == 0
+
+
+class TestAClosingKeywordCannotSpanTwoFields:
+    """A closing reference counts only WITHIN one field.
+
+    The forge honours a closing keyword inside the title or inside the body, never
+    assembled across the two. The closing pattern's ``\\s+`` matches a newline, so
+    searching a newline-joined ``title + body`` matches a reference NEITHER field
+    carries: a title ending ``fix`` glued to a body opening ``#N`` reads as
+    ``fix\\n#N``.
+
+    That direction is the dangerous one. It fabricates coverage, and fabricated
+    coverage SKIPs an item nobody is fixing -- silently, which is the harm this
+    module exists to prevent. The text is arbitrary and opening a fork PR needs no
+    permission, so it is craftable rather than accidental.
+    """
+
+    @pytest.fixture
+    def closing(self, mod):
+        return mod.closing_reference_re(REPO, ITEM)
+
+    def test_a_keyword_in_the_title_and_a_reference_in_the_body_is_not_closure(self, mod, closing):
+        assert mod.claims_closure(closing, "fix", f"#{ITEM}") is False
+
+    @pytest.mark.parametrize("word", ["fix", "fixes", "closes", "resolved"])
+    def test_no_closing_word_reaches_across_the_boundary(self, mod, closing, word):
+        """Every member of the keyword vocabulary, not just the one measured."""
+        assert mod.claims_closure(closing, word, f"#{ITEM}") is False
+
+    def test_a_real_closure_in_the_body_still_counts(self, mod, closing):
+        assert mod.claims_closure(closing, "some title", f"Fixes #{ITEM}") is True
+
+    def test_a_real_closure_in_the_title_still_counts(self, mod, closing):
+        """Both fields are searched, so moving the keyword does not lose it."""
+        assert mod.claims_closure(closing, f"Fixes #{ITEM}", "body text") is True
+
+    def test_a_bare_reference_in_one_field_is_still_not_closure(self, mod, closing):
+        assert mod.claims_closure(closing, "some title", f"Refs #{ITEM}") is False
+
+    @pytest.mark.parametrize("title,body", [(None, None), ("", ""), (None, f"Fixes #{ITEM}")])
+    def test_absent_fields_do_not_raise(self, mod, closing, title, body):
+        """The forge may omit either field; an absent one is empty, not a crash."""
+        assert isinstance(mod.claims_closure(closing, title, body), bool)
+
+    def test_the_fabricated_reference_does_not_skip_the_item(self, mod, monkeypatch, capsys):
+        """End to end, through the real verdict: the craftable pair leaves the item
+        in the queue and is reported as a mention instead of suppressing it."""
+        crafted = dict(a_pull(8100), title="fix", body=f"#{ITEM}")
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: crafted})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "CLAIM"
+        assert payload["checks"]["open_prs"][0]["closes_item"] is False
+        assert payload["evidence"]["open_pr_mention_only"] == [8100]
+
+    def test_a_merged_pr_cannot_be_closed_by_a_fabricated_reference_either(
+        self, mod, monkeypatch, capsys
+    ):
+        """The merged path reads the same annotation, so rule 1 is covered by the
+        same fix. A fabricated closure there would CLOSE a live item, which is
+        stronger than a SKIP and is why the fix belongs at the shared read rather
+        than on the open branch alone."""
+        crafted = dict(
+            a_pull(8100, state="closed", merged=True, sha="a" * 40),
+            title="fix",
+            body=f"#{ITEM}",
+        )
+        forge = Forge(timeline=[a_xref(8100)], pulls={8100: crafted})
+        assert run_main(mod, monkeypatch, forge, ["--json"]) == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "CLAIM"
+        assert payload["checks"]["merged_prs"][0]["closes_item"] is False
+
+
 class TestClosureProseNeverCloses:
-    """Rule 3 reads HAND-WRITTEN ENGLISH, and it used to answer with the
+    """Rule 3 reads HAND-WRITTEN ENGLISH, and a naive reading answers with the
     strongest thing this script can say about somebody else's live work.
 
     Nine false-CLOSE paths reached review in one change and each was fixed on the
@@ -2529,13 +2758,35 @@ class TestAgainstRealGit:
     unlanded. One small real repo pins both.
     """
 
-    @pytest.fixture
-    def clone(self, tmp_path):
-        root = tmp_path / "clone"
+    @pytest.fixture(autouse=True)
+    def _hermetic_git_for_the_script(self, monkeypatch):
+        """The SCRIPT's git inherits this process's environment, unlike the fixture's.
+
+        ``_git`` below hands its spawns ``_fixture_git_env``; ``mod.git`` does not
+        take an environment and reads ``os.environ``. Pin the same containment
+        there for the duration of each test: the operator's global and system config
+        are pointed away and the ``GIT_DIR`` family dropped, so the ancestry and grep
+        questions are answered about the clone and nothing else.
+        """
+        for name in _GIT_LOCATION_VARS:
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        monkeypatch.setenv("GIT_TERMINAL_PROMPT", "0")
+
+    @pytest.fixture(scope="module")
+    def _clone_template(self, tmp_path_factory):
+        """Build the landed/sidetrack clone once per module; ``clone`` copies it.
+
+        Six git subprocesses (~2.3-4.7s) would otherwise be paid on every one of the
+        8 tests below. Module scope is safe because the template is never handed
+        to a test, only copied from via ``shutil.copytree`` -- no test here moves
+        a branch or adds a commit to it, they only read commits already present.
+        """
+        root = tmp_path_factory.mktemp("claim-preflight-seed") / "clone"
         root.mkdir()
 
         def run_git(*args):
-            rc, out, err = 0, "", ""
             rc, out, err = _git(root, list(args))
             assert rc == 0, f"git {args} failed: {err}"
             return out
@@ -2553,6 +2804,18 @@ class TestAgainstRealGit:
         run_git("commit", "-q", "-m", "elsewhere")
         off_main = run_git("rev-parse", "HEAD")
         run_git("checkout", "-q", "main")
+        return root, on_main, off_main
+
+    @pytest.fixture
+    def clone(self, tmp_path, _clone_template):
+        template_root, on_main, off_main = _clone_template
+        root = tmp_path / "clone"
+        shutil.copytree(template_root, root)
+        # A copied checkout reads as "unstaged changes" on Windows (fresh inode/
+        # ctime invalidate the index stat cache); nothing in the template is
+        # uncommitted, so this changes no content and only re-stats the index.
+        rc, _out, err = _git(root, ["reset", "--hard", "HEAD"])
+        assert rc == 0, err
         return root, on_main, off_main
 
     def test_ancestry_distinguishes_landed_from_elsewhere(self, mod, clone):
@@ -2623,6 +2886,38 @@ class TestAgainstRealGit:
         assert got["error"] == "unknown-default-branch"
 
 
+def _fixture_git_env() -> dict[str, str]:
+    """Env for a fixture git call: no host config, templates, hooks, or identity bleed.
+
+    The session/module-scoped template builders below run BEFORE the function-scoped
+    ``_git_identity`` autouse fixture in ``test/conftest.py`` has pinned anything, so
+    they would otherwise read the developer's real ``~/.gitconfig`` -- a
+    ``commit.gpgSign`` aborts the whole template, and a ``core.hooksPath`` or
+    ``init.templateDir`` would EXECUTE host hooks from inside the test run. The
+    ``GIT_DIR`` location family is dropped (the production list, so an exported
+    ``GIT_DIR`` from a hook or ``rebase --exec`` cannot retarget the fixture), both
+    template channels are emptied, and identity is supplied. Deliberately NOT
+    ``git_command_env()``: that pins ``diff.external`` empty for commands that never
+    diff, and these fixtures run ``git diff``.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_LOCATION_VARS}
+    env.update(
+        {
+            "GIT_TEMPLATE_DIR": "",
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "init.templateDir",
+            "GIT_CONFIG_VALUE_0": "",
+        }
+    )
+    return env
+
+
 def _git(root: Path, args: list[str]):
     """Run git against ``root``, contained two ways.
 
@@ -2636,6 +2931,7 @@ def _git(root: Path, args: list[str]):
     done = subprocess.run(
         ["git", "-C", str(root), *args],
         cwd=str(root),
+        env=_fixture_git_env(),
         capture_output=True,
         text=True,
         encoding="utf-8",

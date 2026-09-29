@@ -68,10 +68,10 @@ const withCard = (askId?: string) =>
           slot: 'chat-1',
           ...(askId
             ? { ask_id: askId }
-            // A stateless card carries BOTH identities: the server's record id
-            // (what the dismiss route retires) and this delivery's own id (what
-            // the store's identity-guarded retire compares against).
-            : { serverCardId: 'card-1', cardId: 'delivery-1' }),
+            // A stateless card carries the server's record id: what the dismiss
+            // route retires, and what the store's identity-guarded clear
+            // compares against.
+            : { serverCardId: 'card-1' }),
           questions: QUESTIONS,
         },
       },
@@ -249,13 +249,12 @@ describe('PendingQuestionCard — round 6 findings', () => {
     renderCard(store)
 
     fireEvent.click(screen.getByLabelText('Dismiss question without answering'))
-    // Card B arrives before A's dismissal lands: a live broadcast, so `fresh`.
+    // Card B arrives before A's dismissal lands: a new server identity.
     act(() => {
       store.dispatch(setQuestionCard({
         slot: 'chat-1',
         card_id: 'card-2',
         questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
-        fresh: true,
       }) as never)
     })
     release({ ok: true })
@@ -477,6 +476,8 @@ describe('QuestionCard — every question must be answered', () => {
     pick('Carve-out')
     expect(button.disabled).toBe(true)
 
+    // Answering Q1 folds it and opens Q2, so its options are in the DOM without
+    // the user having to go looking for them.
     pick('staging')
     expect(button.disabled).toBe(false)
   })

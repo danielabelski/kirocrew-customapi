@@ -114,7 +114,7 @@ async function pickPicture(sheet: HTMLElement) {
 
 /** The confirm is a dialog named by its own title, which disambiguates its
  *  buttons from the editor footer's. */
-const GENERIC = 'Discard unsaved changes?'
+const GENERIC = 'Discard unsaved changes and close the editor?'
 const NARROW = 'Discard the new schedule?'
 const confirmBox = (name = GENERIC) => screen.getByRole('dialog', { name })
 
@@ -152,10 +152,11 @@ describe('crew editor — dirty dismissal is guarded on every pane', () => {
 
     fireEvent.click(within(sheet).getByRole('button', { name: 'Cancel' }))
 
-    // The confirm is raised rather than the sheet silently closing.
+    // The confirm is raised rather than the sheet silently closing, and its
+    // body names the member the edits belong to, not the whole crew.
     await waitFor(() => expect(confirmBox()).toBeInTheDocument())
     expect(within(confirmBox()).getByText(
-      'This crew has edits that were never saved. Closing now throws them away.',
+      '“oncall” has edits that were never saved. Closing now throws them away. No other member is affected.',
     )).toBeInTheDocument()
 
     // Back out: the sheet stays and the edited value survives.
@@ -204,6 +205,32 @@ describe('crew editor — dirty dismissal is guarded on every pane', () => {
 
     await waitFor(() =>
       expect(screen.queryByRole('dialog', { name: 'Edit agent oncall' })).not.toBeInTheDocument())
+    expect(screen.queryByRole('dialog', { name: GENERIC })).not.toBeInTheDocument()
+  })
+
+  it('a whitespace-padded display_name from a hand-edited config opens clean', async () => {
+    // The server trims on save, but a hand-edited config can hold "  Ops  ".
+    // The dirty compare must trim BOTH operands, or the sheet opens with Save
+    // enabled and closing prompts to discard changes the user never made.
+    mockApi.kirocrewAgents.mockResolvedValue({
+      agents: [{
+        name: 'oncall',
+        kiro_agent: 'kirocrew',
+        workspace: 'default',
+        memory_store: 'default',
+        triggers: 'incidents',
+        session_color: '',
+        display_name: '  Ops  ',
+      }],
+      default_agent: 'kirocrew',
+    })
+    renderWithProviders(<KiroCrewAgentsPage />)
+    fireEvent.click(await screen.findByTestId('crew-card'))
+    const sheet = await screen.findByRole('dialog', { name: 'Edit agent Ops' })
+    fireEvent.click(within(sheet).getByRole('button', { name: 'Cancel' }))
+
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'Edit agent Ops' })).not.toBeInTheDocument())
     expect(screen.queryByRole('dialog', { name: GENERIC })).not.toBeInTheDocument()
   })
 

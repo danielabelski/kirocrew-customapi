@@ -15,87 +15,6 @@ const os = require("os");
 const path = require("path");
 
 const { findConfiguredDashboardPort } = require("./data-home");
-const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
-const { createRendererRecovery } = require("./renderer-recovery");
-const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
-const { exitImmersiveModes } = require("./blocking-prompt");
-const { armSplashHistoryClear } = require("./splash-history");
-const { hideToTray, cancelPendingTrayHide } = require("./hide-to-tray");
-const { attachHtmlFullScreen } = require("./html-fullscreen");
-const { shouldRetryLocalTokenMint, tokenMintRetryDelayMs, TOKEN_MINT_MAX_RETRIES } = require("./token-acquire");
-const { createDisplayMediaHandler } = require("./display-media");
-const { applyFocusModeChrome } = require("./focus-chrome");
-const {
-  createPermissionRequestHandler,
-  createPermissionCheckHandler,
-} = require("./permission-handler");
-const { createWindowOpenHandler, openExternalSafely } = require("./external-scheme");
-const { resolveThemeSource } = require("./native-theme");
-const { initAutoUpdate } = require("./auto-update");
-
-function ensureKirocrewBridgeInstalled() {
-  try {
-    // H7/bounds: require explicit consent before copying to ~/.config/opencode — do not
-    // auto-enable the bridge. Consent via KIROCREW_BRIDGE_CONSENT=1 or electron-store flag
-    // `kirocrewBridgeConsent`. Without it, return without touching the filesystem.
-    let consented = false;
-    try { if (process.env.KIROCREW_BRIDGE_CONSENT === "1") consented = true; } catch {}
-    if (!consented) {
-      try {
-        const Store = require("electron-store");
-        const _s = new Store();
-        if (_s.get("kirocrewBridgeConsent")) consented = true;
-      } catch {}
-    }
-    if (!consented) return;
-    const os = require("os");
-    const fs = require("fs");
-    const path = require("path");
-    const resourcesBridge = (() => {
-      try {
-        // Packaged: resources/kirocrew-bridge/index.js
-        const r = path.join(process.resourcesPath, "kirocrew-bridge", "index.js");
-        if (fs.existsSync(r)) return r;
-      } catch {}
-      try {
-        // Dev: ../../mcp/kirocrew-bridge/dist/index.js
-        const d = path.join(__dirname, "../../mcp/kirocrew-bridge/dist/index.js");
-        if (fs.existsSync(d)) return d;
-      } catch {}
-      return null;
-    })();
-    if (!resourcesBridge) return;
-    const home = os.homedir();
-    const opencodeConfigPath = path.join(home, ".config", "opencode", "opencode.json");
-    let cfg = {};
-    try { cfg = JSON.parse(fs.readFileSync(opencodeConfigPath, "utf8")); } catch { cfg = {}; }
-    if (!cfg.mcp || typeof cfg.mcp !== "object") cfg.mcp = {};
-    const targetDir = path.join(home, ".config", "opencode", "mcp", "kirocrew-bridge");
-    try { fs.mkdirSync(targetDir, { recursive: true }); } catch {}
-    // Copy/symlink bridge to stable location so opencode's mcp command path is stable across AppImage mounts
-    const targetIndex = path.join(targetDir, "index.js");
-    try {
-      const data = fs.readFileSync(resourcesBridge);
-      fs.writeFileSync(targetIndex, data, { mode: 0o755 });
-    } catch {}
-    const desired = {
-      type: "local",
-      command: ["node", targetIndex],
-      enabled: true,
-    };
-    const existing = cfg.mcp["kirocrew-bridge"];
-    if (JSON.stringify(existing) !== JSON.stringify(desired)) {
-      cfg.mcp["kirocrew-bridge"] = desired;
-      try {
-        fs.mkdirSync(path.dirname(opencodeConfigPath), { recursive: true });
-        fs.writeFileSync(opencodeConfigPath, JSON.stringify(cfg, null, 2) + "\n");
-      } catch {}
-    }
-  } catch (e) {
-    try { console.warn("kirocrew-bridge install failed", e && e.message); } catch {}
-  }
-}
-const { makeUpdaterLogger } = require("./update-logger");
 const {
   classifyBundleLocation,
   containingDirForBundle,
@@ -104,10 +23,11 @@ const {
 } = require("./bundle-location");
 const { DEFAULT_REMOTE_BIN } = require("./remote-token");
 const {
-  migrateRemoteHostConfig,
-  remoteHostPort,
-  getRemoteHostConfig,
+  fallbackLocalPort,
   isSelectablePort,
+  legacyMigrationPort,
+  migrateRemoteHostConfig,
+  selectLaunchPort,
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
@@ -116,6 +36,7 @@ const { identityFamily } = require("./instance-guard");
 const { initNativeLogging } = require("./native-logging");
 const { armCrashCollector, collectCrashReports } = require("./crash-collector");
 const { initGpuPolicy } = require("./disable-gpu");
+const { initGpuCrashFallback } = require("./gpu-crash-fallback");
 const { cancelPendingTrayHide } = require("./hide-to-tray");
 const { exitImmersiveModes } = require("./blocking-prompt");
 const { createMetricsRecorder } = require("./perf-metrics");
@@ -143,12 +64,27 @@ function reopenCrewCompanionAfterUpdate() {
 const { createGatewaySupervisor } = require("./gateway-supervisor");
 const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
+const { installEarlyBootGuard } = require("./early-boot-guard");
+
+// Everything from here to `app.whenReady()` runs synchronously at module load,
+// before Chromium is ready and before any window, tray, or crash reporter
+// exists. The guard turns a throw anywhere in that span into a log entry, a
+// native error box, and exit(1) instead of a silent process death. `glog` and
+// `gatewayLogPath` are function declarations further down; they hoist, so the
+// guard can call them when it fires. The ready handler releases it once the
+// post-ready safety net below can take over.
+const releaseEarlyBootGuard = installEarlyBootGuard({
+  app,
+  dialog,
+  glog,
+  logPath: gatewayLogPath,
+});
 
 // Carry settings across the npm name rename before electron-store opens the
 // destination. Construction writes defaults, after which the seed could no
 // longer distinguish a first launch from an existing store.
 seedRenamedStore(app.getPath("userData"), {
-  log: (message) => console.log("store migration: " + message),
+  log: (message) => glog("store migration: " + message),
 });
 
 const store = new Store({
@@ -165,96 +101,76 @@ const store = new Store({
     autoDownloadUpdates: true,
     runLocalGateway: true,
     linuxFrameless: null,
+    // Written by gpu-crash-fallback.js when the GPU process dies at startup;
+    // read before Chromium initializes on the next launch.
+    gpuSoftwareFallback: null,
   },
 });
 
 const KIROCREW_HOME = resolveHome();
 
-function resolvePort() {
+// dashboard.url in the resolved data home is the backend source of truth.
+const CONFIGURED_PORT = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+
+// Resolved above the migration because both readers need it: an explicit
+// override is the port this launch binds, so it is also the port a legacy crew
+// has to be keyed under. 0 means absent or unusable.
+const ENV_PORT = (() => {
   const raw = process.env.KIROCREW_PORT;
-  if (raw) {
-    const parsed = parseInt(raw, 10);
-    if (isNaN(parsed) || parsed < 1 || parsed > 65535) {
-      console.warn('Invalid KIROCREW_PORT="' + raw + '", falling back to 5476');
-      return 5476;
-    }
-    return parsed;
-  }
+  if (!raw) return 0;
+  const parsed = parseInt(raw, 10);
+  // isSelectablePort, not just a range check: an override short-circuits
+  // selection, so a port selection would REFUSE reaches the launch through here
+  // untouched. Port 80 is refused because the shell's own URL loses it --
+  // `new URL("http://localhost:80").port` is "" -- so every per-port lookup
+  // misses, `isGatewayLocalForWindow` reads a tunnelled crew as local, and the
+  // idle heartbeat sends `X-Internal-Secret` to it. Guarding only the selection
+  // path left this route open: `legacyMigrationPort` then keyed a `remoteHosts`
+  // entry under 80 as well, which is the miss that makes the crew read as local.
+  if (isSelectablePort(parsed)) return parsed;
+  // An unusable value counts as absent rather than as a request for the product
+  // default, so every launch with no usable port of its own takes the same
+  // decision through selection. The warning stays, because the value was given
+  // and ignored.
+  console.warn('Invalid KIROCREW_PORT="' + raw + '", choosing a port as if it were unset');
+  return 0;
+})();
 
-  // dashboard.url in the resolved data home is the backend source of truth.
-  const configuredPort = findConfiguredDashboardPort(fs, path, [KIROCREW_HOME]);
+// Ahead of port selection, because selection is the reader that has to see the
+// crew. A legacy `remoteHost` carries no port of its own, so until it is folded
+// into `remoteHosts` there is no configured crew for selection to weigh, and the
+// launch decides as though the machine had none -- which is the shadowing this
+// whole path exists to prevent.
+if (migrateRemoteHostConfig(store, legacyMigrationPort({
+  envPort: ENV_PORT,
+  configuredPort: CONFIGURED_PORT,
+}))) {
+  glog("Migrated legacy remoteHost into remoteHosts before selecting a port");
+}
 
-  // With "Run a local gateway" off, a dashboard.url naming a port that has no
-  // remote host of its own records a backend which will not run here: nothing
-  // binds it and there is no host to mint a token from. A machine switched from
-  // local to remote-only keeps exactly that record, so honouring it would
-  // rebuild the dead end the opt-out is meant to avoid. A dashboard.url that
-  // DOES name a configured crew still wins -- that is the user choosing between
-  // crews rather than a leftover.
-  if (!isLocalGatewayEnabled(store)) {
-    if (
-      configuredPort
-      && isSelectablePort(configuredPort)
-      && getRemoteHostConfig(store, configuredPort)?.host
-    ) {
-      return configuredPort;
-    }
-    const remotePort = remoteHostPort(store);
-    if (remotePort) {
-      console.log(
-        "Local gateway is off; targeting the configured remote crew on port " + remotePort,
-      );
-      return remotePort;
-    }
-    // No crew is configured, so there is no better target than the local
-    // record: naming the port the user configured beats naming the default.
-  }
-
-  if (configuredPort) return configuredPort;
-  console.debug("No usable dashboard.url port in the data home, falling back to 5476");
-  return 5476;
+function resolvePort() {
+  if (ENV_PORT) return ENV_PORT;
+  return selectLaunchPort({
+    store,
+    configuredPort: CONFIGURED_PORT,
+    localGatewayEnabled: isLocalGatewayEnabled(store),
+    log: glog,
+  });
 }
 
 const PORT = resolvePort();
 const BACKEND_URL = "http://localhost:" + PORT;
 
-if (migrateRemoteHostConfig(store, PORT)) {
-  console.log("Migrated legacy remoteHost to remoteHosts[" + PORT + "]");
-}
-
 app.name = identityFamily(app.getVersion()) === "nightly"
   ? "Kiro Crew Nightly"
   : "Kiro Crew";
 
-// The dashboard view fills the whole content area on all platforms. On macOS
-// and Windows the dashboard's own 42px header doubles as the title bar. macOS
-// insets native traffic lights; Windows overlays its native caption controls
-// and renders application-menu triggers inside the header. On Linux the window
-// is frameless (frame:false) on desktops that prefer client-side decorations —
-// same injected drag region, with an injected caption-control cluster instead
-// of native controls (see linux-frame.js).
-
-const { validateRemoteSettings } = require("./validation");
-const { attachContextMenu } = require("./context-menu");
-
-// Set app name for macOS menu bar and dock. Nightly ships as a separate
-// side-by-side app, so its menu bar must say so.
-app.name = identityFamily(app.getVersion()) === "nightly" ? "Kiro Crew Nightly" : "Kiro Crew";
-
-// Windows taskbar identity. Without an explicit AppUserModelID, Windows groups
-// the app under the generic Electron host (wrong icon in the taskbar/jumplist,
-// pinning targets Electron rather than KiroCrew). Match the packaged appId
-// (build.appId = "com.kirocrew.customapi"); nightly gets a distinct id so it
-// pins/groups side-by-side with stable, mirroring the app.name split above.
-if (IS_WIN) {
-  const appUserModelId = identityFamily(app.getVersion()) === "nightly"
-    ? "com.kirocrew.customapi.nightly" : "com.kirocrew.customapi";
 // Windows groups and pins the live window by this ID. Nightly must remain
 // side-by-side with stable, matching the packaged app IDs.
 if (process.platform === "win32") {
   const appUserModelId = identityFamily(app.getVersion()) === "nightly"
-    ? "com.amazon.kiro.crew.nightly"
-    : "com.amazon.kiro.crew";
+    ? "com.kirocrew.customapi.nightly"
+    : "com.kirocrew.customapi";
   app.setAppUserModelId(appUserModelId);
 }
 
@@ -277,10 +193,23 @@ function glog(line) {
   const entry = "[" + new Date().toISOString() + "] " + line + "\n";
   try {
     fs.appendFileSync(gatewayLogPath(), entry);
-  } catch {
-    // Never let logging break launch or recovery.
+  } catch (error) {
+    // Preserve the diagnostic when the file sink itself is unavailable.
+    console.error(
+      "[gateway-launch] " + line + " (log write failed: "
+        + (error && error.message ? error.message : error) + ")",
+    );
   }
-  console.log("[gateway-launch] " + line);
+}
+
+function gwarn(line) {
+  glog(line);
+  console.warn("[gateway-launch] " + line);
+}
+
+function gerror(line) {
+  glog(line);
+  console.error("[gateway-launch] " + line);
 }
 
 function readInternalSecret() {
@@ -297,32 +226,6 @@ function readInternalSecret() {
   return "";
 }
 
-// /api/health can remain healthy after a Linux AppImage shell exits while its
-// backend survives under an unmounted /tmp/.mount_* path. Probe the dashboard
-// root too: that request touches the bundled static files and exposes the stale
-// mount as HTTP 500 before Electron decides to reuse the process.
-function checkDashboardRoot(rootUrl = `${BACKEND_URL}/`) {
-  return new Promise((resolve) => {
-    const req = http.get(rootUrl, { timeout: 2000 }, (res) => {
-      res.resume();
-      resolve(res.statusCode < 500);
-    });
-    req.on("error", () => resolve(false));
-    req.on("timeout", () => { req.destroy(); resolve(false); });
-  });
-}
-
-// Ask the OTHER channel app to quit through its normal lifecycle (its
-// before-quit stops its own gateway). Never kill the gateway out from under
-// its shell — the shell's exit watcher would treat that as a crash.
-// Targets by app NAME: both installs share one bundle identifier
-// (com.kirocrew.customapi), so `quit app id` would be ambiguous.
-function quitOtherApp(appName) {
-  return new Promise((resolve) => {
-    if (process.platform !== "darwin") { resolve(false); return; }
-    execFile("osascript", ["-e", `quit app "${appName}"`], { timeout: 10000 }, (err) => resolve(!err));
-  });
-}
 let isQuitting = false;
 let desktopMetricsRecorder = null;
 let windows = null;
@@ -436,6 +339,20 @@ if (!app.requestSingleInstanceLock()) {
     log: glog,
   });
 
+  // Same timing constraint as the opt-in above: a persisted software-rendering
+  // decision has to reach Chromium before it initializes. Also arms the
+  // `child-process-gone` listener that makes that decision, so a GPU process
+  // that dies before the dashboard loads relaunches the app once in software
+  // mode instead of letting Chromium abort it with no window and no log.
+  initGpuCrashFallback({
+    app,
+    store,
+    backendUrl: BACKEND_URL,
+    isQuitting: () => isQuitting,
+    requestQuit,
+    log: glog,
+  });
+
   app.on("second-instance", () => {
     // Relaunch is explicit intent to see the existing window. The window owner
     // cancels a pending fullscreen/tray hide before restore/show/focus.
@@ -462,7 +379,20 @@ const gateway = createGatewaySupervisor({
   cancelPendingTrayHide,
   exitImmersiveModes,
   log: glog,
+  warn: gwarn,
+  error: gerror,
   logPath: gatewayLogPath,
+  // The port a successor re-exec'd from the error dialog will select. That
+  // successor starts with the local-gateway setting on, which is why the
+  // setting is named here rather than read: the store write that turns it on
+  // and this prediction describe the same next process. Running the same pure
+  // function that successor will run is what keeps the two answers identical.
+  // The port the successor will BIND, which is a different question from the
+  // port this launch targets: selection names a crew's port so a live tunnel
+  // there is adopted, and a new gateway must not bind that same port. This
+  // process pins the answer into the successor's environment, so the port it
+  // watches is the port the successor takes.
+  predictLocalPort: () => fallbackLocalPort(store, glog),
 });
 
 windows = createWindowLifecycle({
@@ -472,7 +402,7 @@ windows = createWindowLifecycle({
   port: PORT,
   glog,
   readInternalSecret,
-  fetchLocalToken: (...args) => gateway.fetchLocalToken(...args),
+  mintLocalToken: (...args) => gateway.mintLocalToken(...args),
   fetchRemoteToken: (...args) => gateway.fetchRemoteToken(...args),
   isQuitting: () => isQuitting,
   requestQuit,
@@ -492,149 +422,63 @@ const ipcRegistrar = createIpcRegistrar({
   crashScan: scanCrashArtifacts,
 });
 
-async function resolveGatewayConflict(rebindDepth = 0) {
-  const health = await fetchHealthInfo();
-  // A remote host configured for THIS port means the user deliberately pointed
-  // this app at a gateway on another machine, so the local holder is a tunnel
-  // by construction and there is nothing here to evict.
-  const remoteHost = getRemoteHostConfig(store, PORT)?.host || "";
-  if (remoteHost) {
-    glog(`:${PORT} is a configured remote host (${remoteHost}) — holder treated as non-local`);
-  }
-  const localOwner = remoteHost ? "foreign" : await probeGatewayPortOwner(PORT);
-  const gatewayUsable = remoteHost ? true : await checkDashboardRoot();
-  const decision = decideGatewayAction(app.getVersion(), health, { localOwner, gatewayUsable });
-  if (decision.action === "reuse") {
-    // Adopt-or-wait: the /api/status probe that got us here stays 200 while the
-    // backend DRAINS after POST /api/shutdown, so "answering" is not "serving".
-    // Adopting a draining gateway strands the shell: seconds later the process
-    // exits and nothing ever answers this port again (a relaunch arriving
-    // seconds into a graceful stop reads "reusing existing gateway" and then
-    // goes dark). Only a positive shutting-down verdict refuses; every ambiguity
-    // (legacy gateway, probe failure) keeps the historical adopt behavior.
-    // A configured remote host is exempt: its port-holder is a tunnel by
-    // construction, so "wait for the port to clear, then spawn fresh" can never
-    // apply — adopting and letting the reconnect path wait out the remote
-    // restart is the only correct move there.
-    let adoptedDraining = false;
-    const readiness = remoteHost ? "unknown" : await fetchGatewayReadiness();
-    if (readiness === "shutting-down") {
-      glog(`gateway on :${PORT} answers but /api/ready reports shutting-down — refusing to adopt a draining gateway`);
-      sendStatus("Waiting for the previous gateway to exit…");
-      // Capture the draining process NOW, while it still owns the LISTEN
-      // socket — needed below to wait out its gateway.lock after the port clears.
-      const drainingPids = await snapshotGatewayPortPids(PORT);
-      if (unverifiedIncumbent(drainingPids)) {
-        glog(`drain: could not capture the incumbent PID on :${PORT} — refusing an automatic respawn that could race gateway.lock`);
-        return "probe-failed";
-      }
-      if (await waitForPortFree()) {
-        if (localOwner === "service") {
-          // A SERVICE-classified holder that released its port may be mid-restart
-          // (kirocrew restart bounces the launchd/systemd unit): the manager is
-          // about to respawn it, and spawning now races that rebind — one side
-          // exits with EADDRINUSE. But orphans (reparented to init) classify as
-          // service too and have no manager to respawn them, so don't exempt —
-          // grace-wait: adopt a rebind, spawn only if the port stays free.
-          sendStatus("Waiting for the gateway to restart…");
-          const verdict = await waitForServiceRebind({
-            isPortBound: async () => (await probeGatewayPortOwner(PORT)) !== "none",
-            sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-          });
-          if (verdict === "rebound") {
-            // Whatever re-bound the port has NOT been validated: it could be a
-            // foreign process, a different-family gateway, or another draining
-            // gateway. Do not assert "reuse" — re-run the full decision table
-            // (identity + readiness) against the new holder. Depth-capped: one
-            // re-entry per boot; a second rebind-into-drain falls through to
-            // the adopt-anyway path rather than looping.
-            if (rebindDepth < 1) {
-              glog(`service rebind: :${PORT} re-bound within the grace window — re-validating the new holder`);
-              return resolveGatewayConflict(rebindDepth + 1);
-            }
-            glog(`service rebind: :${PORT} re-bound again at depth ${rebindDepth} — treating as adopt-anyway to avoid a validation loop`);
-          } else {
-            glog(`service rebind: :${PORT} stayed free past the grace window (no manager respawned it) — spawning fresh`);
-          }
-        }
-        if (localOwner !== "service" || (await probeGatewayPortOwner(PORT)) === "none") {
-          // Port free ≠ lock free: wait for the draining process itself to
-          // exit so the replacement is not refused by the singleton lock.
-          await waitForIncumbentExit(drainingPids, "drain");
-          glog(`drain complete: :${PORT} released — spawning a fresh gateway`);
-          return "spawn";
-        }
-      }
-      // The drain is stuck holding the socket past the graceful-stop budget.
-      // Spawning now would only hit EADDRINUSE, and evicting is not ours to do
-      // (we did not spawn this gateway). Adopt as before — loudly — and let the
-      // liveness recovery below handle its eventual death with a bounded wait.
-      glog(`drain wait timed out — :${PORT} still held; adopting anyway (recovery will respawn if it dies)`);
-      adoptedDraining = true;
+
+/**
+ * Fork (Custom API Edition): register the bundled kirocrew-bridge MCP adapter
+ * with OpenCode (~/.config/opencode/opencode.json), copying it to a stable path
+ * so the MCP command survives AppImage remounts.
+ *
+ * H7/bounds: requires explicit consent before touching ~/.config/opencode —
+ * KIROCREW_BRIDGE_CONSENT=1 or the electron-store flag `kirocrewBridgeConsent`.
+ * Without it this returns without touching the filesystem. Never throws.
+ */
+function ensureKirocrewBridgeInstalled() {
+  try {
+    let consented = process.env.KIROCREW_BRIDGE_CONSENT === "1";
+    if (!consented) {
+      try { consented = !!store.get("kirocrewBridgeConsent"); } catch { /* ignore */ }
     }
-    glog(`reusing existing gateway on :${PORT} (${decision.reason}) — bundled backend NOT spawned`);
-    // Reuse path — recovery must not kill/respawn a gateway we don't own. A
-    // same-family gateway held by a local Kiro Crew process is OURS in spirit
-    // even though we didn't spawn it: if it dies, no tunnel will resurrect it,
-    // so recovery may respawn after a bounded wait. Anything less positively
-    // identified (tunnel, no visible owner, probe failure) keeps the
-    // never-respawn external classification ("none").
-    gatewayOwnership = classifyAdoptedGateway({ reason: decision.reason, localOwner });
-    // A gateway we adopted mid-drain is not a success to celebrate: recovery
-    // may immediately retract it. Keep the status neutral for that case.
-    sendStatus(adoptedDraining ? "Connecting to the existing gateway…" : "Gateway already running ✓");
-    return "reuse";
-  }
-  if (decision.action === "restart-local") {
-    glog(`gateway on :${PORT} is locally owned but unusable (${decision.reason}) — restarting it`);
-    const stopped = await forceStopGatewayPort(PORT);
-    if (!stopped.freed) {
-      glog(`local gateway restart failed: :${PORT} is still occupied`);
-      return "abort";
+    if (!consented) return;
+    const fs = require("fs");
+    const resourcesBridge = (() => {
+      try {
+        // Packaged: resources/kirocrew-bridge/index.js
+        const r = path.join(process.resourcesPath, "kirocrew-bridge", "index.js");
+        if (fs.existsSync(r)) return r;
+      } catch { /* ignore */ }
+      try {
+        // Dev: ../../mcp/kirocrew-bridge/dist/index.js
+        const d = path.join(__dirname, "../../mcp/kirocrew-bridge/dist/index.js");
+        if (fs.existsSync(d)) return d;
+      } catch { /* ignore */ }
+      return null;
+    })();
+    if (!resourcesBridge) return;
+    const home = os.homedir();
+    const opencodeConfigPath = path.join(home, ".config", "opencode", "opencode.json");
+    let cfg = {};
+    try { cfg = JSON.parse(fs.readFileSync(opencodeConfigPath, "utf8")); } catch { cfg = {}; }
+    if (!cfg || typeof cfg !== "object") cfg = {};
+    if (!cfg.mcp || typeof cfg.mcp !== "object") cfg.mcp = {};
+    const targetDir = path.join(home, ".config", "opencode", "mcp", "kirocrew-bridge");
+    try { fs.mkdirSync(targetDir, { recursive: true }); } catch { /* ignore */ }
+    const targetIndex = path.join(targetDir, "index.js");
+    try {
+      fs.writeFileSync(targetIndex, fs.readFileSync(resourcesBridge), { mode: 0o755 });
+    } catch { /* ignore */ }
+    const desired = { type: "local", command: ["node", targetIndex], enabled: true };
+    if (JSON.stringify(cfg.mcp["kirocrew-bridge"]) !== JSON.stringify(desired)) {
+      cfg.mcp["kirocrew-bridge"] = desired;
+      try {
+        fs.mkdirSync(path.dirname(opencodeConfigPath), { recursive: true });
+        fs.writeFileSync(opencodeConfigPath, JSON.stringify(cfg, null, 2) + "\n");
+      } catch { /* ignore */ }
     }
-    return "spawn";
+  } catch (e) {
+    try { glog("kirocrew-bridge install failed: " + (e && e.message)); } catch { /* ignore */ }
   }
-  const other = FAMILY_META[decision.otherFamily];
-  glog(`gateway on :${PORT} is owned by ${other.appName} (${decision.otherVersion}) — prompting for takeover`);
-  const canTakeover = process.platform === "darwin";
-  const { response } = await dialog.showMessageBox({
-    type: "warning",
-    title: `${other.displayName} is running`,
-    message: `${other.displayName} (${decision.otherVersion}) is already running with your Kiro Crew data.`,
-    detail: canTakeover
-      ? `Only one Kiro Crew app can use ~/.kiro/crew at a time. Quit ${other.displayName} and continue here?`
-      : `Only one Kiro Crew app can use ~/.kiro/crew at a time. Quit ${other.displayName}, then reopen this app.`,
-    buttons: canTakeover ? [`Quit ${other.displayName} & Continue`, "Cancel"] : ["OK"],
-    defaultId: 0,
-    cancelId: canTakeover ? 1 : 0,
-  });
-  if (!canTakeover || response !== 0) return "abort";
-  sendStatus(`Waiting for ${other.displayName} to quit…`);
-  await quitOtherApp(other.appName);
-  if (!(await waitForPortFree())) {
-    glog(`takeover failed: ${other.appName} did not release :${PORT}`);
-    await dialog.showMessageBox({
-      type: "error",
-      message: `${other.displayName} did not quit.`,
-      detail: "Quit it manually, then relaunch this app.",
-      buttons: ["OK"],
-    });
-    return "abort";
-  }
-  glog(`takeover: ${other.appName} released :${PORT} — proceeding to spawn`);
-  return "spawn";
 }
 
-// Running from a Gatekeeper App Translocation copy, or a read-only disk image,
-// is invisible at launch (all writes already redirect to ~/) but makes the
-// macOS in-place bundle swap useless — electron-updater delegates the install to
-// Squirrel.Mac, whose ShipIt replaces the running .app — so the app would
-// download every release and apply none. Surface it once and offer the
-// one-click move.
-// A /Volumes path alone is NOT enough to condemn: an external disk or network
-// share lives there too and is replaceable, so writability decides.
-// Returns the classified location so the caller can log it. Never throws — a
-// boot-time dialog failure must not reject the whole app.whenReady() chain.
 /**
  * Warn when the running bundle cannot be replaced in place and offer the
  * supported macOS relocation. Never rejects: an updater diagnostic cannot
@@ -708,10 +552,17 @@ async function offerRelocationIfUnupdatable() {
 async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
   // Keep the dashboard established credential order: local secret, explicit
   // SSH host, then a token borrowed from the already-authenticated session.
-  const localValue = await gateway.fetchLocalToken(backendUrl);
+  // Every credential here is delivered to `backendUrl` as written, which is what
+  // keeps the shell on one origin and its renderer on one storage bucket. What
+  // makes that address safe for a locally minted token is the mint's own refusal:
+  // `localhost` names both loopback families, so mintLocalToken() produces
+  // nothing unless this gateway holds every family that host resolves to.
+  const localValue = await gateway.mintLocalToken(backendUrl);
   if (localValue) return { value: localValue, viaCookie: false };
   const { token: remoteValue } = await gateway.fetchRemoteToken(new URL(backendUrl).port);
-  if (remoteValue) return { value: remoteValue, viaCookie: false };
+  if (remoteValue) {
+    return { value: remoteValue, viaCookie: false };
+  }
   const borrowed = await borrowSessionToken({
     electronSession: session.defaultSession,
     backendUrl,
@@ -723,20 +574,24 @@ async function fetchMochiGatewayAuth(backendUrl = BACKEND_URL) {
 // bounded renderer/gateway recovery paths can still run.
 process.on("uncaughtException", (error) => {
   try {
-    glog("uncaughtException: " + (error && error.stack ? error.stack : error));
+    gerror("uncaughtException: " + (error && error.stack ? error.stack : error));
   } catch {
     // Logging must never throw from the safety net.
   }
 });
 process.on("unhandledRejection", (reason) => {
   try {
-    glog("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
+    gerror("unhandledRejection: " + (reason && reason.stack ? reason.stack : reason));
   } catch {
     // Same last-resort rule as uncaughtException.
   }
 });
 
 app.whenReady().then(async () => {
+  // The crash reporter and the keep-alive safety net above are armed; from
+  // here on an exception is recovered, not fatal.
+  releaseEarlyBootGuard();
+
   const frameDecision = windows.platform.linuxFrameDecision;
   if (frameDecision) {
     glog(
@@ -755,92 +610,16 @@ app.whenReady().then(async () => {
     });
     desktopMetricsRecorder.start();
   } catch (error) {
-  } catch (e) {
-    // A diagnostic aid must never take the app down at boot.
-    try { glog(`perf: metrics recorder failed to start: ${e && e.message}`); } catch { /* ignore */ }
-  }
-  try { ensureKirocrewBridgeInstalled(); } catch {}
-  // Running from a mounted DMG or a Gatekeeper App Translocation copy looks
-  // fine at launch but can NEVER install an update (the macOS install path
-  // replaces the running .app in place). Say so once, up front, and offer the
-  // one-click move — otherwise the user silently never receives another release.
-  await offerRelocationIfUnupdatable();
-  // Zoom items are explicit (not `role:`-based) so each zoom change can also
-  // recenter the macOS traffic lights in the zoom-scaled header row.
-  // Resolve the dashboard WebContents of the focused window. The de-tabbed
-  // shell hosts pages in WebContentsViews inside BaseWindows: BaseWindow has
-  // no `webContents`, so menu `role:` items (reload/forceReload) and
-  // BrowserWindow.getFocusedWindow() lookups silently no-op on main windows.
-  // Window-first resolution (focused window -> its content view) is also
-  // deterministic when DevTools has focus, where getFocusedWebContents()
-  // would return the DevTools page itself.
-  const focusedDashboardWC = () => {
-    const win = BaseWindow.getFocusedWindow();
-    if (win) {
-      const views = win.contentView && win.contentView.children;
-      if (views && views.length > 0) {
-        // First view with a real page loaded is the dashboard (works for
-        // localhost AND remote-host connection windows).
-        const mainView = views.find((v) => {
-          try { return !!(v.webContents && v.webContents.getURL()); }
-          catch { return false; }
-        });
-        if (mainView) return mainView.webContents;
-      }
-      if (win.webContents) return win.webContents; // plain BrowserWindow (prompts)
-    }
-    return webContents.getFocusedWebContents();
-  };
-  const zoomItem = (apply) => () => {
-    const wc = webContents.getFocusedWebContents();
-    if (!wc) return;
-    apply(wc);
-    // Chromium applies per-origin zoom to every same-origin window at once,
-    // so recenter traffic lights on all shell windows, not just the focused one.
-    for (const win of BaseWindow.getAllWindows()) {
-      if (win._mcView) positionTrafficLights(win);
-    }
-  };
-  // Menu → dashboard SPA navigation (Settings…, About). Targets the focused
-  // dashboard window, falling back to the main window so the items still work
-  // from the dock/tray-only state; surfaces the window before navigating.
-  // `_mcView` marks every window that hosts a dashboard (setupWindowContents),
-  // which skips modal prompt BrowserWindows that have no SPA to navigate.
-  // Resolve the dashboard WINDOW (not WebContents): the focused one, falling
-  // back to the main window so menu items still work from the dock/tray-only
-  // state. `_mcView` marks every window that hosts a dashboard
-  // (setupWindowContents), which skips modal prompt BrowserWindows.
-  const focusedDashboardWindow = () =>
-    [BaseWindow.getFocusedWindow(), mainWindow].find(
-      (w) => w && !w.isDestroyed() && w._mcView
-    );
-  const openSettingsPage = (tab) => {
-    const win = focusedDashboardWindow();
-    if (!win) return;
-    // The window may be mid deferred-hide (still visible, still focusable);
-    // opening settings on it is a request to keep it, not lose it 2s later.
-    cancelPendingTrayHide(win);
-    if (win.isMinimized()) win.restore();
-    win.show();
-    win.focus();
-    const wc = win._mcView.webContents;
-    if (wc && !wc.isDestroyed()) {
-      wc.send("navigate", tab ? `/settings/${tab}` : "/settings");
-    }
-  };
-  // View > Keep on Top: flip always-on-top on the focused dashboard window,
-  // then reconcile the checkbox with the window's ACTUAL state (read back) so
-  // the checkmark cannot drift if the platform refuses or another code path
-  // changes it. Persisted so the pinned window survives a relaunch.
-  const toggleAlwaysOnTop = () => {
-    const win = focusedDashboardWindow();
-    if (!win) return;
     try {
       glog("perf: metrics recorder failed to start: " + (error && error.message));
     } catch {
       // Ignore a failure in the failure logger.
     }
   }
+
+  // Fork: consent-gated install of the bundled kirocrew-bridge MCP adapter
+  // into OpenCode's config. Never throws.
+  try { ensureKirocrewBridgeInstalled(); } catch { /* ignore */ }
 
   await offerRelocationIfUnupdatable();
 
@@ -870,7 +649,7 @@ app.whenReady().then(async () => {
   try {
     initCrewCompanion({
       backendUrl: BACKEND_URL,
-      fetchLocalToken: (...args) => gateway.fetchLocalToken(...args),
+      mintLocalToken: (...args) => gateway.mintLocalToken(...args),
       glog,
       getDashboardWindow: () => windows.focusedDashboardWindow() || null,
     });

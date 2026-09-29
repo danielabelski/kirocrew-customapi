@@ -35,8 +35,10 @@ import os
 import re
 import tempfile
 import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import AsyncIterator
 
 # Concrete publish providers are NOT imported here. In the public edition no
 # provider is registered (the registry stays empty → get_provider() raises
@@ -47,6 +49,7 @@ from pathlib import Path
 from kiro_crew.artifacts import (
     Artifact,
     ArtifactPublication,
+    ArtifactReplacedError,
     ArtifactValidationError,
     ForkMetadata,
     get_default_store,
@@ -108,7 +111,7 @@ _STANDALONE_THEME_VARS: dict[str, str] = {
 
 # Monotonically increasing revision counter for the wrap_widget_html envelope.
 # Bump this whenever the wrapper's CSP, scripts, or structural HTML changes so
-# that already-published widgets are detected as stale and re-pushed (#3373).
+# that already-published widgets are detected as stale and re-pushed.
 WRAPPER_REVISION: int = 2
 
 # CSP for the published standalone widget document (wrap_widget_html).
@@ -323,8 +326,8 @@ def _redact_untrusted(text: str, source: str) -> str:  # noqa: ARG001
     it reaches an external surface (a publish provider). Per the
     security-controls rule.
 
-    Redaction is UNCONDITIONAL — the ``source`` label is no longer trusted as a
-    bypass (kept for call-site readability). ``source`` is set once at create
+    Redaction is UNCONDITIONAL — the ``source`` label is not a bypass (kept for
+    call-site readability). ``source`` is set once at create
     and is NOT re-derived when an agent later ``update``\\s the artifact's
     content, so a ``manual`` artifact can hold agent/LLM-authored bytes by the
     time it is published; exempting it would let that content reach a provider
@@ -440,17 +443,62 @@ def _publication_summary(pub: ArtifactPublication) -> dict[str, object]:
 #: Same shape as ``_clone_lock`` below, for the same reason: find-then-create is a
 #: non-atomic check-then-act, and the check is what both racers pass.
 #:
-#: Per slug rather than global so unrelated artifacts never wait on each other. Entries
-#: are not evicted -- one small lock per artifact published in this process is cheaper
-#: than freeing a lock another task may be about to take.
+#: Per slug rather than global so unrelated artifacts never wait on each other.
+#:
+#: Taken by ``publication_guard``, whose docstring carries the contract: the publish path
+#: is one taker among several, and a path that destroys an artifact takes it too.
 _publish_locks: dict[str, LoopBoundLock] = {}
+#: How many tasks hold or are waiting for each lock above. The lock is dropped at zero,
+#: which is the only moment at which dropping it excludes nobody.
+_publish_lock_users: dict[str, int] = {}
 _publish_locks_guard = threading.Lock()
 
 
-def _publish_lock(slug: str) -> LoopBoundLock:
-    """The lock guarding one artifact's publish path."""
+@asynccontextmanager
+async def publication_guard(slug: str) -> AsyncIterator[None]:
+    """The lock one artifact's publication state is decided under.
+
+    Every path that reads whether this artifact has a live publication and then ACTS on
+    that reading holds this, not only the publish path. A first publish uploads the
+    object before the record naming it exists, so during that upload the store answers
+    "not published" about content that is already public. A destroy that trusts that
+    answer erases the artifact and leaves the copy served with nothing able to withdraw
+    it, and no later action reaches it.
+
+    Holding this across the destroy is what makes the store's own
+    ``delete(refuse_if_published=True)`` re-read decisive: the record is then either
+    absent because no publish is running, or present because the publish finished, and
+    never absent merely because a publish is halfway through.
+
+    The registry is REFCOUNTED, which is what lets a slug that names no artifact be
+    guarded too. A delete is asked about slugs the store never resolved, so a table that
+    only ever grew would grow with request volume; but the artifact that has to be
+    excluded on such a slug is one CREATED and first-published inside the delete's own
+    window, which is exactly the case a caller cannot pre-resolve. The count is taken
+    before the acquire, so a waiter keeps the entry alive, and the entry is dropped only
+    when nobody holds or waits -- at which point a later caller minting a fresh lock
+    excludes nobody, because there is no holder to exclude.
+
+    Process-local, and per running loop within the process (see :class:`LoopBoundLock`):
+    it excludes concurrent tasks in this gateway, which is where both the publish and the
+    destroy paths run. A publish issued by a separate process is not excluded.
+    """
     with _publish_locks_guard:
-        return _publish_locks.setdefault(slug, LoopBoundLock())
+        lock = _publish_locks.get(slug)
+        if lock is None:
+            lock = _publish_locks[slug] = LoopBoundLock()
+        _publish_lock_users[slug] = _publish_lock_users.get(slug, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        with _publish_locks_guard:
+            remaining = _publish_lock_users.get(slug, 0) - 1
+            if remaining > 0:
+                _publish_lock_users[slug] = remaining
+            else:
+                _publish_lock_users.pop(slug, None)
+                _publish_locks.pop(slug, None)
 
 
 async def publish(
@@ -475,7 +523,7 @@ async def publish(
     ``push_version`` and ``update_sharing`` are the two functions this path calls and
     neither publishes.
     """
-    async with _publish_lock(slug):
+    async with publication_guard(slug):
         return await _publish_unlocked(
             slug,
             visibility=visibility,
@@ -648,7 +696,7 @@ async def push_version(art: Artifact, *, force: bool = False) -> None:
     # stored bytes (e.g. the provider's HTML auto-injection) won't match a
     # locally-computed hash anyway.
     # Also re-push when the wrapper envelope has changed (CSP, CDN scripts) even
-    # if the artifact content version hasn't moved (#3373).
+    # if the artifact content version hasn't moved.
     wrapper_stale = (
         fresh.kind == "widget"
         and WRAPPER_REVISION > (pub.wrapper_revision or 0)
@@ -859,7 +907,30 @@ async def unpublish(slug: str) -> None:
             "The destination did not confirm the removal, so this artifact is still "
             "marked published and the withdrawal can be retried."
         ) from exc
-    await asyncio.to_thread(store.clear_publication, slug)
+    # Pinned to BOTH the generation and the publication read before the withdrawal above,
+    # which is a network round trip. A slug is only a name, the store re-mints a freed one
+    # identically, and this path holds no guard, so by now the slug can hold a different
+    # artifact created and published while the removal was in flight. The generation alone
+    # does not settle it either: re-publishing the SAME artifact replaces the record and
+    # leaves `created_at` untouched, so a second withdrawal in flight would find an
+    # unchanged stamp over a brand-new live copy. Clearing then discards that copy's only
+    # handle and nothing later reaches it. The withdrawal this call asked for did complete,
+    # so neither case is an error here: the record is left alone and the caller is answered
+    # normally.
+    try:
+        await asyncio.to_thread(
+            store.clear_publication,
+            slug,
+            expect_created_at=art.created_at,
+            expect_publication_id=art.publication.artifact_id,
+        )
+    except ArtifactReplacedError:
+        logger.warning(
+            "unpublish: withdrew the copy of %s but left the record alone -- the record "
+            "under that slug names a different artifact or a different copy, so it "
+            "belongs to a publication this call never withdrew",
+            slug,
+        )
     logger.info("artifact unpublished: slug=%s", slug)
 
 
@@ -1070,7 +1141,7 @@ async def delete_for_artifact(art: Artifact) -> DeleteWithdrawal:
     Unlike ``unpublish`` this does NOT touch the local store (the artifact is the
     caller's to delete) and NEVER raises -- provider resolution, the availability
     probe, and the withdrawal call are all inside the guard, so a caller that
-    cannot act on an exception gets a value instead. But it no longer *swallows*
+    cannot act on an exception gets a value instead. But it does not *swallow*
     the distinction: the caller uses the returned outcome to decide whether the
     local delete may proceed.
 
@@ -1294,7 +1365,7 @@ async def upstream_status(slug: str) -> dict[str, object]:
         upstream_ahead = bool(baseline) and bool(remote_hash) and remote_hash != baseline
         local_ahead_live = (
             art.version > pub.last_synced_kirocrew_version
-            # Wrapper envelope changed since last push — widget needs re-render (#3373).
+            # Wrapper envelope changed since last push — widget needs re-render.
             or (art.kind == "widget" and WRAPPER_REVISION > (pub.wrapper_revision or 0))
         )
         base.update(
@@ -1312,7 +1383,7 @@ async def upstream_status(slug: str) -> dict[str, object]:
         and art.publication is not None
         and (
             art.version > art.publication.last_synced_kirocrew_version
-            # Wrapper envelope changed since last push — widget needs re-render (#3373).
+            # Wrapper envelope changed since last push — widget needs re-render.
             or (art.kind == "widget" and WRAPPER_REVISION > (art.publication.wrapper_revision or 0))
         )
     )

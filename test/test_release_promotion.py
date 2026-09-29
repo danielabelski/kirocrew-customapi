@@ -41,6 +41,10 @@ def _bundle(
         "KiroCrew-aarch64.rpm": b"rpm-arm64",
         "notarized.zip": b"mac-zip",
         "KiroCrew.dmg": b"dmg",
+        "notarized-arm64.zip": b"mac-zip-arm64",
+        "KiroCrew-arm64.dmg": b"dmg-arm64",
+        "notarized-x64.zip": b"mac-zip-x64",
+        "KiroCrew-x64.dmg": b"dmg-x64",
     }
     for name in omit:
         del files[name]
@@ -86,6 +90,10 @@ def test_manifest_round_trip_binds_source_and_every_shipping_file(tmp_path: Path
         "rpm_arm64",
         "mac_zip",
         "dmg",
+        "mac_zip_arm64",
+        "dmg_arm64",
+        "mac_zip_x64",
+        "dmg_x64",
     }
     assert manifest["docker"]["digest"] == IMAGE_DIGEST
     for entry in manifest["artifacts"].values():
@@ -330,7 +338,12 @@ def test_archive_path_traversal_is_rejected(tmp_path: Path) -> None:
         promotion.extract_verified_archive(archive, tmp_path / "resolved", expected_digest=digest)
 
 
-MAC_ROLES = {"mac_zip", "dmg"}
+MAC_ROLES = {"mac_zip", "dmg", "mac_zip_arm64", "dmg_arm64", "mac_zip_x64", "dmg_x64"}
+MAC_FILES = frozenset({
+    "notarized.zip", "KiroCrew.dmg",
+    "notarized-arm64.zip", "KiroCrew-arm64.dmg",
+    "notarized-x64.zip", "KiroCrew-x64.dmg",
+})
 WINDOWS_ROLES = {
     "KiroCrew-Setup.exe": b"nsis-installer",
     "KiroCrew-Setup.exe.blockmap": b"blockmap",
@@ -355,11 +368,18 @@ def test_a_candidate_without_macos_is_still_promotable(tmp_path: Path) -> None:
     # infrastructure), and unsigned app bytes must never be recorded under the
     # mac roles -- stable promotion would republish them as verified. A run
     # with no gated artifact records a mac-less candidate instead.
-    bundle = _bundle(tmp_path / "bundle", omit=frozenset({"notarized.zip", "KiroCrew.dmg"}))
+    bundle = _bundle(tmp_path / "bundle", omit=MAC_FILES)
     manifest = promotion.verify_bundle(bundle, expected_source_sha=SOURCE_SHA)
     assert set(manifest["artifacts"]) == set(promotion.REQUIRED_ARTIFACT_NAMES)
-    assert "dmg" not in manifest["artifacts"]
-    assert "mac_zip" not in manifest["artifacts"]
+    assert not MAC_ROLES & set(manifest["artifacts"])
+
+
+@pytest.mark.parametrize("dropped", sorted(MAC_FILES))
+def test_part_of_the_macos_group_is_refused(tmp_path: Path, dropped: str) -> None:
+    # The six macOS roles come from one gated notarize fan-out; promoting part
+    # of it would advance some installs and strand the rest.
+    with pytest.raises(promotion.PromotionError, match="promoted together or not at all"):
+        _bundle(tmp_path / "bundle", omit=frozenset({dropped}))
 
 
 def test_a_candidate_with_windows_promotes_the_installer_and_its_blockmap(

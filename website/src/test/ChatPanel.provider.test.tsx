@@ -5,6 +5,8 @@ vi.mock('@radix-ui/react-select', async () => await import('./__mocks__/@radix-u
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
+import { Provider } from 'react-redux'
 import React from 'react'
 
 const { patchConfigMock, kirocrewConfigMock, modelsMock } = vi.hoisted(() => ({
@@ -28,10 +30,18 @@ vi.mock('../api/client', () => ({
 }))
 
 import { ChatPanel } from '../pages/settings/ChatPanel'
+import { createTestStore } from './helpers'
 
+// The Provider section is its own Settings ▸ Chat rail page.
 function wrap(ui: React.ReactElement) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={qc}>{ui}</QueryClientProvider>)
+  return render(
+    <MemoryRouter initialEntries={['/settings/chat/provider']}>
+      <Provider store={createTestStore()}>
+        <QueryClientProvider client={qc}>{ui}</QueryClientProvider>
+      </Provider>
+    </MemoryRouter>,
+  )
 }
 
 const seed = (agent: Record<string, unknown>) =>
@@ -46,7 +56,7 @@ async function openSelect(label: string) {
 
 describe('ChatPanel Provider section', () => {
   it('renders the three backends with their format subheaders', async () => {
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel basePath="/settings" />)
     const claude = await screen.findByRole('button', { name: /Claude Code/i })
     expect(claude.textContent).toContain('anthropic endpoint')
     expect(screen.getByRole('button', { name: /OpenCode/i }).textContent).toContain('OpenAI-compatible endpoint')
@@ -56,7 +66,7 @@ describe('ChatPanel Provider section', () => {
   it('prefills the URL from a preset and saves provider fields', async () => {
     seed({ provider: 'claude_code', provider_base_url: '', provider_api_key: '', model: 'auto' })
     patchConfigMock.mockClear()
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel basePath="/settings" />)
 
     // Switch to OpenCode backend.
     fireEvent.click(await screen.findByRole('button', { name: /OpenCode/i }))
@@ -82,7 +92,7 @@ describe('ChatPanel Provider section', () => {
 
   it('shows a saved-key placeholder instead of the real key', async () => {
     seed({ provider: 'claude_code', provider_base_url: 'http://localhost:8317', provider_api_key: 'sk-stored', model: 'auto' })
-    wrap(<ChatPanel />)
+    wrap(<ChatPanel basePath="/settings" />)
     const keyInput = await screen.findByLabelText('API key') as HTMLInputElement
     expect(keyInput.value).toBe('')
     expect(keyInput.placeholder).toContain('saved')

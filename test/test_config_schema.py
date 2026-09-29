@@ -71,7 +71,11 @@ def _all_fields_recursive(
         result.append((path, f))
         tp = f.type
         if isinstance(tp, str):
-            import kiro_crew.config.loader as _mod
+            # Evaluate in the DEFINING module's namespace (standard
+            # get_type_hints semantics): the section dataclasses live in
+            # sections.py, and the loader facade's re-export list is frozen, so
+            # a post-split type is resolvable only where it is defined.
+            import kiro_crew.config.sections as _mod
 
             try:
                 tp = eval(tp, vars(_mod))  # noqa: S307
@@ -105,7 +109,8 @@ def _all_fields_recursive(
 
 def _resolve_type(f: dataclasses.Field) -> type:  # type: ignore[type-arg]
     """Resolve a field's type annotation to a runtime type."""
-    import kiro_crew.config.loader as _mod
+    # Same defining-module namespace as _all_fields_recursive above.
+    import kiro_crew.config.sections as _mod
 
     tp = f.type
     if isinstance(tp, str):
@@ -254,14 +259,22 @@ class TestConfigSchemaProperties:
             origin = typing.get_origin(tp)
             if origin is list or origin is dict:
                 reachable_paths.add(f"{path}.*")
+
             # A dict field may declare known sub-keys via _meta(...,
             # properties={...}); those flatten into first-class entries
             # (see TestDeclaredDictProperties) and are reachable by
-            # construction from the field's own metadata.
-            declared = (f.metadata or {}).get("properties")
-            if isinstance(declared, dict):
-                for key in declared:
-                    reachable_paths.add(f"{path}.{key}")
+            # construction from the field's own metadata. A declared node may
+            # itself be an object with declared properties (the flattener
+            # recurses `properties` at every depth), so walk them the same way.
+            def _add_declared(prefix: str, props: object) -> None:
+                if not isinstance(props, dict):
+                    return
+                for key, node in props.items():
+                    reachable_paths.add(f"{prefix}.{key}")
+                    if isinstance(node, dict):
+                        _add_declared(f"{prefix}.{key}", node.get("properties"))
+
+            _add_declared(path, (f.metadata or {}).get("properties"))
 
         assert len(SCHEMA_REGISTRY) > 0, "Registry should not be empty"
 
@@ -477,16 +490,38 @@ class TestDeclaredDictProperties:
         assert "shell" in node.get("properties", {})
 
     def test_declared_key_type_violation_keeps_value_and_dict(self) -> None:
-        # B5 fix: _apply_field_default now recurses to depth, walks
-        # additionalProperties/items, warns on non-dict and strips by key
-        # presence (H7). A violating declared 3-level sub-key is therefore
-        # removed so the loader falls back to its default, and the warning
-        # says "using default".
+        # _apply_field_default is deliberately depth-capped (deeper paths
+        # reach dict-field values the loader tolerates — see its docstring),
+        # so a violating declared 3-level sub-key is retained: the warning
+        # says "value kept", the surrounding dict survives untouched, and the
+        # value is re-validated by its consumer (_resolve_shell coerces and
+        # rejects at spawn time).
         from kiro_crew.config.validation import validate_config_data
 
         data = {"dashboard": {"terminal": {"enabled": True, "shell": 123}}}
         validate_config_data(data)
-        assert data["dashboard"]["terminal"] == {"enabled": True}
+        assert data["dashboard"]["terminal"] == {"enabled": True, "shell": 123}
+
+    def test_completion_enabled_is_first_class_entry(self) -> None:
+        # The Settings toggle references it by configKey, and the generated
+        # settings registry is drift-checked against SCHEMA_REGISTRY.
+        index = {e.path: e for e in SCHEMA_REGISTRY}
+        entry = index.get("dashboard.terminal.completion.enabled")
+        assert entry is not None, "nested declared sub-key did not flatten"
+        assert entry.type == "boolean"
+        assert entry.default_value is True
+
+    def test_completion_dict_stays_open_for_undeclared_keys(self) -> None:
+        # `completion.commands` (the subcommand-probe allowlist) is documented
+        # and undeclared; declaring `enabled` must not invalidate it.
+        from kiro_crew.config.validation import validate_config_data
+
+        node = JSON_SCHEMA["properties"]["dashboard"]["properties"]["terminal"]
+        completion = node["properties"]["completion"]
+        assert completion.get("additionalProperties") is True
+        data = {"dashboard": {"terminal": {"completion": {"enabled": False, "commands": ["gh"]}}}}
+        validate_config_data(data)
+        assert data["dashboard"]["terminal"]["completion"] == {"enabled": False, "commands": ["gh"]}
 
 
 class TestAgentWorkspaceBindingsSchema:

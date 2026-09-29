@@ -1,9 +1,9 @@
 """``MAX_STAGE_ROUNDS`` must stop a dashboard plan.
 
 ``OrchestrationTracker.record_round()`` returns whether the stage has spent its
-round budget, and the dashboard's ``_stage_loop`` recorded the round and threw the
-answer away — so the "max 3 rounds per stage" the orchestrator prompt promises
-enforced nothing on the dashboard path (issue #1783).
+round budget, and the dashboard's ``_stage_loop`` must act on that answer rather than discard
+it — otherwise the "max 3 rounds per stage" the orchestrator prompt promises
+enforces nothing on the dashboard path.
 
 Where the rounds come from matters for what has to be tested. Every round is
 recorded by the subagent-completion handler, against ``tracker.current_stage`` as
@@ -14,8 +14,8 @@ records those rounds the same way the gateway does.
 The loop does NOT record one. It enters a stage through ``start_stage``, which
 registers the stage and starts its clock but spends no round, so all three the
 prompt promises are available to actual waves. Entering through ``record_round``
-(which is what the loop used to do, for the side effects rather than the count)
-made the enforced cap 2 waves on this path and 3 on the Slack path — stricter than
+(for the side effects rather than the count) would make the enforced cap 2 waves
+on this path and 3 on the Slack path — stricter than
 the promise, and inconsistent between the two. That is what
 ``test_two_waves_per_stage_is_still_under_the_cap`` guards.
 
@@ -44,12 +44,22 @@ def _isolate_config_dir(tmp_path, monkeypatch):
         monkeypatch.setattr(f"kiro_crew.dashboard.{module}.config_dir", lambda: tmp_path)
 
 
+class _StageManager:
+    def running_agents_for(self, _parent: str) -> list[dict]:
+        return []
+
+    async def has_pending_work_for_async(self, _parent: str) -> bool:
+        return False
+
+    async def wait_for_parent_reports(self, _parent: str, _owner: str = "") -> bool:
+        return False
+
+
 def _make_state():
     state = MagicMock()
     state.broadcast_ws = MagicMock()
     state.push_slots_update = MagicMock()
-    state.subagents = MagicMock()
-    state.subagents.running_agents_for = MagicMock(return_value=[])
+    state.subagents = _StageManager()
     return state
 
 
@@ -74,6 +84,9 @@ def _stage_turns(monkeypatch, *, extra_rounds_per_stage=0, texts=None):
     box = {"n": 0}
 
     async def _mock_run_chat(state, slot, message, **kwargs):
+        callback = kwargs.get("_on_consumed")
+        if callable(callback):
+            callback(True)
         idx = box["n"]
         box["n"] += 1
         body = (texts or [])[idx] if texts and idx < len(texts) else f"stage {idx + 1} output"

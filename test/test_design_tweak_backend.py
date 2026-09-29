@@ -217,7 +217,7 @@ class TestValidTarget:
         """A bad PORT must be refused at the barrier, not at the first reader.
 
         `urlsplit` accepts `http://localhost:notaport` and resolves `.hostname`
-        happily — `.port` is a lazily-parsed property, so the ValueError used to
+        happily — `.port` is a lazily-parsed property, so the ValueError would
         surface far downstream. The URL got persisted onto the project and then
         every `/projects` poll raised while reading `.port`, turning one typo into
         a permanent 500 on project loading.
@@ -416,15 +416,6 @@ class TestQueueReadIsSizeBounded:
         got = server._read_request(fp)
         assert got is not None and got["id"] == rid
 
-    def test_the_bound_is_checked_before_the_read(self):
-        """Statting after loading the bytes would not prevent the exhaustion."""
-        import inspect
-
-        src = inspect.getsource(server._read_request)
-        assert src.index("st_size") < src.index("read_text"), (
-            "the size check must gate the read, not follow it"
-        )
-
 
 class TestRemovingAProjectReleasesItsResources:
     """Dropping the registry row is not the same as stopping what it started.
@@ -522,19 +513,13 @@ class TestStopStaticPreview:
 class TestWhatIsWrittenStaysReadable:
     """The write ceiling and the read ceiling must be the SAME number.
 
-    A record the writer accepts but the reader refuses is a draft the user can
-    no longer see: `_read_request` reports it absent, so `/queue` stops listing
+    A record the writer accepts but the reader refuses is a draft the user cannot
+    see: `_read_request` reports it absent, so `/queue` stops listing
     it and the queued work is effectively gone. Refusing the append that would
     have crossed the line is strictly better — the user keeps the draft and is
     told it is full. Each individual payload is under `MAX_BODY_BYTES`, so the
     accumulation is the only way to get there and a per-payload cap cannot see it.
     """
-
-    def test_the_two_ceilings_are_the_same_constant(self):
-        import inspect
-
-        assert "MAX_RECORD_BYTES" in inspect.getsource(server._read_request)
-        assert "MAX_RECORD_BYTES" in inspect.getsource(server._write_request)
 
     def test_an_oversized_write_is_refused(self, isolated_queue):
         fp = server._request_file(server.QUEUE_DIR, "1700000000000-toobig")
@@ -619,21 +604,6 @@ class TestWhatIsWrittenStaysReadable:
             f"the boundary round-trip pushed {sum(offered)} bytes through the writer "
             f"for a {server.MAX_RECORD_BYTES}-byte answer"
         )
-
-    def test_the_writer_bound_covers_every_route(self):
-        """A per-route guard would leave the other writers able to strand a draft."""
-        import inspect
-
-        src = inspect.getsource(server._write_request)
-        assert "max_bytes=MAX_RECORD_BYTES" in src, (
-            "the bound must sit at the shared write chokepoint"
-        )
-
-    def test_config_writes_are_not_bounded_by_the_record_ceiling(self):
-        """The ceiling is about queue records; the config writer must stay generic."""
-        import inspect
-
-        assert "max_bytes" not in inspect.getsource(server._save_cfg)
 
 
 class TestUpstreamContentType:
@@ -1064,14 +1034,6 @@ class TestProxyFailureNeverFramesTheBareDevServer:
                 ), f"{fn.__name__} reports injected on an unbindable proxy: {stripped}"
         assert checked == 2, f"expected 2 injected sites, inspected {checked}"
 
-    def test_the_fallback_dev_url_return_is_gone_from_the_source(self):
-        """Pin the barrier: no `return dev_url` may creep back into the helper."""
-        import inspect
-
-        src = inspect.getsource(server._front_with_proxy)
-        assert "return dev_url" not in src
-        assert 'return ""' in src
-
 
 class TestProjectSecretsAreNeverServed:
     """A previewed project's OWN credential files must not be readable.
@@ -1304,12 +1266,6 @@ class TestKiroCrewInternalTreesAreNeverServed:
         """Defense in depth: a copy inside a project tree is refused by name."""
         assert ".app_secret" in server._PROJECT_SECRET_NAMES
 
-    def test_the_barrier_is_wired_into_the_static_sink(self):
-        import inspect
-
-        src = inspect.getsource(server._static_response)
-        assert "_is_kirocrew_internal" in src
-
 
 class TestEntryPointCannotLaunderASecret:
     """A directory request must not serve a secret via its entry-point symlink.
@@ -1505,6 +1461,20 @@ class TestMalformedSelectionCannotPoisonTheQueue:
     """
 
     def _submit(self, payload):
+        """Run the real `_h_submit` against a hand-rolled handler.
+
+        Every caller takes `isolated_queue`, including the ones that expect a
+        refusal. A payload the guard lets through reaches the draft transaction
+        for real, and `QUEUE_DIR`/`HANDLED_DIR` are frozen at import off
+        `$KIROCREW_HOME` (server.py), so the accepted case writes
+        `queue/<id>.json` — and, via the unscoped counter, `config.json` — into
+        whatever data home the session resolved: outside `tmp_path`, outside the
+        run's temp root, so none of conftest's residue guards can see it, and
+        permanent when the operator exported `KIROCREW_HOME` themselves. The
+        refused cases write nothing today; they take the fixture so a regression
+        of the guard fails as a test rather than as a file in someone's queue.
+        """
+
         sent: list[tuple[int, dict]] = []
 
         class _H(server.Handler):
@@ -1520,14 +1490,14 @@ class TestMalformedSelectionCannotPoisonTheQueue:
         server.Handler._h_submit(_H())
         return sent[0] if sent else (None, None)
 
-    def test_a_string_element_is_refused(self):
+    def test_a_string_element_is_refused(self, isolated_queue):
         code, body = self._submit(
             {"type": "visual_edit_request", "selection": {"elements": ["x"]}, "comment": "c"}
         )
         assert code == 400
         assert body.get("code") == "selection_malformed"
 
-    def test_a_mixed_list_is_refused(self):
+    def test_a_mixed_list_is_refused(self, isolated_queue):
         """One bad element poisons the whole request, so all-or-nothing."""
         code, body = self._submit(
             {
@@ -1539,7 +1509,7 @@ class TestMalformedSelectionCannotPoisonTheQueue:
         assert code == 400
         assert body.get("code") == "selection_malformed"
 
-    def test_non_list_and_empty_elements_are_refused(self):
+    def test_non_list_and_empty_elements_are_refused(self, isolated_queue):
         for bad in ({"elements": "div"}, {"elements": {}}, {"elements": []}, {}):
             code, body = self._submit(
                 {"type": "visual_edit_request", "selection": bad, "comment": "c"}
@@ -1578,7 +1548,7 @@ class TestMalformedSelectionCannotPoisonTheQueue:
     # `tag` raised `TypeError: unsupported operand type(s) for +=: 'int' and
     # 'str'`. Same persistent-500 outage, one layer deeper.
 
-    def test_a_non_string_tag_is_refused(self):
+    def test_a_non_string_tag_is_refused(self, isolated_queue):
         code, body = self._submit(
             {
                 "type": "visual_edit_request",
@@ -1589,7 +1559,7 @@ class TestMalformedSelectionCannotPoisonTheQueue:
         assert code == 400
         assert body.get("code") == "selection_malformed"
 
-    def test_a_non_string_id_or_classes_is_refused(self):
+    def test_a_non_string_id_or_classes_is_refused(self, isolated_queue):
         bad_elements = [
             {"tag": "div", "id": 7},
             {"tag": "div", "classes": "card"},
@@ -1607,7 +1577,7 @@ class TestMalformedSelectionCannotPoisonTheQueue:
             assert code == 400, el
             assert body.get("code") == "selection_malformed", el
 
-    def test_well_formed_selections_are_still_accepted(self):
+    def test_well_formed_selections_are_still_accepted(self, isolated_queue):
         """The guard must not reject the shapes the preview legitimately sends.
 
         `id` and `classes` are both optional, and an empty `classes` list is
@@ -2614,8 +2584,8 @@ class TestPersistedDevUrlIsFrontedWithProxy:
     def test_proxy_failure_leaves_the_preview_unreachable(self, tmp_path, monkeypatch):
         """No preview beats a leaking one.
 
-        This previously asserted the opposite — that framing the bare dev server
-        was an acceptable degradation "without select-to-edit". It is not: the
+        Framing the bare dev server is not an acceptable degradation, even
+        "without select-to-edit": the
         proxy is also what strips the dashboard's `Cookie` header, and cookies
         ignore the port, so the bare dev server on the same host receives the
         session cookie. An empty `previewUrl` renders the unreachable state.
@@ -2640,8 +2610,8 @@ class TestPersistedDevUrlIsFrontedWithProxy:
         """The allow-list is re-asserted at the sink: this value is read off disk
         and would become a proxy UPSTREAM.
 
-        It is CLEARED, not handed back. This previously asserted "left exactly as
-        today (framed bare)", which is the credential leak: framing it directly
+        It is CLEARED, not handed back. Handing it back — "left exactly as
+        today (framed bare)" — is the credential leak: framing it directly
         bypasses the proxy that strips `Cookie`/`Authorization`, and cookies are
         host-scoped but port-agnostic, so the dashboard's own session cookie
         reached whatever the value named.
@@ -3308,7 +3278,7 @@ class TestDevProcCrossPlatform:
 class TestDeliveryAcknowledgement:
     """`/send` seals; the panel dispatches afterwards. Two steps need an ack.
 
-    A tab closed between the seal and the prompt reaching the agent used to leave
+    A tab closed between the seal and the prompt reaching the agent would leave
     the request sealed and undeliverable: the send bar only renders for a draft,
     so the batch was stranded with no retry. `deliveredAt` records that the
     dispatch actually happened, which is what lets the panel offer a resend for

@@ -31,20 +31,34 @@ import json
 import io
 import logging
 import os
-import re
 from pathlib import Path
 
 from kiro_crew.hooks import is_unc_shape, safe_read_file_bytes, unc_probe_allowed
 
+# The path grammar and the history scrubber live in the LEAF module
+# kiro_crew.image_refs for the same reason the Pillow machinery lives in
+# kiro_crew.imaging: kiro_crew.context needs the scrubber and the
+# agent-sdk-boundary gate forbids application code from importing
+# kiro_crew.acp. The pattern names are re-exported because this module and
+# its tests are where they have always been read from.
+from kiro_crew.image_refs import (  # noqa: F401 -- re-exported, see comment
+    _PATH_RE,
+    _POSIX_PATH_RE,
+    _WINDOWS_PATH_RE,
+    STRIPPED_IMAGE_MARKER,
+    strip_image_refs,
+)
+
 # The budget constants and Pillow machinery live in the LEAF module
 # kiro_crew.imaging (shared with the gateway's tool-result rewrite, which must
 # not import the ACP package). The two constants are re-exported because this
-# module is where the prompt path's callers and tests historically found them.
+# module is where the prompt path's callers and tests import them from.
 from kiro_crew.imaging import (  # noqa: F401 -- constants re-exported, see comment
     MAX_IMAGE_B64_BYTES,
     MAX_IMAGE_EDGE_PX,
     downscale_image_block,
 )
+from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform_compat import first_linked_ancestor, is_link_or_junction
 
 logger = logging.getLogger(__name__)
@@ -67,99 +81,22 @@ IMAGE_MEDIA_TYPES: dict[str, str] = {
 #: a file that passed ingestion is not silently dropped here.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
-#: Longest-edge cap (px) enforced on every inlined image. Anthropic rejects the
-#: ENTIRE request when a many-image conversation (more than 20 images) carries
-#: any image whose width or height exceeds 2000px. Because kiro-cli replays the
-#: full message history to the model every turn, a single oversized image
-#: permanently wedges the session -- the offending block sits at a fixed history
-#: index and re-uploading a smaller copy cannot evict it. This builder is the
-#: one funnel every channel's images cross before reaching kiro-cli, so capping
-
-#: Longest base64-encoded payload (bytes) allowed for a single inlined image.
-#: The dimension cap above is not sufficient: a raster can sit well inside 2000px
-#: and still encode past the backend's per-image byte ceiling.
-#:
-#: 5 MiB is the value the backend itself reports. It is not derived from which
-#: provider kiro-cli happens to route through, which we treat as opaque, but read
-#: straight out of its rejection, which names the limit in bytes:
-#:
-#:     image exceeds 5 MB maximum: 6714372 bytes > 5242880
-#:
-#: 5242880 is exactly 5 * 1024 * 1024. (Anthropic's published per-image ceiling
-#: for Bedrock and Google Cloud agrees, which is corroboration rather than the
-#: basis.) base64 inflates by 4/3, so a ~3.9 MiB raster already exceeds it while
-#: passing every pre-encode check.
-#:
-#: Note this is a DIFFERENT quantity from the limit kiro-cli documents. Its docs
-#: state "images must be under 10MB in size" -- a FILE-size rule, which
-#: ``MAX_IMAGE_BYTES`` implements -- and say nothing about the encoded payload.
-#: Both hold at once: a 5.04 MiB file is under 10 MB yet encodes to 6.71 MiB and
-#: is refused. So the encoded ceiling is undocumented but enforced, which is why
-#: it has to be observed rather than looked up.
-#:
-#: Being wrong here is safe in one direction only, which is why the cap is set to
-#: the observed value rather than a guess: too LOW merely ships a smaller image,
-#: while too HIGH ships a payload the backend refuses. Callers can override it
-#: via ``build_prompt_blocks(max_image_b64_bytes=...)`` if a backend ever reports
-#: a different number.
-#:
-#: Per-attempt edge multiplier and attempt cap for the encoded-budget shrink.
-#: Encoded size falls roughly with area, so 0.8 on the edge sheds ~36% per pass
-#: and 6 passes span a 4x linear reduction -- enough to bring any image that the
-#: dimension cap admitted under a 5 MiB encoding.
-_ENCODE_SHRINK_FACTOR = 0.8
-_MAX_ENCODE_ATTEMPTS = 6
-
-#: mime -> Pillow save format for a re-encoded downscale. GIF collapses to a PNG
-#: first frame: vision models read frame 0 only (animation is invisible to them)
-#: and rescaling a palette image is lossy, so a lossless still is faithful.
-_PIL_SAVE_FORMAT: dict[str, str] = {
-    "image/png": "PNG",
-    "image/jpeg": "JPEG",
-    "image/webp": "WEBP",
-    "image/bmp": "BMP",
-    "image/gif": "PNG",
-}
-
-#: Formats every major vision provider accepts natively. Anything outside this
-#: set (AVIF, HEIC, TIFF, ICO, …) has to be transcoded to PNG before it is
-#: inlined, or the backend returns 400 "Could not process image". Mirrors the
-#: wire contract in docs/reference/kiro-cli/acp.md.
+#: Formats every major vision provider accepts natively. A raster the upstream
+#: sniffer recognises outside this set (BMP) is transcoded to PNG before it is
+#: inlined, so the backend never sees BMP.
 _UNIVERSALLY_SUPPORTED_MIMES: frozenset[str] = frozenset(
-    # BMP is intentionally absent: it is sniffed but transcoded to PNG (Pillow
-    # opens it, the backend never sees BMP).
     {"image/png", "image/jpeg", "image/gif", "image/webp"}
 )
 
 
-def _sniff_mime_from_bytes(raw: bytes) -> str | None:
-    """Detect image MIME from magic bytes, or None when unrecognized.
+def _sniff_exotic_mime(raw: bytes) -> str | None:
+    """Detect raster formats :func:`sniff_raster_mime` does not know.
 
-    Filename-suffix detection is unreliable when a channel lies about
-    content-type — Discord serves proxied/animated stickers, custom-emoji
-    previews and some bot uploads as PNG bytes with ``content_type=image/webp``,
-    and Anthropic strictly validates that the declared media type matches the
-    actual bytes (HTTP 400 on mismatch). The suffix is only a fallback; the
-    bytes are authoritative.
+    Channels sometimes serve bytes under a misleading suffix (Discord proxies
+    stickers/emoji as ``.png``/``.webp`` whose bytes are AVIF/HEIC/TIFF/ICO).
+    Those are recognised here so they can be transcoded to PNG instead of
+    being left as a text path. Returns ``None`` for anything else.
     """
-    if not raw:
-        return None
-    # PNG: 89 50 4E 47 0D 0A 1A 0A
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    # JPEG: FF D8 FF
-    if raw.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    # GIF87a / GIF89a
-    if raw[:6] in {b"GIF87a", b"GIF89a"}:
-        return "image/gif"
-    # WEBP: "RIFF" .... "WEBP"
-    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        return "image/webp"
-    # BMP: "BM"
-    if raw.startswith(b"BM"):
-        return "image/bmp"
-    # ISO-BMFF family (HEIC/HEIF/AVIF): bytes 4..8 == 'ftyp', major brand at 8..12
     if len(raw) >= 12 and raw[4:8] == b"ftyp":
         brand = raw[8:12]
         if brand in {b"avif", b"avis"}:
@@ -169,35 +106,25 @@ def _sniff_mime_from_bytes(raw: bytes) -> str | None:
             b"mif1", b"msf1", b"heim", b"heis",
         }:
             return "image/heic"
-    # TIFF: II*\0 (little-endian) or MM\0* (big-endian)
     if raw[:4] in {b"II*\x00", b"MM\x00*"}:
         return "image/tiff"
-    # ICO: 00 00 01 00 (reserved=0, type=1=icon)
     if raw[:4] == b"\x00\x00\x01\x00":
         return "image/x-icon"
-    # SVG: text-based, look for an <svg tag near the start (skip BOM/whitespace)
-    head = raw[:512].lstrip().lower()
-    if head.startswith(b"<?xml") or head.startswith(b"<svg"):
-        if b"<svg" in head:
-            return "image/svg+xml"
     return None
 
 
 def _transcode_to_png(raw: bytes, mime: str) -> bytes | None:
     """Decode *raw* with Pillow and re-encode as PNG.
 
-    Used for formats outside :data:`_UNIVERSALLY_SUPPORTED_MIMES` — AVIF/HEIC
-    (needs an optional Pillow plugin), TIFF, ICO, BMP. Returns None when Pillow
-    is missing, cannot decode the bytes, or the format is a vector (SVG), so
-    the caller fails CLOSED (keeps the suffix as text) rather than shipping a
-    payload the backend refuses.
+    Used for formats outside :data:`_UNIVERSALLY_SUPPORTED_MIMES` -- BMP, and
+    AVIF/HEIC (optional Pillow plugin), TIFF, ICO. Returns None when Pillow is
+    missing or cannot decode the bytes, so the caller fails CLOSED (keeps the
+    path as text) rather than shipping a payload the backend refuses.
     """
     try:
         from PIL import Image
 
         with Image.open(io.BytesIO(raw)) as img:
-            # Transparency is preserved where the source had it; a source with
-            # no alpha stays in a compact mode instead of being forced to RGBA.
             src = img.convert("RGBA") if img.mode not in {"RGB", "RGBA", "L", "LA", "P"} else img
             buf = io.BytesIO()
             src.save(buf, format="PNG", optimize=False)
@@ -207,69 +134,6 @@ def _transcode_to_png(raw: bytes, mime: str) -> bytes | None:
             "acp prompt: could not transcode %s to PNG; leaving as path", mime, exc_info=True
         )
         return None
-
-
-# Absolute paths ending in a supported raster suffix.
-#
-# Two properties are load-bearing, and BOTH were learned from real defects:
-#
-# 1. The quantifier is non-greedy. A greedy `+` swallows the separator between
-#    two paths, so "/tmp/a.png and /tmp/b.png" matched as ONE span ending at the
-#    final ".png" -- not a file, so every image in a multi-image message was
-#    dropped.
-#
-# 2. The character class holds HORIZONTAL whitespace only, and a lookbehind
-#    forbids starting inside a URL or another path. With `\s` (which includes
-#    "\n") a leading URL chained across the newline into the appended path:
-#    `slack/events.py` emits "<user text>\n<image path>", so
-#
-#        see https://example.com/docs\n/tmp/a.png
-#
-#    matched as "//example.com/docs\n/tmp/a.png" -- one nonexistent path. Any
-#    Slack message containing a link therefore lost its image. The `(?<![\w:/])`
-#    guard rejects the "/" inside "https://" as a start position, which also
-#    stops a URL that merely ends in ".png" from being probed as a local file.
-_SUFFIX_GROUP = r"(?:png|jpg|jpeg|gif|webp|bmp)"
-
-#: Space and tab only -- NEVER `\s`. See note 2 above.
-_PATH_CHARS = r"[\w./@~ \t()\-]"
-
-#: Must not begin mid-token: rules out "https://host/..." and a "/" that is
-#: already part of a longer path.
-_NOT_MID_TOKEN = r"(?<![\w:/])"
-
-_POSIX_PATH_RE = re.compile(
-    rf"{_NOT_MID_TOKEN}(/{_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
-    re.IGNORECASE,
-)
-
-# Windows absolute paths: a drive letter ("C:\...", "C:/...") or a UNC share
-# ("\\\\host\\share\\..."). Temp attachments land in %LOCALAPPDATA%\Temp and
-# dashboard uploads in %USERPROFILE%\.kiro\crew\uploads, so on Windows the
-# POSIX grammar matched NOTHING and every image stayed prose -- then the temp
-# file was deleted at end of turn, leaving a dead reference.
-#
-# Platform-gated rather than merged into one pattern: backslash and ":" are
-# legal in POSIX filenames, so accepting Windows shapes everywhere makes prose
-# like `the path C:\docs\logo.png is an example` a candidate -- and on Linux a
-# file with that literal name can exist in the CWD, which would inline a file
-# the user only mentioned. Matching the host's own grammar keeps that impossible.
-#
-# The UNC alternative accepts both separators after the leading pair
-# (``\\host\share\...`` and ``//host/share/...``): the dashboard composer
-# serializes image attachments with forward slashes (a markdown destination
-# cannot carry raw backslashes -- CommonMark eats ``\`` before punctuation),
-# and Windows file APIs accept the forward-slash form verbatim. The leading
-# pair likewise accepts ``//``; ``(?<![\w:/])`` guards it from matching inside
-# a URL's ``://``.
-_WINDOWS_PATH_CHARS = r"[\w\\/.@ \t()\-]"
-_WINDOWS_PATH_RE = re.compile(
-    rf"(?<![\w:])(?:(?<![\w:/]))((?:[A-Za-z]:[\\/]|[\\/]{{2}}[^\\/:*?\"<>|\r\n]+[\\/])"
-    rf"{_WINDOWS_PATH_CHARS}+?\.{_SUFFIX_GROUP})",
-    re.IGNORECASE,
-)
-
-_PATH_RE = _WINDOWS_PATH_RE if os.name == "nt" else _POSIX_PATH_RE
 
 
 def build_prompt_blocks(
@@ -326,8 +190,8 @@ def build_prompt_blocks(
                 continue
             path = Path(raw)
             suffix = path.suffix.lower()
-            mime = IMAGE_MEDIA_TYPES.get(suffix)
-            if mime is None:
+            suffix_mime = IMAGE_MEDIA_TYPES.get(suffix)
+            if suffix_mime is None:
                 # Unreachable for regex-produced candidates today (_PATH_RE's
                 # suffix group and IMAGE_MEDIA_TYPES share one key set), kept
                 # as the lexical backstop should the two ever drift.
@@ -340,14 +204,14 @@ def build_prompt_blocks(
             # on POSIX stat-ing through a symlink is harmless. Reference
             # wiring: dashboard/handlers/themes.py::_resolve_local_source.
             if os.name == "nt" and first_linked_ancestor(path) is not None:
-                seen.add(raw)
+                seen_blocked.add(raw)
                 continue
             # The LEAF gets the junction-aware check the walk deliberately
             # excludes: is_file() below FOLLOWS a final-component link, so a
             # leaf symlink/junction targeting a UNC share is the same probe.
             # lstat-based, so the link itself is never followed.
             if os.name == "nt" and is_link_or_junction(path):
-                seen.add(raw)
+                seen_blocked.add(raw)
                 continue
             if not path.is_file():
                 continue
@@ -376,27 +240,38 @@ def build_prompt_blocks(
                 # stays in the text; it is NOT inlined.
                 logger.warning("acp prompt: image read refused for %s", path.name)
                 continue
-            # Magic-byte sniff is authoritative: a channel that lies about
-            # content-type (Discord serving PNG bytes as webp) would otherwise
-            # inline a payload the backend rejects with 400. When the real
-            # format differs from the suffix, transcode non-universal formats
-            # (AVIF/HEIC/TIFF/ICO/…) to PNG so the declared mime matches the
-            # bytes.
-            sniffed = _sniff_mime_from_bytes(raw_bytes)
-            if sniffed and sniffed != mime:
-                logger.debug(
-                    "acp prompt: %s declares %s but bytes are %s",
+            # The suffix selects path CANDIDATES; the bytes decide what reaches
+            # the wire. Require a complete sniff window so a truncated header
+            # cannot become a pass-through image when Pillow is unavailable.
+            mime = (
+                sniff_raster_mime(raw_bytes[:SNIFF_BYTES])
+                if len(raw_bytes) >= SNIFF_BYTES
+                else None
+            )
+            if mime is None and len(raw_bytes) >= SNIFF_BYTES:
+                # Not a raster upstream's sniffer knows; a mislabelled
+                # AVIF/HEIC/TIFF/ICO is still usable once transcoded below.
+                mime = _sniff_exotic_mime(raw_bytes)
+            if mime is None:
+                logger.warning(
+                    "acp prompt: %s is not a supported raster by content - "
+                    "sending path, not inline",
+                    path.name,
+                )
+                continue
+            if mime != suffix_mime:
+                logger.info(
+                    "acp prompt: %s is %s by content, not %s by suffix; using content",
                     path.name,
                     mime,
-                    sniffed,
+                    suffix_mime,
                 )
-                mime = sniffed
             if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
                 transcoded = _transcode_to_png(raw_bytes, mime)
                 if transcoded is None:
-                    # Fail CLOSED: an untranscodable format (SVG, missing
-                    # HEIC/AVIF plugin) stays as a text path rather than
-                    # shipping bytes the backend refuses.
+                    # Fail CLOSED: an untranscodable format (missing HEIC/AVIF
+                    # plugin) stays as a text path rather than shipping bytes
+                    # the backend refuses.
                     logger.warning(
                         "acp prompt: image %s is %s and could not be transcoded - "
                         "sending path, not inline",
@@ -476,8 +351,8 @@ def summarize_prompt_structure(blocks: object) -> dict:
       than a size describing a payload the counts claim is empty.
 
     This summary is deliberately safe to log: it carries no content and
-    therefore cannot leak credentials or user data. That is a hard requirement
-    (issue #6022) -- the kiro-cli data dir is fenced precisely because it holds
+    therefore cannot leak credentials or user data. That is a hard
+    requirement -- the kiro-cli data dir is fenced precisely because it holds
     SSO tokens, so the outbound-request diagnostics must expose counts, types,
     and sizes ONLY, never the bytes themselves.
 

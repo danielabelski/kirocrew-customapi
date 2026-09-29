@@ -24,9 +24,54 @@ import yaml
 
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
+
+def _bash_can_run_the_assembly_step() -> bool:
+    """Whether this host's ``bash`` is close enough to ubuntu-latest's to mean anything.
+
+    The step uses ``mapfile``, a bash **4+** builtin, and these tests execute it for
+    real. macOS ships ``/bin/bash`` 3.2.57, where the step dies with
+    ``mapfile: command not found`` -- so on a Mac four of these tests failed while
+    testing nothing, and the ``os.name == "nt"`` guard they replaced did not catch it
+    even though its own reason named ubuntu-latest.
+
+    A capability probe rather than ``sys.platform != "darwin"``: a Mac with a bash 4+
+    first on PATH runs the step faithfully and keeps the coverage. ``os.name == "nt"``
+    is kept as well, so no platform that skipped before starts running these now.
+    """
+    try:
+        probe = subprocess.run(
+            ["bash", "-c", "type -t mapfile"],
+            capture_output=True,
+            check=False,
+            # A CONSTRUCTED environment, not the inherited one. `pytestmark` runs
+            # this at COLLECTION time, and conftest.py's
+            # `_scrub_inherited_preload_env` is function-scoped, so it has not run
+            # yet -- this is the only bash in this file outside that protection.
+            # An inherited `BASH_ENV` is a file bash SOURCES before it reaches
+            # `type -t mapfile`, and that fixture's own docstring treats such a
+            # variable as ordinary host state ("a login profile exporting
+            # BASH_ENV, or a container image setting it"), not an exotic one.
+            #
+            # `PATH` is passed on deliberately and is the only thing passed on:
+            # this is a capability probe, so a Mac with bash 4+ first on PATH has
+            # to be discovered, and PATH selects which program runs rather than
+            # supplying code for it to run. The literal fallback avoids
+            # `os.defpath`, whose leading empty entry would put the working
+            # directory on the search path.
+            env={"PATH": os.environ.get("PATH") or "/usr/bin:/bin"},
+            **UTF8_TEXT,
+        )
+    except OSError:
+        return False  # no bash on PATH at all
+    return probe.returncode == 0 and (probe.stdout or "").strip() == "builtin"
+
+
 pytestmark = pytest.mark.skipif(
-    os.name == "nt",
-    reason="the GitHub Release assembly step runs under bash on ubuntu-latest",
+    os.name == "nt" or not _bash_can_run_the_assembly_step(),
+    reason=(
+        "the GitHub Release assembly step runs under bash on ubuntu-latest; this host "
+        "has no bash providing mapfile (a bash 4+ builtin the step uses)"
+    ),
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,10 +111,30 @@ def _write_valid_dmg(path: Path) -> None:
     path.write_bytes(b"test payload" + b"koly" + bytes(508))
 
 
-def _write_valid_handoff(root: Path, name: str = ARTIFACT_NAME) -> Path:
+#: The two single-arch macOS legs beside the universal one. Their gated files
+#: carry the arch in the NAME (sign-and-notarize.yml's NOTARIZED_ZIP /
+#: ARTIFACT_BASENAME) because a promotion bundle is one flat directory.
+MAC_ARCHES = ("arm64", "x64")
+#: The artifact filename stem, named once: the brand gate exempts a literal
+#: ``KiroCrew.dmg`` but not the templated single-arch spellings below.
+PRODUCT = "KiroCrew"  # brand-ok: artifact filename stem
+
+
+def _write_valid_handoff(root: Path, name: str = ARTIFACT_NAME, *, promoted: bool = False) -> Path:
+    """All three gated macOS handoffs, laid out the way the run holds them.
+
+    Fresh path: each leg attached its own artifact, ``<name>`` for the universal
+    DMG and ``<name>-<arch>`` for a single-arch one. Promotion (``promoted``):
+    every leg's files sit in the ONE resolved bundle under the universal name.
+    Returns the universal artifact directory.
+    """
     artifact = _artifact_dir(root, name)
     _write_valid_zip(artifact / "notarized.zip")
     _write_valid_dmg(artifact / "KiroCrew.dmg")
+    for arch in MAC_ARCHES:
+        leg = artifact if promoted else _artifact_dir(root, f"{name}-{arch}")
+        _write_valid_zip(leg / f"notarized-{arch}.zip")
+        _write_valid_dmg(leg / f"{PRODUCT}-{arch}.dmg")
     return artifact
 
 
@@ -143,22 +208,49 @@ def test_missing_exact_gated_artifact_does_not_fall_back_to_unsigned(tmp_path: P
 
 
 @pytest.mark.parametrize(
-    ("missing_name", "expected_error"),
+    ("leg", "missing_name", "expected_error"),
     (
-        ("notarized.zip", "Required gated macOS ZIP is missing or empty"),
-        ("KiroCrew.dmg", "Required gated macOS DMG is missing or empty"),
+        ("", "notarized.zip", "Required gated macOS ZIP is missing or empty"),
+        ("", "KiroCrew.dmg", "Required gated macOS DMG is missing or empty"),
+        ("-arm64", "notarized-arm64.zip", "Required gated macOS ZIP is missing or empty"),
+        ("-arm64", "KiroCrew-arm64.dmg", "Required gated macOS DMG is missing or empty"),
+        ("-x64", "notarized-x64.zip", "Required gated macOS ZIP is missing or empty"),
+        ("-x64", "KiroCrew-x64.dmg", "Required gated macOS DMG is missing or empty"),
     ),
 )
 def test_incomplete_gated_handoff_fails(
-    tmp_path: Path, missing_name: str, expected_error: str
+    tmp_path: Path, leg: str, missing_name: str, expected_error: str
 ) -> None:
-    artifact = _write_valid_handoff(tmp_path)
-    (artifact / missing_name).unlink()
+    """Every one of the three legs is REQUIRED: the page may not offer two of
+    three DMGs, because an install on the missing arch's feed would then see a
+    version it can never receive."""
+    _write_valid_handoff(tmp_path)
+    (tmp_path / "artifacts" / f"{ARTIFACT_NAME}{leg}" / missing_name).unlink()
 
     result = _run_assembly(tmp_path)
 
     assert result.returncode != 0
     assert expected_error in result.stderr + result.stdout
+
+
+def test_a_single_arch_file_inside_the_universal_artifact_is_not_a_handoff(
+    tmp_path: Path,
+) -> None:
+    """Off the promotion path a single-arch leg's files come from ITS gated
+    artifact (``<name>-<arch>``), never from a same-named file that happens to
+    sit in the universal one: the fresh legs attach separate artifacts, and
+    reading across them would let a stale or misrouted file stand in for a
+    leg that never notarized."""
+    artifact = _write_valid_handoff(tmp_path)
+    for arch in MAC_ARCHES:
+        _write_valid_zip(artifact / f"notarized-{arch}.zip")
+        _write_valid_dmg(artifact / f"{PRODUCT}-{arch}.dmg")
+        (tmp_path / "artifacts" / f"{ARTIFACT_NAME}-{arch}" / f"notarized-{arch}.zip").unlink()
+
+    result = _run_assembly(tmp_path)
+
+    assert result.returncode != 0
+    assert "Required gated macOS ZIP is missing or empty" in result.stderr + result.stdout
 
 
 def test_corrupt_notarized_zip_fails(tmp_path: Path) -> None:
@@ -230,8 +322,44 @@ def test_exact_gated_handoff_is_renamed_for_the_release(tmp_path: Path) -> None:
     release_dmg = release / f"KiroCrew-{VERSION}-universal.dmg"
     assert release_zip.read_bytes() == (gated / "notarized.zip").read_bytes()
     assert release_dmg.read_bytes() == (gated / "KiroCrew.dmg").read_bytes()
+    # The single-arch legs land beside it under the same shape: the arch is
+    # spelled on every mac asset, x64 included (electron-builder's default
+    # would drop it), so the three are told apart at a glance.
+    for arch in MAC_ARCHES:
+        leg = tmp_path / "artifacts" / f"{ARTIFACT_NAME}-{arch}"
+        assert (release / f"{PRODUCT}-{VERSION}-{arch}-mac.zip").read_bytes() == (
+            leg / f"notarized-{arch}.zip"
+        ).read_bytes()
+        assert (release / f"{PRODUCT}-{VERSION}-{arch}.dmg").read_bytes() == (
+            leg / f"{PRODUCT}-{arch}.dmg"
+        ).read_bytes()
+    assert sorted(path.name for path in release.glob("*.dmg")) == sorted(
+        f"{PRODUCT}-{VERSION}-{label}.dmg" for label in ("universal", *MAC_ARCHES)
+    )
     assert not (release / "unsigned-mac.zip").exists()
     assert not (release / "unsigned.dmg").exists()
+
+
+def test_a_promotion_takes_every_mac_leg_from_the_one_bundle(tmp_path: Path) -> None:
+    """On a byte promotion the resolved bundle is the only gated artifact, and
+    it holds all three legs' files side by side -- so the single-arch assets
+    are read from THAT directory, by their arch-carrying names, and a
+    ``<name>-<arch>`` artifact (which a promotion run never has) is not
+    required."""
+    gated = _write_valid_handoff(tmp_path, promoted=True)
+    assert not (tmp_path / "artifacts" / f"{ARTIFACT_NAME}-arm64").exists()
+
+    result = _run_assembly(tmp_path, promote_mode=True)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    release = tmp_path / "release"
+    for arch in MAC_ARCHES:
+        assert (release / f"{PRODUCT}-{VERSION}-{arch}-mac.zip").read_bytes() == (
+            gated / f"notarized-{arch}.zip"
+        ).read_bytes()
+        assert (release / f"{PRODUCT}-{VERSION}-{arch}.dmg").read_bytes() == (
+            gated / f"{PRODUCT}-{arch}.dmg"
+        ).read_bytes()
 
 
 def test_promotion_publishes_the_bundled_installer_and_never_the_rebuild(
@@ -244,7 +372,7 @@ def test_promotion_publishes_the_bundled_installer_and_never_the_rebuild(
     version, so the two filenames differ and a ``*.exe`` glob would attach both
     -- the rebuild looking the more official for carrying the version number.
     """
-    gated = _write_valid_handoff(tmp_path)
+    gated = _write_valid_handoff(tmp_path, promoted=True)
     (gated / "KiroCrew-Setup.exe").write_bytes(b"promoted installer")
     (gated / "KiroCrew-Setup.exe.blockmap").write_bytes(b"promoted blockmap")
     rebuilt = _artifact_dir(tmp_path, "build-windows-x64")

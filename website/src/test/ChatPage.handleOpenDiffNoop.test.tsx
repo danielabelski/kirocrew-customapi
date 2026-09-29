@@ -102,7 +102,8 @@ vi.mock('../api/client', () => ({
     get: (_t, prop: string) => {
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
-          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 } : {},
+          prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
+            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
         )
       }
       return apiMocks[prop]
@@ -126,6 +127,10 @@ Object.defineProperty(window, 'matchMedia', {
 // opens a tab (it reports through the pane notice), so the panel never shows.
 const fileReadStub = () => vi.fn().mockResolvedValue({
   ok: true, status: 200,
+  // A real Response always carries headers, and the read path asks this one
+  // whether the file is binary. Using the platform's own Headers keeps the mock
+  // Response-shaped rather than growing a bespoke getter per field read.
+  headers: new Headers(),
   text: () => Promise.resolve('file content'),
   json: () => Promise.resolve({}),
 }) as never

@@ -8,9 +8,11 @@ they need a marker the model and the frontend can both recognise.
 **The user may not be present.** Process the envelope and act; do not answer it as
 though someone is waiting for a conversational reply.
 
-Every prefix is defined once, in `src/kiro_crew/dashboard/state.py`, so the
-frontend has one list to mirror and no second copy can drift. Classification is by
-`str.startswith` on the resolved prefix, never by a loose regex.
+Dashboard-owned prefixes are defined once in `src/kiro_crew/dashboard/state.py`.
+The two core-safe sub-agent completion markers live in `src/kiro_crew/constants.py`
+so `subagent.py` can import them without importing the dashboard layer; `state.py`
+imports and aggregates them. Classification is by `str.startswith` on the resolved
+prefix or prefix tuple, never by a loose regex.
 
 ## Cron notification
 
@@ -53,7 +55,7 @@ Discord pass those exact bytes through:
 
 ```
 [Monitor wake]
-Monitor <id>: GitHub pull request <target>; objective: review_ready.
+Monitor <id>: pull request <target>; objective: review_ready.
 Fingerprint: <fingerprint>. Classification: <reason code>.
 Head: <revision>. Changed: <allowlisted canonical facts>.
 Next action: <bounded instructions>.
@@ -77,10 +79,14 @@ single completion path that serves every terminal outcome:
 Agent `<id>` (<agent name>) <status> <emoji>
 Task: <first 100 chars of the task>
 
+Usage: <credits> credits · <elapsed>
+
 <result detail>
 ```
 
-- Prefix `SUBAGENT_COMPLETION_PREFIX = '[Subagent completion event]'`.
+- `SUBAGENT_COMPLETION_PREFIX = '[Subagent completion event]'` is defined in
+  `constants.py` and included in `state.py`'s `SUBAGENT_COMPLETION_PREFIXES`
+  aggregate.
 - `<status> <emoji>` is one of `completed ✅`, `failed ❌`, or `stopped by user ⏹`.
   The agent-name parenthetical is present only when the sub-agent ran under a named
   agent.
@@ -88,6 +94,17 @@ Task: <first 100 chars of the task>
   content, or in orchestrator mode, it is a summary plus a `result_path` pointer, so
   the parent reads the full transcript on demand (`read`, `grep`, `spawn_status`)
   instead of re-running the sub-agent.
+- Usage is cumulative across all attempted turns in the run, including billed
+  retries that failed before the final turn. Providers that do not report credit
+  billing render this line as `Usage: <elapsed>`; the missing credit label is
+  intentional, and zero is not a claim that the run was free. Reported credits
+  use two decimals below 10 and one decimal at or above 10, matching the
+  dashboard's precision.
+- The same charge is written into the PARENT's crew log as `credits` on
+  `subagent/completed` or `subagent/failed`, and `usage.credits_by_source.subagent`
+  folds it. This line and that entry read the one accumulator, so they cannot
+  disagree; the entry drops an unbilled zero rather than writing it, which is the
+  same posture as this line omitting the credit label.
 - A user-stopped agent says so explicitly and instructs the parent not to treat the
   partial output as a finished result or retry it unprompted.
 - A wide wave is delivered in chunks under a sibling prefix,
@@ -130,6 +147,7 @@ session failed (most commonly a delivery timeout). `subagent.py` builds:
 [Subagent completion event]
 Agent `<id>` ❌ <reason>
 Task: <first 100 chars of the task>
+Usage: <credits> credits · <elapsed>
 <outcome line>
 Result saved at: <path> (<n> bytes)
 Use the read tool to retrieve it if needed.
@@ -140,7 +158,10 @@ completion — this path fires for every terminal state, including runs that
 never executed (the never-ran reading comes from the record's execution marker,
 never from its error wording):
 
-- completed: `The agent finished but result delivery timed out.`
+- completed: `The agent finished, but its result could not be delivered.`
+  The line names no mechanism: `<reason>` above it already carries one, and
+  most call sites pass something other than a timeout (a dead provider, a
+  died ACP process, a raw exception string).
 - failed after execution began: `The agent failed before a result could be delivered.`
 - failed before execution (approval or queued rejection, no output exists):
   `The run failed before it started, so there is no result to deliver.`
@@ -151,11 +172,25 @@ never from its error wording):
 The result-path lines are present only when a result file exists. **The result is
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.
 
-Two adjacent variants exist for a gateway restart, same prefix:
+Three adjacent variants exist for a gateway restart, same prefix:
+These notices omit usage because an interrupted run has no settled terminal
+billing record:
 
 - `⚠️ orphaned by gateway restart` plus `Result saved at: <path>` and
-  `Use the read tool to retrieve it.`
+  `Use the read tool to retrieve it.` — only when the run recorded
+  `result_complete`, i.e. its stream reached the complete event.
+- `⚠️ cut off mid-turn by gateway restart` plus `Partial output saved at: <path>`
+  and a line saying the text stops wherever the restart landed. `result.txt` is
+  appended per streamed chunk, so a run killed mid-turn leaves a non-empty file
+  holding an opening sentence; this variant exists so the parent is not sent to
+  read a fragment as though it were the answer.
 - `❌ lost to gateway restart` plus `No result was captured before the restart.`
+  When the run's conversation is still resumable
+  (`session_map.session_files_resumable` on the orphan's `session_id` /
+  `provider`), one more line follows: how many turns it completed, its last
+  tool call, and the `spawn_continue(conversation="<id>", task=...)` handle
+  that resumes it — see `orphan_resume_hint` in
+  [subagent](../modules/subagent.md#gateway-restart-reconciliation).
 
 All three are redacted before any delivery path. When the parent has no open
 dashboard surface, undelivered notices are batched into a single digest DM rather
@@ -206,6 +241,20 @@ none is mirrored to a linked Slack or Telegram thread as though the user typed i
 | `[Continue — requested by the user]` | The user pressed Continue on an interrupted turn. It is in this family so `test_recovery_card_prefixes.py`'s cross-language drift guard covers it, but the value deliberately does not say "automatic recovery": a person pressed the button, and the card must not claim the system recovered by itself. |
 | `[Tool blocked — reason sent to the agent]` | Display-only. A tool deny's reason was steered into the running turn, so nothing is queued and no turn is dispatched — this row exists so the person sees the same blocked-tool card instead of only a generic "Steered" chip that reads as though they had steered the turn themselves. |
 
+A related notice-only guard handles turns that cannot be replayed safely. When a
+normal top-level turn ends after earlier tool calls with a new immediate-action
+promise, or its final segment claims foreground work is still continuing, the
+runner keeps the completed tool work landed and appends an informational notice:
+the main-agent turn has ended, separately shown subagents or monitor loops may
+continue, and otherwise the user must send a message to resume. This path never
+injects a continuation because replaying a mixed turn could duplicate a push,
+deployment, message, or other side effect. The detector is model-agnostic and
+matches only first-person progress claims at a sentence boundary; third-person
+status statements about a separately shown subagent or monitor are not classified
+as foreground work. A first-person claim that the main agent is running or checking
+one remains foreground work unless the same sentence delivers the content after a
+colon.
+
 **A tool deny is explained IN-BAND first, and the injection above is the
 fallback.** ACP's permission response carries only `outcome`/`optionId`, so the
 host cannot attach a reason to a rejection — kiro-cli hands the model the fixed
@@ -216,8 +265,9 @@ permission request. Holding the unanswered request is what makes that race-free:
 the turn is provably in flight, so the notice is queued and folded in at the next
 model-inference boundary — the one right after the rejected tool resolves — and
 the model adapts inside the SAME turn. It is opt-in by positive capability
-(`supports_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
-steer is unchanged.
+(`supports_refusal_steer`, i.e. `ACP_BACKENDS_STEER`), so a harness without mid-turn
+steer is unchanged, and so is codex: its user steer rides `_session/steering`, but its
+approval answer cancels the turn and drops what was injected into it.
 
 `should_queue_refusal_recovery` then suppresses the extra turn only when every
 refusal got a notice AND a `steering_consumed` echo accounted for all of them. An
@@ -239,7 +289,54 @@ unattended transcript line remains the only agent-facing explanation. The
 timeout card stays the sole user-visible surface — this steer paints no
 tool-blocked row.
 
-The recovery classification for the last two is **structural**: the queue entry
+**The other two host-originated approval auto-declines take the same path**,
+each with its own cause and the same no-ledger, no-row discipline as the
+timeout: `approval_no_budget` (the turn had no budget left to host the prompt
+— the agent is told the prompt was never shown, to state the permission it
+needs, and not to immediately reissue the identical call, since this turn
+cannot host an approval wait) and `approval_undeliverable` (the approval card
+could not be delivered to the operator's channel — the agent is told the call
+was never judged and to state the permission it needs). All three are steered
+once, at the shared reject branch, gated on the host-recorded provenance; a
+genuine user refusal records no cause, so kiro-cli's generic denial stays the
+true attribution there and no notice is sent.
+
+**The headless funnel steers the same notice.** `llm_helpers._resolve_permission`
+answers permissions for every surface without a dashboard slot — cron, Slack and
+channel turns driven through `stream_and_collect`, workflows, heartbeat, Meetings
+transcript turns — and `llm_helpers.run_bg_oneliner` answers them for the
+tool-free background one-liners (titles, labels, summaries). Each host deny there
+awaits `deny_notice.steer_refusal_notice` through the module's
+`_steer_host_deny` immediately before `reject_tool`, naming its cause per site:
+
+- `policy` — a safety rule judged the call itself: an always-deny pattern hit, a
+  hook `deny`, the shared permission floor refusing an `AUTO_APPROVE` call.
+  Carries the class remediation.
+- `surface_policy` — the SURFACE refused the call, not a rule about the call:
+  the reject-all and read-only tool policies, the tool-free one-liner, and a
+  name-based grant withheld on a surface with no approver to fall back to. No
+  remediation, because it is keyed off the reason and the model's own title, and
+  on a surface where no tool can run (or no one can approve) it would name a
+  sanctioned command the model cannot run there; the withheld-grant reason is
+  host-authored and carries no rule identity, so the title would be the only
+  anchor.
+- `invalid_name` — the call carried no title, the one deny the model can fix.
+
+The one genuine user rejection on that funnel (the interactive approver said no)
+sends no notice. Two orderings are load-bearing at every site and are pinned by
+a source-walking test (`test_llm_helpers_deny_notice.py`): the SEL audit row is
+written BEFORE the steer and the reject (both await the ACP pipe, and a stalled
+pipe cancels the coroutine at the turn deadline — an audit sequenced after them
+never runs), and an audit that cannot be written raises before the wire, so a
+deny never proceeds unaudited — the request stays unanswered and the caller's
+own deadline bounds it, exactly as an approval whose audit fails after the wire
+keeps raising. A cancellation that lands inside the
+steer still answers the wire: the reject is scheduled as a strongly referenced
+task whose outcome is read when it settles, and the cancellation re-raises at
+once — the cancellation is the caller's deadline, so nothing waits past it.
+
+The recovery classification for the last two rows of the marker table above
+is **structural**: the queue entry
 carries `kind == "synthetic_recovery"` (`SYNTHETIC_RECOVERY_KIND`), set at insert
 time. Metadata survives every queue transformation (merge, prefixing, truncation)
 and cannot collide with a user pasting the transcript-visible recovery text back
@@ -328,10 +425,16 @@ next turn into the same slot:
 
 ```
 [auto-nudge cycle <N>]
+[patrol budget: cycle <N>/<max_cycles>, <left>s/<max_runtime_secs>s runtime left]
 <nudge message>
 ```
 
 - `N` is `cycle_count + 1`. Only DELIVERED nudges count toward `max_cycles`.
+- The `[patrol budget: ...]` line appears only on a loop with a cycle or runtime
+  cap, and names only the caps it has; an uncapped loop's tag is unchanged. It
+  ends `; 10% or less left` once either budget is at or under 10% of its cap. It states a
+  fact and asks for nothing; the goal-conductor skill is what tells its agent to
+  renew on those cycles (`nudge_cycle_header`).
 - `{{STOP_FILE}}` in the configured message is substituted with the resolved stop
   sentinel path before the tag is prepended.
 - The slot entry uses role `nudge` with a structured `nudge` meta block (`cycle`,
@@ -460,10 +563,10 @@ speech rather than as the user.
 |---|---|---|
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
-| `[Previous run result — do NOT repeat the same content]` | `cron.py` | A recurring cron's own last output, so the turn reports only what changed. |
-| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold; take the lighter path this turn. |
+| `[Previous run result — do NOT repeat the same content]` | `cron_service/identity.py` (`build_cron_session_context`) | A recurring cron's own last output, so the turn reports only what changed. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skills.py` pointer renderer | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
-| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and keeps nothing of the chat, its history or its lessons. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the ephemeral transcript. |
+| `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 
 ## Adding a new envelope
 
