@@ -354,14 +354,20 @@ class TestServedBackendAttribution:
     """
 
     def test_the_config_field_is_a_single_valued_enum(self):
-        """The premise. If this ever gains values, revisit the emit site."""
+        """The premise. If this ever gains values, revisit the emit site.
+
+        Fork: the enum also admits the legacy ``claude_code`` / ``opencode``
+        spellings (they pin that backend). Revisited: the emit site reads
+        ``provider_label`` of the live client (llm_helpers._provider_label),
+        never this field, so the wider enum cannot mislabel a turn.
+        """
         from dataclasses import fields
 
         from kiro_crew.config.loader import AgentConfig
 
         provider = next(f for f in fields(AgentConfig) if f.name == "provider")
         assert provider.default == "acp"
-        assert provider.metadata["enum"] == ["acp"]
+        assert provider.metadata["enum"] == ["acp", "claude_code", "opencode"]
 
     def test_label_distinguishes_the_backend_the_config_cannot(self):
         """`is_claude_backend` separates the two backends this surface can see.
