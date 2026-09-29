@@ -8797,7 +8797,9 @@
         "security_shim": "Security & Shim",
         "failed_to_save_vision_mode": "Failed to save image input mode",
         "failed_to_save_vision_redirect": "Failed to save text-only model behavior",
-        "failed_to_save_vision_fallback": "Failed to save vision fallback model"
+        "failed_to_save_vision_fallback": "Failed to save vision fallback model",
+        "provider_claude_login_hint": "Uses the Claude Pro/Max login from `claude /login` on this machine. On a headless server, run `claude setup-token` and paste the token as the API key.",
+        "provider_anthropic_key_hint": "Talks to the Anthropic API directly with your API key (billed per token). Leave the base URL empty."
       },
       "computerUsePanel": {
         "accessibility": "Accessibility",

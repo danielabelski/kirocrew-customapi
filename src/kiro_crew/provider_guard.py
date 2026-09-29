@@ -109,15 +109,22 @@ def validate_provider_settings(agent) -> list[str]:  # noqa: ANN001 - AgentConfi
     problems: list[str] = []
     provider = (agent.provider or "").strip()
 
-    if provider == "claude_code":
-        base_url = (agent.provider_base_url or "").strip()
+    if provider == "claude_code" or getattr(agent, "acp_backend", "") == "claude":
+        # No base URL and no key is NOT a problem: claude-agent-acp then uses
+        # the Claude subscription login (`claude /login`), see claude_auth.
+        from kiro_crew.claude_auth import effective_base_url
+
+        base_url = effective_base_url(
+            agent.provider_base_url, use_shim=bool(getattr(agent, "use_shim", False))
+        )
         model = (agent.model or "").strip()
         api_key = (agent.provider_api_key or "").strip()
-        if not base_url and not api_key:
+        if getattr(agent, "use_shim", False) and not (
+            getattr(agent, "shim_openai_base_url", "") or ""
+        ).strip():
             problems.append(
-                "provider=claude_code with neither provider_base_url nor an API "
-                "key: requests will go to api.anthropic.com unauthenticated and "
-                "fail with 401."
+                "use_shim is on but shim_openai_base_url is empty: the shim has "
+                "no OpenAI-compatible backend to forward to."
             )
         if base_url and model in ("", "auto"):
             problems.append(

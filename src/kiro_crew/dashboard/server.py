@@ -6340,10 +6340,16 @@ async def start_dashboard(
             from kiro_crew import shim as _shim
             from kiro_crew.provider_secrets import effective_provider_api_key
 
-            _shim_key = effective_provider_api_key(
-                (_cfg0.agent.shim_openai_api_key or "").strip()
+            from kiro_crew.claude_auth import shim_port
+
+            # The shim's OWN key wins. effective_provider_api_key() puts env
+            # and keyring ahead of its argument, so routing the configured
+            # shim key through it sent the Anthropic/router provider key to
+            # the OpenAI backend whenever one was stored there.
+            _shim_key = (_cfg0.agent.shim_openai_api_key or "").strip() or (
+                effective_provider_api_key("")
             )
-            _shim_port = int(os.environ.get("KIROCREW_SHIM_PORT", "8391"))
+            _shim_port = shim_port()
             _holder, _site = await _shim.start_shim(
                 "127.0.0.1",
                 _shim_port,

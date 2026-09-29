@@ -1794,19 +1794,35 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     agents._doctor_agent_auth()
 
     # ── Fork: router settings validation + connectivity probe ──────────
-    if _cfg_provider in ("claude_code", "opencode"):
+    try:
+        _agent_cfg = KiroCrewConfig.load().agent
+    except Exception:  # noqa: BLE001 - doctor never crashes on a bad config
+        _agent_cfg = None
+    if _agent_cfg is not None and (
+        _cfg_provider in ("claude_code", "opencode") or _agent_cfg.acp_backend in (
+            "claude",
+            "opencode",
+        )
+    ):
+        from kiro_crew.claude_auth import auth_mode, effective_base_url
         from kiro_crew.provider_guard import (
             probe_provider_endpoint,
             validate_provider_settings,
         )
         from kiro_crew.provider_secrets import describe_key_source, effective_provider_api_key
 
-        _agent_cfg = KiroCrewConfig.load().agent
         print("  router:")
         for _problem in validate_provider_settings(_agent_cfg):
             print(f"    ⚠️  {_problem}")
-        base_url = (_agent_cfg.provider_base_url or "").strip()
+        _is_claude = _cfg_provider == "claude_code" or _agent_cfg.acp_backend == "claude"
+        base_url = (
+            effective_base_url(_agent_cfg.provider_base_url, use_shim=bool(_agent_cfg.use_shim))
+            if _is_claude
+            else (_agent_cfg.provider_base_url or "").strip()
+        )
         key = effective_provider_api_key((_agent_cfg.provider_api_key or "").strip())
+        if _is_claude:
+            print(f"    claude auth: {auth_mode(base_url=base_url, api_key=key)}")
         print(f"    key source: {describe_key_source((_agent_cfg.provider_api_key or '').strip())}")
         if base_url:
             print(f"    probing {base_url} …")

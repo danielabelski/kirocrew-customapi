@@ -24,7 +24,7 @@ import { useDiffSplit } from '../../hooks/useDiffSplit'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { normalizeModelKey } from '../../lib/model'
 import { isMac } from '../../utils/platform'
-import { BACKEND_OPTIONS, PROVIDER_PRESETS, type AgentBackend } from './providerPresets'
+import { BACKEND_OPTIONS, CLAUDE_DIRECT_PRESETS, PROVIDER_PRESETS, savedClaudePreset, type AgentBackend } from './providerPresets'
 import { readBusySendDefault, setBusySendDefault, type BusySendMode } from '../../components/BusySendButton'
 import { platformShortcut } from '../../utils/platform'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
@@ -1112,8 +1112,10 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   // "custom" after save + reload.
   const savedPreset = (() => {
     const savedUrl = (mcCfg?.agent?.provider_base_url ?? '').replace(/\/+$/, '')
-    const presets = (mcCfg?.agent?.provider === 'claude_code' || mcCfg?.agent?.provider === 'opencode')
-      ? PROVIDER_PRESETS[mcCfg.agent.provider] : []
+    if (mcCfg?.agent?.provider === 'claude_code') {
+      return savedClaudePreset(savedUrl, !!mcCfg?.agent?.provider_api_key)
+    }
+    const presets = mcCfg?.agent?.provider === 'opencode' ? PROVIDER_PRESETS.opencode : []
     return presets.find(p => p.url === savedUrl)?.value ?? 'custom'
   })()
   const effPreset = draft?.preset ?? savedPreset
@@ -1138,7 +1140,7 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
   const switchBackend = (value: AgentBackend) => {
     // Switching backend resets the draft to a clean custom entry — preset
     // URLs are backend-specific.
-    setDraft({ backend: value, preset: 'custom', url: '', key: '', format: value === 'opencode' ? 'openai' : 'anthropic' })
+    setDraft({ backend: value, preset: value === 'claude_code' ? 'claude-login' : 'custom', url: '', key: '', format: value === 'opencode' ? 'openai' : 'anthropic' })
     setProviderTestResult(null)
   }
 
@@ -1985,6 +1987,13 @@ export function ChatPanel({ basePath }: { basePath?: string } = {}) {
                 optionLabels={providerPresets.map(p => p.label)}
                 onChange={applyPreset}
               />
+              {effBackend === 'claude_code' && CLAUDE_DIRECT_PRESETS.has(effPreset) && (
+                <p className="mt-2 text-[13px] text-muted">
+                  {effPreset === 'claude-login'
+                    ? i18nT('pages.settings.chatPanel.provider_claude_login_hint')
+                    : i18nT('pages.settings.chatPanel.provider_anthropic_key_hint')}
+                </p>
+              )}
               <SettingsInput
                 label={i18nT('pages.settings.chatPanel.provider_url')}
                 aria-label={i18nT('pages.settings.chatPanel.provider_url')}

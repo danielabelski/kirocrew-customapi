@@ -33,6 +33,12 @@ export const BACKEND_OPTIONS: BackendOption[] = [
 
 export const PROVIDER_PRESETS: Record<'claude_code' | 'opencode', ProviderPreset[]> = {
   claude_code: [
+    // Empty URL = talk to Anthropic directly. With no key, claude-agent-acp
+    // uses the Claude Pro/Max login from `claude /login`; a `claude
+    // setup-token` token (sk-ant-oat…) in the key field does the same on a
+    // headless gateway. See src/kiro_crew/claude_auth.py.
+    { value: 'claude-login', label: 'Claude subscription (Pro/Max)', url: '' },
+    { value: 'anthropic-key', label: 'Anthropic API key', url: '', keyRequired: true },
     { value: 'custom', label: 'Custom', url: '' },
     { value: 'ollama-cloud', label: 'Ollama Cloud', url: 'https://ollama.com', keyRequired: true },
     { value: 'opencode-zen', label: 'OpenCode Zen', url: 'https://opencode.ai/zen', keyRequired: true },
@@ -74,6 +80,19 @@ export const PROVIDER_PRESETS: Record<'claude_code' | 'opencode', ProviderPreset
     { value: 'together', label: 'Together (OpenAI)', url: 'https://api.together.xyz', format: 'openai', keyRequired: true },
     { value: 'mistral', label: 'Mistral (OpenAI)', url: 'https://api.mistral.ai', format: 'openai', keyRequired: true },
   ],
+}
+
+/** Claude Code presets that talk to Anthropic directly (no base URL). */
+export const CLAUDE_DIRECT_PRESETS = new Set(['claude-login', 'anthropic-key'])
+
+/**
+ * Preset to show for a saved claude_code config. Several presets share an
+ * empty URL, so the stored key disambiguates them.
+ */
+export function savedClaudePreset(savedUrl: string, hasStoredKey: boolean): string {
+  const url = savedUrl.replace(/\/+$/, '')
+  if (!url) return hasStoredKey ? 'anthropic-key' : 'claude-login'
+  return PROVIDER_PRESETS.claude_code.find(p => p.url && p.url === url)?.value ?? 'custom'
 }
 
 /** True when the backend has a URL/key to configure (kiro-native does not). */

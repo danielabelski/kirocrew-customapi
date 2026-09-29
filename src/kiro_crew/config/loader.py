@@ -5138,11 +5138,21 @@ class KiroCrewConfig:
             # for every session, overriding the member/acp_backend selection.
             if provider_backend:
                 _backend = provider_backend
+            # Fork: on the claude backend an empty base URL with agent.use_shim
+            # on means "the built-in shim", so switching the shim on is the
+            # whole setup (kiro_crew.claude_auth.effective_base_url).
+            _base_url = provider_base_url
+            if _backend == "claude":
+                from kiro_crew.claude_auth import effective_base_url
+
+                _base_url = effective_base_url(
+                    provider_base_url, use_shim=bool(self.agent.use_shim)
+                )
             # Fork: a claude/opencode session pointed at a custom router
             # (agent.provider_base_url) speaks the ROUTER's model namespace
             # (prefixed picker ids such as cmc/deepseek-v4-pro), so the pin is
             # never registry-translated -- a Bedrock-form id would be rejected.
-            _router_mode = bool(provider_base_url) and _backend in _FORK_ROUTER_BACKENDS
+            _router_mode = bool(_base_url) and _backend in _FORK_ROUTER_BACKENDS
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
             # key on the backend this session actually gets, not on the
@@ -5228,9 +5238,30 @@ class KiroCrewConfig:
             # wire format) into a claude / opencode session. extra_env wins
             # over config values.
             _env: dict[str, str] = dict(extra_env or {})
-            if _backend in _FORK_ROUTER_BACKENDS:
-                if provider_base_url and not _env.get("ANTHROPIC_BASE_URL"):
-                    _env["ANTHROPIC_BASE_URL"] = provider_base_url
+            if _backend == "claude":
+                # Subscription login / direct API key / custom endpoint: see
+                # kiro_crew.claude_auth. The ambient ANTHROPIC_API_KEY and
+                # CLIPROXY_API_KEY fallbacks only apply to a custom endpoint --
+                # without one they would override a Claude subscription login.
+                from kiro_crew.acp.client import strip_router_model_prefix
+                from kiro_crew.claude_auth import claude_env
+
+                _key = provider_api_key
+                if _base_url and not _key:
+                    _key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get(
+                        "CLIPROXY_API_KEY", ""
+                    )
+                _env.update(
+                    claude_env(
+                        base_url=_base_url,
+                        api_key=_key,
+                        model=strip_router_model_prefix(m or "") if _router_mode else "",
+                        existing=_env,
+                    )
+                )
+            elif _backend in _FORK_ROUTER_BACKENDS:
+                if _base_url and not _env.get("ANTHROPIC_BASE_URL"):
+                    _env["ANTHROPIC_BASE_URL"] = _base_url
                 if not _env.get("ANTHROPIC_API_KEY"):
                     api_key = (
                         provider_api_key
@@ -5239,6 +5270,7 @@ class KiroCrewConfig:
                     )
                     if api_key:
                         _env["ANTHROPIC_API_KEY"] = api_key
+            if _backend in _FORK_ROUTER_BACKENDS:
                 if _backend == "opencode":
                     _env.setdefault(
                         "OPENCODE_API_FORMAT", self.agent.provider_api_format or "openai"

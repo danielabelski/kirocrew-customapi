@@ -6940,7 +6940,10 @@ async def api_provider_test(request: web.Request) -> web.Response:
             headers["anthropic-version"] = "2023-06-01"
         else:
             headers["Authorization"] = f"Bearer {api_key}"
-    fetch_url = f"{url.rstrip('/')}/v1/models"
+    # OpenAI-style base URLs usually already end in /v1 (Ollama, vLLM,
+    # api.openai.com/v1); appending another /v1 probed /v1/v1/models -> 404.
+    _base = url.rstrip("/")
+    fetch_url = f"{_base}/models" if _base.endswith("/v1") else f"{_base}/v1/models"
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
             async with session.get(fetch_url, headers=headers) as resp:
