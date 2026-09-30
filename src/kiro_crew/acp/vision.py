@@ -176,6 +176,7 @@ async def describe_image_via_chain(
     work_dir: str | Path | None = None,
     sandbox_mode: str = "auto",
     timeout: float = VISION_DESCRIBE_TIMEOUT,
+    shared_scratch: str | Path | None = None,
 ) -> str:
     """Describe *image_ref* trying each provider in *providers* until one succeeds.
 
@@ -192,6 +193,7 @@ async def describe_image_via_chain(
             acp_backend=prov.acp_backend,
             sandbox_mode=sandbox_mode,
             timeout=timeout,
+            shared_scratch=shared_scratch,
         )
         if description and description != "unavailable":
             return description
@@ -211,6 +213,7 @@ async def redirect_image_message(
     main_backend: str = "",
     work_dir: str | Path | None = None,
     sandbox_mode: str = "auto",
+    shared_scratch: str | Path | None = None,
 ) -> tuple[str, str]:
     """Apply the image-redirect decision to *message* and return
     ``(rewritten_message, image_mode)``.
@@ -265,6 +268,7 @@ async def redirect_image_message(
                                 work_dir=work_dir,
                                 sandbox_mode=sandbox_mode,
                                 timeout=VISION_DESCRIBE_TIMEOUT,
+                                shared_scratch=shared_scratch,
                             ),
                             timeout=VISION_DESCRIBE_TIMEOUT,
                         )
@@ -398,6 +402,7 @@ async def vision_subagent_describe(
     acp_backend: str = "",
     sandbox_mode: str = "auto",
     timeout: float = VISION_DESCRIBE_TIMEOUT,
+    shared_scratch: str | Path | None = None,
 ) -> str:
     """Describe *image_ref* (a local path or http(s) URL) on *vision_model*.
 
@@ -444,6 +449,9 @@ async def vision_subagent_describe(
         extra_env=sub_env,
         acp_backend=acp_backend,
         audit_source="vision-subagent",
+        # Spawned on the calling session's behalf: join its session tree so
+        # an image the session saved under $KIROCREW_SCRATCH is visible.
+        shared_scratch=shared_scratch,
     )
     try:
         chunks: list[str] = []
@@ -595,6 +603,7 @@ async def describe_image_via_vision(
     acp_backend: str = "",
     sandbox_mode: str = "auto",
     timeout: float = VISION_DESCRIBE_TIMEOUT,
+    shared_scratch: str | Path | None = None,
 ) -> str:
     """Best-effort wrapper: describe *image_ref* or return ``"unavailable"``.
 
@@ -611,6 +620,7 @@ async def describe_image_via_vision(
             acp_backend=acp_backend,
             sandbox_mode=sandbox_mode,
             timeout=timeout,
+            shared_scratch=shared_scratch,
         )
     except Exception:
         logger.warning("vision describe failed for %s", image_ref, exc_info=True)

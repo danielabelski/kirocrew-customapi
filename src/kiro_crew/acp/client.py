@@ -14800,6 +14800,7 @@ class AcpClient:
             providers,
             work_dir=self._work_dir / "vision-subagent",
             sandbox_mode=self._sandbox_mode,
+            shared_scratch=self.work_scratch_dir,
         )
 
     async def _switch_to_vision_model(self) -> None:
@@ -14825,6 +14826,7 @@ class AcpClient:
             extra_env=self._extra_env,
             acp_backend=self._acp_backend,
             sandbox_mode=self._sandbox_mode,
+            shared_scratch=self.work_scratch_dir,
         )
 
     async def _read_prompt_response(self, req_id: int, timeout: float) -> str:

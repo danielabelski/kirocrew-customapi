@@ -1453,6 +1453,7 @@ class AcpSessionHandle:
                     main_env=main_env,
                     main_backend=main_backend,
                     sandbox_mode=a.sandbox,
+                    shared_scratch=getattr(self._runtime, "work_scratch_dir", None),
                 )
 
         async def _build() -> tuple[str, dict[str, Any]]:

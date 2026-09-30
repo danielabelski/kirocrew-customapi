@@ -1990,6 +1990,8 @@ def _run_vision_analyze(args: dict[str, Any]) -> str:
                 ref,
                 providers,
                 sandbox_mode=cfg.agent.sandbox,
+                # The calling session's tree, as its tools see it.
+                shared_scratch=os.environ.get("KIROCREW_SCRATCH") or None,
             )
         )
     except Exception as exc:  # noqa: BLE001 - surface a clean tool error
