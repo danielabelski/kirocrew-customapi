@@ -2534,7 +2534,7 @@ async def api_models(request: web.Request) -> web.Response:
     # picker must show the router's catalog, not the harness's own list.
     legacy_provider = getattr(cfg.agent, "provider", "") or ""
     router_url = (getattr(cfg.agent, "provider_base_url", "") or "").strip()
-    if legacy_provider == "claude_code" or (backend == ACP_BACKEND_CLAUDE and router_url):
+    if is_claude_code(legacy_provider) or (backend == ACP_BACKEND_CLAUDE and router_url):
         return await asyncio.to_thread(_cc_models_response, request)
     if legacy_provider == "opencode" or (backend == ACP_BACKEND_OPENCODE and router_url):
         return await _opencode_models_response(request)

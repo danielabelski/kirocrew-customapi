@@ -1814,7 +1814,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
         print("  router:")
         for _problem in validate_provider_settings(_agent_cfg):
             print(f"    ⚠️  {_problem}")
-        _is_claude = _cfg_provider == "claude_code" or _agent_cfg.acp_backend == "claude"
+        _is_claude = is_claude_code(_cfg_provider) or _agent_cfg.acp_backend == "claude"
         base_url = (
             effective_base_url(_agent_cfg.provider_base_url, use_shim=bool(_agent_cfg.use_shim))
             if _is_claude
