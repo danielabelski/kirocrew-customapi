@@ -1776,7 +1776,7 @@
     },
     "devFleet": {
       "manifest": {
-        "description": "Un panel de control para trabajar en kirocrew-customapi mismo. Lista cada worktree de función junto con el estado de su pull request, su número de commits y su uso de disco, y puede levantar cualquiera de ellos como un pod: una instancia de vista previa completa en su propio puerto y con su propio directorio de datos, para que revises un cambio sin terminar sin tocar tu gateway en vivo. También se encarga de las tareas de alrededor — traer main y recompilar, hacer rebase de una rama, transmitir los logs del pod y purgar los worktrees cuyo trabajo ya se integró.",
+        "description": "Un panel de control para trabajar en Kiro Crew mismo. Lista cada worktree de función junto con el estado de su pull request, su número de commits y su uso de disco, y puede levantar cualquiera de ellos como un pod: una instancia de vista previa completa en su propio puerto y con su propio directorio de datos, para que revises un cambio sin terminar sin tocar tu gateway en vivo. También se encarga de las tareas de alrededor — traer main y recompilar, hacer rebase de una rama, transmitir los logs del pod y purgar los worktrees cuyo trabajo ya se integró.",
         "display_name": "Dev Fleet",
         "highlight_1": "Levanta cualquier worktree como un pod aislado en su propio puerto y directorio de datos, sin tocar tu gateway en vivo",
         "highlight_2": "Vista de flota con el estado del PR por rama, el número de commits y el uso de disco",
@@ -4995,7 +4995,7 @@
     },
     "workflows": {
       "manifest": {
-        "description": "Desarrollo basado en especificaciones dentro de kirocrew-customapi: convierte una idea de función en Requisitos → Diseño → Tareas con un agente integrado, revisa el markdown en la propia app y luego entrega el plan aprobado a una sesión de ejecución autónoma.",
+        "description": "Crea, ejecuta y observa flujos de trabajo dinámicos: scripts de Python, normalmente escritos por un agente a partir de un objetivo en lenguaje natural, que guían a varios agentes de Kiro Crew por fases ordenadas. Un script se comprueba contra un conjunto aislado de comandos de flujo de trabajo antes de que se ejecute nada, así los errores salen a la luz sin ejecutarse, y luego la página transmite cada fase y cada evento de los agentes a medida que avanza la ejecución. La aplicación incluye ejemplos ejecutables para empezar.",
         "display_name": "Flujos de trabajo",
         "highlight_1": "Valida un flujo de trabajo antes de ejecutarlo — los errores salen a la luz sin que se ejecute nada",
         "highlight_2": "Observa la ejecución en vivo, fase por fase, con eventos de avance por agente",
@@ -7863,7 +7863,7 @@
       "gitlab_cli_login_required": "Se requiere iniciar sesión en la CLI de GitLab",
       "gitlab_merges_this_merge_request_when_the_pipeli": "GitLab fusiona esta merge request cuando el pipeline se completa correctamente — la fusiona de inmediato si no hay ningún pipeline pendiente",
       "gitlab_will_merge_this_merge_request_when_the_pi": "GitLab fusionará esta merge request cuando el pipeline se complete correctamente",
-      "kiro_crew_uses_your_local_provider_cli_to_load_p": "kirocrew-customapi uses your local provider CLI to load pull requests. Run this command in your terminal, then retry.",
+      "kiro_crew_uses_your_local_provider_cli_to_load_p": "{{productName}} usa la CLI de tu proveedor local para cargar las pull requests. Ejecuta este comando en tu terminal y vuelve a intentarlo.",
       "loading_diff": "Cargando el diff…",
       "loading_source_provider": "Cargando el proveedor de origen…",
       "merge_blocked": "Fusión bloqueada",
@@ -15066,7 +15066,26 @@
         "message_font_size_desc": "Tamaño de fuente de la conversación, en todas las sesiones: texto de los mensajes, código, tablas, respuestas sugeridas y el cuadro de entrada de mensajes. El ancho de contenido compacto crece en proporción. La barra lateral, la lista de sesiones y el resto de la interfaz no se ven afectados.",
         "remove_the_agents_pin": "Quitar su fijación",
         "failed_to_clear_agent_model_pin": "No se pudo quitar el modelo fijado del agente ({{error}}). Inténtalo de nuevo.",
-        "failed_to_clear_agent_model_pin_no_reason": "No se pudo quitar el modelo fijado del agente. Inténtalo de nuevo."
+        "failed_to_clear_agent_model_pin_no_reason": "No se pudo quitar el modelo fijado del agente. Inténtalo de nuevo.",
+        "provider": "Proveedor",
+        "provider_preset": "Plantilla",
+        "provider_url": "URL base",
+        "provider_api_key": "Clave de API",
+        "provider_api_key_saved": "••• guardada (déjalo vacío para conservarla)",
+        "provider_save": "Guardar proveedor",
+        "provider_managed_by_kiro_cli": "Gestionado por kiro-cli: el router, los modelos y las credenciales se configuran allí.",
+        "provider_test": "Probar conexión",
+        "provider_test_ok": "Conectado: modelos encontrados",
+        "provider_test_failed": "Error de conexión",
+        "provider_models": "Elige los modelos que se muestran en el selector (vacío = todos)",
+        "failed_to_save_provider": "No se pudo guardar la configuración del proveedor",
+        "vision": "Visión",
+        "security_shim": "Seguridad y shim",
+        "failed_to_save_vision_mode": "No se pudo guardar el modo de entrada de imágenes",
+        "failed_to_save_vision_redirect": "No se pudo guardar el comportamiento para modelos solo de texto",
+        "failed_to_save_vision_fallback": "No se pudo guardar el modelo de visión de respaldo",
+        "provider_claude_login_hint": "Usa el inicio de sesión de Claude Pro/Max de `claude /login` en este equipo. En un servidor sin pantalla, ejecuta `claude setup-token` y pega el token como clave de API.",
+        "provider_anthropic_key_hint": "Se conecta directamente a la API de Anthropic con tu clave de API (facturación por token). Deja vacía la URL base."
       },
       "computerUsePanel": {
         "accessibility": "Accesibilidad",

@@ -5,6 +5,7 @@ import { ErrorCard, isAuthRequired, isCapabilitiesChanged, isModelUnentitled, is
 import type { ChatMessage } from '../types'
 import { FEATURE_REQUEST_FORM_URL } from '../prompts/featureRequest'
 import { i18nT } from '../i18n/t'
+import { FEATURE_REQUEST_URL } from '../prompts/featureRequest'
 
 const setupMeta = (member = 'reviewer') => ({
   code: 'memory_unavailable',
@@ -312,7 +313,7 @@ describe('ErrorCard — feature request refused for a usage limit', () => {
 
   it('points at the repo\'s feature_request issue template, not a blank issue', () => {
     const url = new URL(FEATURE_REQUEST_FORM_URL)
-    expect(url.origin + url.pathname).toBe('https://github.com/kirodotdev/KiroCrew/issues/new')
+    expect(url.origin + url.pathname).toBe(FEATURE_REQUEST_URL)
     expect(url.searchParams.get('template')).toBe('feature_request.yml')
   })
 

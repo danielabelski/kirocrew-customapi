@@ -33,6 +33,7 @@ vi.mock('../components/McpBrowserModal', () => ({
 
 import McpTab from '../pages/overview/McpTab'
 import { MemoryRouter } from 'react-router-dom'
+import { i18nT } from '../i18n/t'
 
 const server = (name: string): McpServer => ({
   name, command: `${name}-cmd`, status: 'ok', source: 'kirocrew', enabled: true, tools: ['t1'],
@@ -781,7 +782,8 @@ describe('McpTab disabled-in-config rows', () => {
     // badges read identically to a screen reader: two unnamed inert buttons.
     // Not the pending-uninstall wording the same styling means on a staged row.
     const names: string[] = []
-    for (const [scope, label] of [['kirocrew', 'Kiro Crew'], ['kiroGlobal', 'Kiro']] as const) {
+    // The Crew scope's label is the catalog's (a fork renames it), not a literal.
+    for (const [scope, label] of [['kirocrew', i18nT('pages.overview.mcpTab.kirocrew')], ['kiroGlobal', 'Kiro']] as const) {
       const badge = tr.querySelector<HTMLButtonElement>(`button[data-scope="${scope}"]`)
       expect(badge, scope).not.toBeNull()
       expect(badge).toBeDisabled()

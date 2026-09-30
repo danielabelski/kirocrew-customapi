@@ -2001,7 +2001,7 @@
     },
     "devFleet": {
       "manifest": {
-        "description": "Un panneau de contrôle pour travailler sur kirocrew-customapi lui-même. Liste chaque worktree de fonctionnalité avec l’état de sa pull request, son nombre de commits et son occupation disque, et peut démarrer n’importe lequel sous forme de pod : une instance de prévisualisation complète, sur son propre port et avec son propre répertoire de données, pour parcourir une modification inachevée sans perturber ton gateway en service. Il prend aussi en charge les corvées associées — récupérer main et recompiler, rebaser une branche, diffuser les journaux d’un pod et élaguer les worktrees dont le travail est déjà fusionné.",
+        "description": "Un panneau de contrôle pour travailler sur Kiro Crew lui-même. Liste chaque worktree de fonctionnalité avec l’état de sa pull request, son nombre de commits et son occupation disque, et peut démarrer n’importe lequel sous forme de pod : une instance de prévisualisation complète, sur son propre port et avec son propre répertoire de données, pour parcourir une modification inachevée sans perturber ton gateway en service. Il prend aussi en charge les corvées associées — récupérer main et recompiler, rebaser une branche, diffuser les journaux d’un pod et élaguer les worktrees dont le travail est déjà fusionné.",
         "display_name": "Dev Fleet",
         "highlight_1": "Démarre n’importe quel worktree comme un pod isolé, sur son propre port et son propre répertoire de données, sans toucher à ton gateway en service",
         "highlight_2": "Vue de flotte avec l’état des PR par branche, le nombre de commits et l’occupation disque",
@@ -5081,7 +5081,7 @@
     },
     "workflows": {
       "manifest": {
-        "description": "Développement piloté par les spécifications au sein de kirocrew-customapi : transforme une idée de fonctionnalité en Exigences → Conception → Tâches avec un agent intégré, relis le markdown dans l’application, puis confie le plan approuvé à une session d’exécution autonome.",
+        "description": "Crée, exécute et suis des workflows dynamiques : des scripts Python, généralement écrits pour toi par un agent à partir d’un objectif en langage courant, qui pilotent plusieurs agents Kiro Crew à travers des phases ordonnées. Un script est vérifié contre un jeu de commandes de workflow en bac à sable avant toute exécution, donc les erreurs apparaissent sans rien exécuter, puis la page diffuse chaque phase et chaque événement d’agent à mesure que l’exécution avance. Des exemples exécutables sont fournis avec l’application comme point de départ.",
         "display_name": "Workflows",
         "highlight_1": "Valide un workflow avant de l’exécuter — les erreurs apparaissent sans que rien ne s’exécute",
         "highlight_2": "Suis l’exécution en direct, phase par phase, avec des événements de progression par agent",
@@ -7863,7 +7863,7 @@
       "gitlab_cli_login_required": "Connexion à la CLI GitLab requise",
       "gitlab_merges_this_merge_request_when_the_pipeli": "GitLab fusionne cette merge request quand le pipeline réussit — la fusion est immédiate si aucun pipeline n’est en attente",
       "gitlab_will_merge_this_merge_request_when_the_pi": "GitLab fusionnera cette merge request quand le pipeline réussira",
-      "kiro_crew_uses_your_local_provider_cli_to_load_p": "kirocrew-customapi uses your local provider CLI to load pull requests. Run this command in your terminal, then retry.",
+      "kiro_crew_uses_your_local_provider_cli_to_load_p": "{{productName}} utilise la CLI locale de votre fournisseur pour charger les pull requests. Exécutez cette commande dans votre terminal, puis réessayez.",
       "loading_diff": "Chargement du diff…",
       "loading_source_provider": "Chargement du fournisseur source…",
       "merge_blocked": "Fusion bloquée",
@@ -15066,7 +15066,26 @@
         "message_font_size_desc": "Taille de police de la conversation, dans toutes les sessions : texte des messages, code, tableaux, réponses suggérées et zone de saisie du message. La largeur de contenu compacte s'élargit en proportion. La barre latérale, la liste des sessions et le reste de l'interface ne sont pas affectés.",
         "remove_the_agents_pin": "Retirer son épingle",
         "failed_to_clear_agent_model_pin": "Impossible de retirer le modèle épinglé de l’agent ({{error}}). Réessaie.",
-        "failed_to_clear_agent_model_pin_no_reason": "Impossible de retirer le modèle épinglé de l’agent. Réessaie."
+        "failed_to_clear_agent_model_pin_no_reason": "Impossible de retirer le modèle épinglé de l’agent. Réessaie.",
+        "provider": "Fournisseur",
+        "provider_preset": "Préréglage",
+        "provider_url": "URL de base",
+        "provider_api_key": "Clé d’API",
+        "provider_api_key_saved": "••• enregistrée (laisser vide pour la conserver)",
+        "provider_save": "Enregistrer le fournisseur",
+        "provider_managed_by_kiro_cli": "Géré par kiro-cli : le routeur, les modèles et les identifiants s’y configurent.",
+        "provider_test": "Tester la connexion",
+        "provider_test_ok": "Connecté – modèles trouvés",
+        "provider_test_failed": "Échec de la connexion",
+        "provider_models": "Choisissez les modèles affichés dans le sélecteur (vide = tous)",
+        "failed_to_save_provider": "Impossible d’enregistrer les paramètres du fournisseur",
+        "vision": "Vision",
+        "security_shim": "Sécurité et shim",
+        "failed_to_save_vision_mode": "Impossible d’enregistrer le mode d’entrée des images",
+        "failed_to_save_vision_redirect": "Impossible d’enregistrer le comportement des modèles texte uniquement",
+        "failed_to_save_vision_fallback": "Impossible d’enregistrer le modèle de vision de secours",
+        "provider_claude_login_hint": "Utilise la connexion Claude Pro/Max de `claude /login` sur cette machine. Sur un serveur sans écran, lancez `claude setup-token` et collez le jeton comme clé d’API.",
+        "provider_anthropic_key_hint": "Contacte directement l’API Anthropic avec votre clé d’API (facturée au jeton). Laissez l’URL de base vide."
       },
       "computerUsePanel": {
         "accessibility": "Accessibilité",

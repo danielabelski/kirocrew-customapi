@@ -3,6 +3,7 @@ import { render, fireEvent, waitFor, within } from '@testing-library/react'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { RedactionCoach } from '../components/RedactionCards'
 import { api } from '../api/client'
+import { FEATURE_REQUEST_URL } from '../prompts/featureRequest'
 
 const copied: string[] = []
 let copyResult = true
@@ -258,7 +259,7 @@ describe('credential lock tag', () => {
     expect(card.textContent).toContain('Not a secret? Report a false positive')
     const report = getByTestId('redaction-report') as HTMLAnchorElement
     const issue = new URL(report.href)
-    expect(`${issue.origin}${issue.pathname}`).toBe('https://github.com/kirodotdev/KiroCrew/issues/new')
+    expect(`${issue.origin}${issue.pathname}`).toBe(FEATURE_REQUEST_URL)
     expect(issue.searchParams.get('title')).toBe('Redaction false positive: aws_secret_access_key')
     expect(issue.searchParams.get('body')).toContain('**Card:** credential redaction')
     // Only the rule name leaves: no path, no command, no session.

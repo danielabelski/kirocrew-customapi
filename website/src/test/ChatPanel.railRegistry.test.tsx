@@ -45,7 +45,9 @@ vi.mock('../api/client', () => ({
     sttConfig: () => Promise.resolve({ enabled: false, provider: '', model: '', available: false, streaming: false, transcribe_region: '', transcribe_profile: '', language_code: 'en-US', models: {}, language_codes: [] }),
     // user_role 'other': the Describe your role input renders only for it.
     kirocrewConfig: () => Promise.resolve({
-      agent: { completion_keep: 'head', completion_keep_chars: 3000, model: 'auto', reasoning_effort: '' },
+      // provider: the fork's Provider page shows its URL / key / preset rows
+      // only for a backend that has them (not kiro-native).
+      agent: { completion_keep: 'head', completion_keep_chars: 3000, model: 'auto', reasoning_effort: '', provider: 'claude_code' },
       dashboard: { user_role: 'other', user_role_other: 'SRE', user_technical_level: 'expert' },
     }),
     models: () => Promise.resolve([{ model_name: 'auto', description: 'Default' }]),
