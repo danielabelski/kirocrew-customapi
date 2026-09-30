@@ -1545,7 +1545,7 @@ jobs:
           cp "$RPM_ARM64" promotion-bundle/KiroCrew-aarch64.rpm
           MAC_SET=("$MAC_ZIP" "$DMG" "$MAC_ZIP_ARM64" "$DMG_ARM64" "$MAC_ZIP_X64" "$DMG_X64")
           MAC_FOUND=0
-          for f in "${MAC_SET[@]}"; do
+          for f in ${MAC_SET[@]+"${MAC_SET[@]}"}; do
             if [ -n "$f" ]; then MAC_FOUND=$((MAC_FOUND + 1)); fi
           done
           if [ "$MAC_FOUND" -eq 6 ]; then
