@@ -57,7 +57,10 @@ class TestWidgetBlockPlaceholder:
         # bundled skill. Regression guard against reintroducing the bloat.
         for density in ("more", "less"):
             result = _resolve("{{WIDGET_BLOCK}}", "dashboard:abc", density=density)
-            assert len(result) < 700, f"{density} pointer too long: {len(result)} chars"
+            assert "var(--bg)" not in result, f"theme var leaked into {density} pointer"
+            assert "var(--card)" not in result
+            assert "Chart.js" not in result
+            assert "bg-[var(" not in result
 
     def test_pointer_is_short(self):
         # Hard budget per density. The pre-pointer block was ~800 chars of

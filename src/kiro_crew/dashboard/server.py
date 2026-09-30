@@ -4939,6 +4939,19 @@ def _register_stt_hooks(app: web.Application) -> None:
     app.on_cleanup.append(_stt_shutdown)
 
 
+
+#: Fork: config paths whose change needs a provider-factory reload. The
+#: custom-provider endpoint / key / wire format and the shim switch are baked
+#: into the factory's spawn env just like the backend choice (see
+#: kiro_crew.claude_auth), so they reload exactly like a provider switch.
+PROVIDER_RELOAD_KEYS: tuple[str, ...] = (
+    "agent.provider",
+    "agent.provider_base_url",
+    "agent.provider_api_key",
+    "agent.provider_api_format",
+    "agent.use_shim",
+)
+
 def _register_config_watch(
     app: web.Application, state: DashboardState, initial: KiroCrewConfig | None
 ) -> None:
@@ -5003,18 +5016,8 @@ def _register_config_watch(
             cfg.agent.provider,
         )
 
-    # Fork: the custom-provider endpoint/key/wire-format are baked into the
-    # provider factory's env just like the backend choice, so a change to any of
-    # them needs the same factory reload as a provider switch.
-    _provider_keys = (
-        "agent.provider",
-        "agent.provider_base_url",
-        "agent.provider_api_key",
-        "agent.provider_api_format",
-    )
-
     async def _apply_provider(change: ConfigChange) -> None:
-        if not change.touched(*_provider_keys):
+        if not change.touched(*PROVIDER_RELOAD_KEYS):
             return
         # The switch runs OFF the watcher's cycle, like a channel reconnect. It
         # clears the session registry and then shuts every retired provider down
@@ -5138,7 +5141,7 @@ def _register_config_watch(
     # WorkflowService and ChannelManager bind their own setters in their
     # constructors (``live.bind``), the rule for an applier a long-lived object owns.
     subs = [
-        live.subscribe(*_provider_keys, callback=_apply_provider, name="agent.provider"),
+        live.subscribe(*PROVIDER_RELOAD_KEYS, callback=_apply_provider, name="agent.provider"),
         live.subscribe(
             "agent.role_models.background",
             callback=_apply_background_model,

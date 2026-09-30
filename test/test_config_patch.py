@@ -1321,16 +1321,20 @@ class TestProviderPatch:
         data = json.loads(tmp_config.read_text(encoding="utf-8"))
         assert data["agent"]["provider_api_key"] == "sk-test-123"
 
-    @pytest.mark.asyncio
-    async def test_provider_base_url_triggers_reload(self, tmp_config) -> None:
-        app = self._provider_app()
-        with patch("kiro_crew.agent.rebuild_agent_config") as rebuild:
-            async with TestClient(TestServer(app)) as c:
-                assert (
-                    await _patch(c, "agent.provider_base_url", "http://localhost:8317")
-                ).status == 200
-            rebuild.assert_called_once()
-        app["state"].sessions.reload_provider_factory.assert_awaited_once()
+    def test_router_settings_trigger_a_provider_reload(self) -> None:
+        # Provider reloads are driven by the live config watcher
+        # (server._register_config_watch -> _apply_provider), not by the PATCH
+        # handler; every router setting must be in the set it reacts to.
+        from kiro_crew.dashboard.server import PROVIDER_RELOAD_KEYS
+
+        for key in (
+            "agent.provider",
+            "agent.provider_base_url",
+            "agent.provider_api_key",
+            "agent.provider_api_format",
+            "agent.use_shim",
+        ):
+            assert key in PROVIDER_RELOAD_KEYS
 
 
 class TestProviderApiFormat:

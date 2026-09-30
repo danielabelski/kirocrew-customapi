@@ -9,9 +9,9 @@ since an empty advertised set cannot be told apart from "entitled to nothing".
 sentinel, not a served model.
 """
 
-import json
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 

@@ -9198,8 +9198,16 @@ class AcpClient:
         # back to the configured default model, then 'auto'; raise only when even
         # the default is unusable (a genuinely broken entitlement). Not for
         # claude: its advertised list is the adapter's own catalog (or, on the
-        # router path, the router's), and an explicit pick must reach it.
-        if not self._is_claude and not self._is_kiro and self._model_is_unusable(model_id):
+        # router path, the router's), and an explicit pick must reach it. Nor
+        # for backends that advertise model+effort PAIRS (codex): a bare id is
+        # legitimately absent from that list and upstream's pair typing in
+        # _push_model_config_option resolves it.
+        if (
+            not self._is_claude
+            and not self._is_kiro
+            and self.backend not in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+            and self._model_is_unusable(model_id)
+        ):
             fallback = self._usable_fallback_model()
             if not fallback:
                 _rejected_log, _ = redact_exfiltration_urls(str(model_id))
