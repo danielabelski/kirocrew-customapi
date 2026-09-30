@@ -1,3 +1,13 @@
+## [0.9.0-1.0] — 2026-09-30
+
+kirocrew-customapi release `v0.9.0-1.0` — kiro base `0.9.0` (upstream `main` at `6d3ec5037`) + fork version `1.0`.
+
+- **Base sync:** 2,675 upstream commits merged (not rebased, matching earlier syncs). Upstream's architecture wins; fork features are re-applied on top of its new `agent_sdk/backends`, `security/` and `subagent_manager/admission/` packages. The fork's opencode backend is folded into upstream's native one; the fork's "subagents cannot spawn subagents" guard is dropped because upstream now bounds nested spawns itself.
+- **Claude & Claude Code** (`kiro_crew/claude_auth.py`, [guide](docs/guides/claude-code.md)): a Claude Pro/Max login is used as-is (an ambient `ANTHROPIC_API_KEY` no longer overrides it); `claude setup-token` tokens ride as `CLAUDE_CODE_OAUTH_TOKEN`; on a router, Claude Code's background/subagent models are pinned to the chat model; `agent.use_shim` alone points Claude Code at the built-in shim. New "Claude subscription" and "Anthropic API key" presets in Settings → Chat → Provider; `doctor` prints the active Claude auth mode.
+- **Shim:** uses its own key (it sent the provider key before), answers with a proper `message`, forwards `tool_choice` / `stop_sequences` / `top_p` / tool errors, reports input tokens when streaming, and passes 400/404/413/429 through instead of a retryable 502.
+- **Fixes found while syncing:** the desktop `main.js` did not parse; the config schema turned every field into a string; `agent.provider=claude_code|opencode` was silently dropped by validation; the Claude router model pin never reached Claude Code; channel replies vanished on any session-store hiccup; signed x86_64 macOS builds would refuse their bundled ffmpeg; codex refused bare model ids; the provider test probed `/v1/v1/models`; conflict markers were committed in five docs; a whole test file had never run (SyntaxError).
+- **Tests:** full Python suite (~148k tests), frontend (~41.7k) and Electron (2,275) run; every remaining Python failure also fails on pristine upstream in the same container (root user / no IPv6 / no `gh`).
+
 
 ## [0.5.0-1.0] — 2026-09-06
 

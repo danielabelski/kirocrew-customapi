@@ -50,7 +50,7 @@
 
 ## Versioning
 
-This fork tracks upstream [`kirodotdev/KiroCrew`](https://github.com/kirodotdev/KiroCrew) — currently base **upstream `main`** (`v0.5.0` + all pushes since, synced 2026-09-06). Every release is tagged **`{upstream}-{n}`** — for example `0.5.0-1.0` means *official kiro `0.5.0` + fork revision `1.0`*. The upstream part tells you how up-to-date the sync is, the fork part counts revisions since it. The current release is **`v0.5.0-1.0`**. See [`CHANGELOG.md`](CHANGELOG.md) for what each fork revision adds.
+This fork tracks upstream [`kirodotdev/KiroCrew`](https://github.com/kirodotdev/KiroCrew) — currently base **upstream `main`** (`v0.9.0`, synced 2026-09-29). Every release is tagged **`{upstream}-{n}`** — for example `0.9.0-1.0` means *official kiro `0.9.0` + fork revision `1.0`*. The upstream part tells you how up-to-date the sync is, the fork part counts revisions since it. The current release is **`v0.9.0-1.0`**. See [`CHANGELOG.md`](CHANGELOG.md) for what each fork revision adds.
 
 ## Why this fork? (Custom API Edition)
 
@@ -63,6 +63,7 @@ This fork tracks upstream [`kirodotdev/KiroCrew`](https://github.com/kirodotdev/
 | 3 | **Bundled MCP bridge adapter** — `kirocrew-bridge` ships in-tree with tool allowlisting out of the box | Model Context Protocol (MCP) tool integration with zero extra installs |
 | 4 | **Hardened local runtime** — 30+ edge-case fixes across ACP streaming, sandboxing, path-traversal guards (`O_NOFOLLOW`), SQLite race resilience, and atomic persistence | Fail-closed security with rate and payload-size guards, built for unattended operation |
 | 5 | **EU privacy & data sovereignty** — runs 100% on your hardware with no telemetry lock-in | A GDPR-friendly workspace: your code and conversations stay with you |
+| 6 | **Claude & Claude Code, every way** — your Claude Pro/Max login, a `claude setup-token` token for headless servers, an Anthropic API key, a router, or any OpenAI-compatible model through the built-in shim ([guide](docs/guides/claude-code.md)) | Use the Claude subscription you already pay for; nothing silently switches you to per-token billing |
 
 ## Quick start
 
