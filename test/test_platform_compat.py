@@ -185,10 +185,6 @@ class TestReexecPythonModule:
         monkeypatch.setattr(pc.os, "execv", lambda path, argv: calls.append((path, argv)))
         monkeypatch.setenv("PYTHONUTF8", "0")
         monkeypatch.setenv("PYTHONIOENCODING", "latin-1")
-        monkeypatch.setenv("PYTHONUTF8", "0")
-        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
-        monkeypatch.setenv("PYTHONUTF8", "0")
-        monkeypatch.setenv("PYTHONIOENCODING", "latin-1")
 
         pc.reexec_python_module("kiro_crew", ["gateway"])
 
@@ -227,48 +223,6 @@ class TestReexecPythonModule:
             "PYTHONPATH": os.pathsep.join(
                 p for p in (str(tmp_path), source_root, inherited_path) if p
             ),
-        }
-
-        result = subprocess.run(
-            [sys.executable, "-m", "utf8_reexec_probe"],
-            cwd=tmp_path,
-            env=env,
-            capture_output=True,
-            timeout=15,
-            check=False,
-        )
-
-        assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
-        assert "👻 restarted".encode() in result.stdout
-        assert os.environ["PYTHONUTF8"] == "1"
-        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
-
-    def test_reexec_successor_survives_hostile_parent_encoding(self, tmp_path):
-        """Exercise the real failure shape behind desktop in-app restarts.
-
-        The first interpreter intentionally starts with cp1252 streams on every
-        OS.  It re-execs without calling ensure_utf8_console, so only the
-        environment published by reexec_python_module can make the successor's
-        first emoji print safe.
-        """
-        probe = tmp_path / "utf8_reexec_probe.py"
-        probe.write_text(
-            "import os\n"
-            "from kiro_crew.platform_compat import reexec_python_module\n"
-            "if os.environ.get('_KIROCREW_UTF8_REEXEC_PROBE') == '1':\n"
-            "    print('👻 restarted')\n"
-            "else:\n"
-            "    os.environ['_KIROCREW_UTF8_REEXEC_PROBE'] = '1'\n"
-            "    reexec_python_module('utf8_reexec_probe', [])\n",
-            encoding="utf-8",
-        )
-        source_root = str(Path(__file__).resolve().parents[1] / "src")
-        inherited_path = os.environ.get("PYTHONPATH", "")
-        env = {
-            **os.environ,
-            "PYTHONUTF8": "0",
-            "PYTHONIOENCODING": "cp1252",
-            "PYTHONPATH": os.pathsep.join(p for p in (source_root, inherited_path) if p),
         }
 
         result = subprocess.run(
@@ -1014,19 +968,6 @@ class TestFindPythonInterpreter:
 
 
 class TestUtf8Console:
-    @pytest.mark.parametrize("is_windows", [False, True])
-    def test_call_publishes_utf8_for_children(self, monkeypatch, is_windows):
-        monkeypatch.setattr(pc, "IS_WINDOWS", is_windows)
-        monkeypatch.setattr(pc.sys, "stdout", None)
-        monkeypatch.setattr(pc.sys, "stderr", None)
-        monkeypatch.setenv("PYTHONUTF8", "0")
-        monkeypatch.setenv("PYTHONIOENCODING", "cp1252")
-
-        pc.ensure_utf8_console()
-
-        assert os.environ["PYTHONUTF8"] == "1"
-        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
-
     @pytest.mark.parametrize("is_windows", [False, True])
     def test_call_publishes_utf8_for_children(self, monkeypatch, is_windows):
         monkeypatch.setattr(pc, "IS_WINDOWS", is_windows)
@@ -5120,8 +5061,6 @@ class TestCtypesStructsAreModuleScoped:
                 for base in node.bases
             )
         ]
-        assert os.environ["PYTHONUTF8"] == "1"
-        assert os.environ["PYTHONIOENCODING"] == "utf-8:backslashreplace"
         assert not local_structs, (
             f"{func_name} declares {local_structs} in its body; each call would pin a new "
             "type in ctypes' pointer-type memo. Hoist the layout to module scope."
@@ -6930,6 +6869,7 @@ class TestKillProcessTreePinned:
 
         monkeypatch.setattr(pc, "IS_WINDOWS", False)
         monkeypatch.setattr(pc, "_open_process_query_handle", opened.append)
+        # Fork: POSIX confirms the pinned start time before signalling.
         monkeypatch.setattr(pc, "process_start_time", lambda pid: "anything")
         monkeypatch.setattr(
             pc, "kill_process_tree", lambda pid, sig: killed.append((pid, sig)) or True
@@ -6939,6 +6879,18 @@ class TestKillProcessTreePinned:
 
         assert killed == [(4321, pc.SIGTERM)]
         assert opened == [], "no handle work on POSIX"
+
+    @pytest.mark.parametrize("live", [None, "other"])
+    def test_posix_refuses_a_recycled_or_unreadable_pid(self, monkeypatch, live):
+        """Fork: a PID whose start time no longer matches is never signalled."""
+        killed: list = []
+        monkeypatch.setattr(pc, "IS_WINDOWS", False)
+        monkeypatch.setattr(pc, "process_start_time", lambda pid: live)
+        monkeypatch.setattr(
+            pc, "kill_process_tree", lambda pid, sig: killed.append((pid, sig)) or True
+        )
+        assert pc.kill_process_tree_pinned(4321, "expected", pc.SIGTERM) is False
+        assert killed == []
 
     def test_the_pinned_identity_is_the_same_half_process_start_time_returns(self, monkeypatch):
         """Both sides must read the CREATION half, or the comparison is nonsense.
