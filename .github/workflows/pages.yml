@@ -3,12 +3,8 @@ name: Deploy Site (GitHub Pages)
 # Publishes the public marketing site in site/ to GitHub Pages.
 # Path-scoped to site/** so it never runs for backend (kirocrew-client-py)
 # or dashboard (website/) changes — and those workflows never run for site-only PRs.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'site/**'
-      - '.github/workflows/pages.yml'
   workflow_dispatch:
 
 # Least privilege at the workflow level: only checkout. The build job runs npm

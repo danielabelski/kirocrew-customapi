@@ -23,12 +23,9 @@ name: GPT 5.6 Review
 #     ledger can only suppress REPEAT reporting of an adjudicated class — it
 #     never waives a new defect and never turns the gate green.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    # `edited` is included so a later PR title/body edit re-runs the review with
-    # FRESH intent -- otherwise a green verdict would rest on stale author intent
-    # after an edit (the review now consumes title/body below).
-    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
 
 permissions:
   contents: read

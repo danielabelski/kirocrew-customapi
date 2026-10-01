@@ -78,12 +78,8 @@ name: PR Readiness Self-Heal Sweep
 #      place on every push, so the dispatch would be spent per bot edit, per PR,
 #      repo-wide. Deleting the record with no replacement leaves nothing
 #      observable and waits for a push or a manual dispatch.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    # Every 15 minutes. A normal fan-out publishes terminal state via events
-    # well inside this window; anything still `pending` past STALE_MINUTES is
-    # treated as a dropped-event freeze and nudged.
-    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:

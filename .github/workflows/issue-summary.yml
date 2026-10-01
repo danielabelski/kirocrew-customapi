@@ -93,9 +93,8 @@
 
 name: Issue Summary
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  issues:
-    types: [opened]
   workflow_dispatch:
     inputs:
       issue:

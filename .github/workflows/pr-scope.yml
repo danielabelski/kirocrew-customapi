@@ -14,9 +14,9 @@ name: PR Scope
 # compares the diff against the PR's stated purpose and flags undeclared scope.
 # This gate covers only what a model cannot see cheaply: raw breadth.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

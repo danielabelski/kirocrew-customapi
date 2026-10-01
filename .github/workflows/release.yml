@@ -1,8 +1,8 @@
 name: Release
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 # Prerelease tags build, sign, publish, and record one immutable promotion
 # bundle. A bare stable tag REBUILDS that same commit under the bare version, so

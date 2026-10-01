@@ -11,17 +11,8 @@ name: PR Merge-Conflict Label
 # code, recomputes mergeability itself, or re-runs any checks. It also never
 # blocks merge (GitHub already blocks a conflicting merge) -- the label is
 # purely a visibility signal.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    # Backstop sweep. A PR flips MERGEABLE -> CONFLICTING purely because its
-    # base branch advanced, and GitHub emits NO pull_request event for that,
-    # so a periodic sweep is the only way to catch the base-moved case.
-    - cron: "*/30 * * * *"
-  push:
-    # A merge into the default branch is the usual cause of other open PRs
-    # becoming conflicted -- re-sweep immediately so the labels stay fresh
-    # without waiting for the next scheduled run.
-    branches: [main]
   workflow_dispatch: {}
 
 permissions:

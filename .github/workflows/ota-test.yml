@@ -35,12 +35,10 @@
 # to the user's.
 name: OTA Update Test (macOS)
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
   workflow_dispatch:
   workflow_call:
-  schedule:
-    # Nightly, offset from the release nightly so they do not contend.
-    - cron: "40 8 * * *"
 
 permissions:
   contents: read

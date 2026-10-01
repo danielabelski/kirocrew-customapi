@@ -18,9 +18,8 @@
 # run.
 name: Fix Loop Analysis
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    - cron: "0 17 * * 1" # Mondays 17:00 UTC (after the 16:00 deferred audit)
   workflow_dispatch:
     inputs:
       window_days:

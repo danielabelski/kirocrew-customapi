@@ -61,10 +61,8 @@
 
 name: Ship Report
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    - cron: "0 16 * * *" # 9am PDT
-    - cron: "0 0 * * *" # 5pm PDT
   workflow_dispatch:
     inputs:
       lookback_hours:
