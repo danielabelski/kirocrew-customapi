@@ -34,9 +34,9 @@ name: Opus 4.8 Review
 # pattern; this mirrors it, with the same SHA-scoped marker contract as
 # codex-review.yml ([OPUS-REVIEWED] / [BLOCK-MERGE]).
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

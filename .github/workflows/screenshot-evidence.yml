@@ -20,11 +20,9 @@ name: Screenshot Evidence
 # (self-service for fork contributors, who cannot add labels). Both warn
 # instead of passing silently.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    # `edited` matters: adding the screenshots to the body must be able to turn
-    # this check green WITHOUT forcing a no-op code push.
-    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+  workflow_dispatch:
 
 permissions:
   contents: read

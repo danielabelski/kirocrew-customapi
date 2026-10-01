@@ -53,13 +53,8 @@ name: Main Ratchet Audit
 # judge the integrated tree, which is the only question a push to main can
 # answer and the reason this lane exists.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  push:
-    branches: [main]
-  # PRs are deliberately NOT a trigger: a pull request already runs these exact
-  # gates against its own diff in ci.yml. This lane's whole value is evaluating
-  # them on main's INTEGRATED tree, which only a push (or a manual dispatch)
-  # produces.
   workflow_dispatch: {}
 
 permissions:

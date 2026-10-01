@@ -22,9 +22,9 @@ name: Cross-Platform Portability
 # `main` are full of them (`/usr/bin/gh`, `/tmp/...`), every one behind a
 # `skipif(sys.platform == "win32")` or a mock that never touches a real path.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
 
 permissions:
   contents: read

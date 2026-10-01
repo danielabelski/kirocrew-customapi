@@ -31,13 +31,9 @@ name: First Principles Review
 # Amazon Bedrock; Fable 5 runs through anthropics/claude-code-action with
 # use_bedrock.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    # No `edited`: this reviewer does judge the stated intent, but so does Design
-    # Review, which runs without it, and a description rewrite would re-run the
-    # ladder's most expensive lane. A stale-intent verdict is corrected by the
-    # next push, and nothing here is a merge gate.
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

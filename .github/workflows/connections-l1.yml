@@ -16,9 +16,9 @@ name: Connections L1 Authorized-Grant Smoke
 # grant-bearing box. Not a pull_request check either (connections-l0.yml's stated
 # reason). No secrets or writes; the report is an artifact, grants stay on the box.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    - cron: "40 7 * * *" # 07:20 is L0's slot; stagger so the two never contend
+  workflow_dispatch:
 
 permissions:
   contents: read
