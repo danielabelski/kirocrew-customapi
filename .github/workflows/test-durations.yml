@@ -29,6 +29,7 @@ name: Update Test Durations
 # protected branch, so instead of committing directly it pushes a feature
 # branch and opens/updates a PR for review.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
   workflow_dispatch: {}
 
