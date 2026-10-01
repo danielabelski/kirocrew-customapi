@@ -25,14 +25,18 @@ Lark).
    its **App ID** and **App Secret** from *Credentials & Basic Info*.
 2. **Add the bot capability** — *Add features → Bot*.
 3. **Grant permissions** — under *Permissions & Scopes*, add
-   `im:message` (receive) and `im:message:send_as_bot` (reply).
+   `im:message.p2p_msg:readonly` (receive DMs) and
+   `im:message:send_as_bot` (reply). If you enable group chats, also add
+   `im:message.group_at_msg.include_bot:readonly` (receive group messages that
+   @-mention the bot). The broader `im:message` grant does not replace the
+   explicit p2p event scope in the current Feishu console.
 4. **Use long connection** — under *Events & Callbacks*, choose
    **Long connection** (not a request URL), then subscribe to
    `im.message.receive_v1`.
 5. **Publish the app** so your tenant can install it.
 6. **Find your open_id** — the console's API Explorer, or any inbound message
    in the gateway log, shows the sender's `open_id` (it starts with `ou_`).
-7. **Paste it into Settings** — open **Settings → Channels → Feishu**, put the
+7. **Paste it into Settings** — open **Settings → Messaging Channels → Feishu**, put the
    App ID and App Secret in their fields, add your `open_id` to the allow-list,
    turn the channel on, and save. Saving writes the two secrets to
    `~/.kiro/crew/.env` (owner-only, `0600`) and the rest to `config.json`, so
@@ -171,6 +175,16 @@ Known gaps, all follow-up work rather than defects:
 - **No auto-reconnect beyond the SDK's own.** `lark-oapi` reconnects
   internally; if it gives up, the gateway logs that the receiver is down and you
   restart.
+
+### Bot doesn’t receive direct messages
+
+- Confirm `im:message.p2p_msg:readonly` is granted. A green
+  `im:message.group_at_msg.include_bot:readonly` grant covers group @-mentions,
+  not private messages.
+- Publish a new app version after changing permissions; a draft permission does
+  not affect the installed bot.
+- Confirm `im.message.receive_v1` appears in the subscribed-event list, not only
+  that long connection is selected.
 
 ## How it fits together
 

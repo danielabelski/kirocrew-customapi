@@ -72,6 +72,63 @@ LangString KiroUpdateProgress 1055 "Bu işlem birkaç dakika sürebilir. ${PRODU
 LangString KiroUpdateProgress 1054 "อาจใช้เวลาหลายนาที ${PRODUCT_NAME} จะเปิดขึ้นอีกครั้งโดยอัตโนมัติ"
 LangString KiroUpdateProgress 1066 "Quá trình này có thể mất vài phút. ${PRODUCT_NAME} sẽ tự động mở lại."
 
+; A fresh install can finish before the default agent is usable. Keep this
+; handoff on the native Finish page: the shell must never download Kiro CLI or
+; start its login flow, but users should learn about both before first launch.
+LangString KiroCliPrerequisiteText 1033 "${PRODUCT_NAME} is installed. The default Kiro agent requires Kiro CLI, installed separately, and the command kiro-cli login. Use the official setup guide below."
+LangString KiroCliPrerequisiteText 1031 "${PRODUCT_NAME} ist installiert. Der standardmäßige Kiro-Agent benötigt die separat installierte Kiro CLI und den Befehl kiro-cli login. Verwenden Sie die offizielle Anleitung unten."
+LangString KiroCliPrerequisiteText 1036 "${PRODUCT_NAME} est installé. L'agent Kiro par défaut nécessite Kiro CLI, installé séparément, puis la commande kiro-cli login. Consultez le guide officiel ci-dessous."
+LangString KiroCliPrerequisiteText 3082 "${PRODUCT_NAME} está instalado. El agente Kiro predeterminado requiere instalar Kiro CLI por separado y ejecutar kiro-cli login. Consulta la guía oficial de abajo."
+LangString KiroCliPrerequisiteText 2052 "${PRODUCT_NAME} 已安装。默认 Kiro 代理需要单独安装 Kiro CLI，并运行 kiro-cli login。请使用下方的官方设置指南。"
+LangString KiroCliPrerequisiteText 1028 "${PRODUCT_NAME} 已安裝。預設 Kiro 代理需要另外安裝 Kiro CLI，並執行 kiro-cli login。請使用下方的官方設定指南。"
+LangString KiroCliPrerequisiteText 1041 "${PRODUCT_NAME} がインストールされました。既定の Kiro エージェントには、Kiro CLI の別途インストールと kiro-cli login の実行が必要です。以下の公式ガイドをご覧ください。"
+LangString KiroCliPrerequisiteText 1042 "${PRODUCT_NAME}이(가) 설치되었습니다. 기본 Kiro 에이전트를 사용하려면 Kiro CLI를 별도로 설치하고 kiro-cli login을 실행해야 합니다. 아래 공식 설정 가이드를 이용하세요."
+LangString KiroCliPrerequisiteText 1040 "${PRODUCT_NAME} è installato. L'agente Kiro predefinito richiede Kiro CLI, installato separatamente, e il comando kiro-cli login. Consulta la guida ufficiale qui sotto."
+LangString KiroCliPrerequisiteText 1043 "${PRODUCT_NAME} is geïnstalleerd. De standaard Kiro-agent vereist een apart geïnstalleerde Kiro CLI en de opdracht kiro-cli login. Gebruik de officiële handleiding hieronder."
+LangString KiroCliPrerequisiteText 1030 "${PRODUCT_NAME} er installeret. Standardagenten Kiro kræver, at Kiro CLI installeres separat, og at kiro-cli login køres. Brug den officielle vejledning nedenfor."
+LangString KiroCliPrerequisiteText 1053 "${PRODUCT_NAME} är installerat. Kiro-standardagenten kräver att Kiro CLI installeras separat och att kiro-cli login körs. Använd den officiella guiden nedan."
+LangString KiroCliPrerequisiteText 1044 "${PRODUCT_NAME} er installert. Standardagenten Kiro krever at Kiro CLI installeres separat, og at kiro-cli login kjøres. Bruk den offisielle veiledningen nedenfor."
+LangString KiroCliPrerequisiteText 1035 "${PRODUCT_NAME} on asennettu. Kiro-oletusagentti edellyttää, että Kiro CLI asennetaan erikseen ja komento kiro-cli login suoritetaan. Käytä alla olevaa virallista opasta."
+LangString KiroCliPrerequisiteText 1049 "${PRODUCT_NAME} установлено. Для агента Kiro по умолчанию нужно отдельно установить Kiro CLI и выполнить kiro-cli login. Используйте официальное руководство ниже."
+LangString KiroCliPrerequisiteText 2070 "O ${PRODUCT_NAME} está instalado. O agente Kiro padrão requer a instalação separada do Kiro CLI e o comando kiro-cli login. Use o guia oficial abaixo."
+LangString KiroCliPrerequisiteText 1046 "O ${PRODUCT_NAME} está instalado. O agente Kiro predefinido requer a instalação separada do Kiro CLI e o comando kiro-cli login. Use o guia oficial abaixo."
+LangString KiroCliPrerequisiteText 1045 "${PRODUCT_NAME} jest zainstalowany. Domyślny agent Kiro wymaga osobnej instalacji Kiro CLI i uruchomienia kiro-cli login. Skorzystaj z oficjalnego przewodnika poniżej."
+LangString KiroCliPrerequisiteText 1058 "${PRODUCT_NAME} установлено. Для стандартного агента Kiro потрібно окремо встановити Kiro CLI та виконати kiro-cli login. Скористайтеся офіційним посібником нижче."
+LangString KiroCliPrerequisiteText 1029 "${PRODUCT_NAME} je nainstalován. Výchozí agent Kiro vyžaduje samostatnou instalaci Kiro CLI a spuštění kiro-cli login. Použijte oficiální návod níže."
+LangString KiroCliPrerequisiteText 1051 "${PRODUCT_NAME} je nainštalovaný. Predvolený agent Kiro vyžaduje samostatnú inštaláciu Kiro CLI a spustenie kiro-cli login. Použite oficiálny návod nižšie."
+LangString KiroCliPrerequisiteText 1038 "A(z) ${PRODUCT_NAME} telepítve van. Az alapértelmezett Kiro-ügynökhöz külön kell telepíteni a Kiro CLI-t, majd futtatni a kiro-cli login parancsot. Használja az alábbi hivatalos útmutatót."
+LangString KiroCliPrerequisiteText 1025 "تم تثبيت ${PRODUCT_NAME}. يتطلب وكيل Kiro الافتراضي تثبيت Kiro CLI بشكل منفصل وتشغيل الأمر kiro-cli login. استخدم دليل الإعداد الرسمي أدناه."
+LangString KiroCliPrerequisiteText 1055 "${PRODUCT_NAME} yüklendi. Varsayılan Kiro aracısı için Kiro CLI'ın ayrıca yüklenmesi ve kiro-cli login komutunun çalıştırılması gerekir. Aşağıdaki resmi kılavuzu kullanın."
+LangString KiroCliPrerequisiteText 1054 "ติดตั้ง ${PRODUCT_NAME} แล้ว เอเจนต์ Kiro เริ่มต้นต้องติดตั้ง Kiro CLI แยกต่างหากและเรียกใช้ kiro-cli login โปรดใช้คู่มืออย่างเป็นทางการด้านล่าง"
+LangString KiroCliPrerequisiteText 1066 "Đã cài đặt ${PRODUCT_NAME}. Tác nhân Kiro mặc định yêu cầu cài riêng Kiro CLI và chạy kiro-cli login. Hãy dùng hướng dẫn chính thức bên dưới."
+
+LangString KiroCliPrerequisiteLink 1033 "Open the Kiro CLI setup guide"
+LangString KiroCliPrerequisiteLink 1031 "Kiro CLI-Einrichtungsanleitung öffnen"
+LangString KiroCliPrerequisiteLink 1036 "Ouvrir le guide de configuration de Kiro CLI"
+LangString KiroCliPrerequisiteLink 3082 "Abrir la guía de configuración de Kiro CLI"
+LangString KiroCliPrerequisiteLink 2052 "打开 Kiro CLI 设置指南"
+LangString KiroCliPrerequisiteLink 1028 "開啟 Kiro CLI 設定指南"
+LangString KiroCliPrerequisiteLink 1041 "Kiro CLI セットアップガイドを開く"
+LangString KiroCliPrerequisiteLink 1042 "Kiro CLI 설정 가이드 열기"
+LangString KiroCliPrerequisiteLink 1040 "Apri la guida di configurazione di Kiro CLI"
+LangString KiroCliPrerequisiteLink 1043 "Installatiehandleiding voor Kiro CLI openen"
+LangString KiroCliPrerequisiteLink 1030 "Åbn opsætningsvejledningen til Kiro CLI"
+LangString KiroCliPrerequisiteLink 1053 "Öppna installationsguiden för Kiro CLI"
+LangString KiroCliPrerequisiteLink 1044 "Åpne oppsettsveiledningen for Kiro CLI"
+LangString KiroCliPrerequisiteLink 1035 "Avaa Kiro CLI:n määritysopas"
+LangString KiroCliPrerequisiteLink 1049 "Открыть руководство по настройке Kiro CLI"
+LangString KiroCliPrerequisiteLink 2070 "Abrir o guia de configuração do Kiro CLI"
+LangString KiroCliPrerequisiteLink 1046 "Abrir o guia de configuração do Kiro CLI"
+LangString KiroCliPrerequisiteLink 1045 "Otwórz przewodnik konfiguracji Kiro CLI"
+LangString KiroCliPrerequisiteLink 1058 "Відкрити посібник із налаштування Kiro CLI"
+LangString KiroCliPrerequisiteLink 1029 "Otevřít návod k nastavení Kiro CLI"
+LangString KiroCliPrerequisiteLink 1051 "Otvoriť návod na nastavenie Kiro CLI"
+LangString KiroCliPrerequisiteLink 1038 "A Kiro CLI beállítási útmutatójának megnyitása"
+LangString KiroCliPrerequisiteLink 1025 "فتح دليل إعداد Kiro CLI"
+LangString KiroCliPrerequisiteLink 1055 "Kiro CLI kurulum kılavuzunu aç"
+LangString KiroCliPrerequisiteLink 1054 "เปิดคู่มือการตั้งค่า Kiro CLI"
+LangString KiroCliPrerequisiteLink 1066 "Mở hướng dẫn thiết lập Kiro CLI"
+
 !ifndef BUILD_UNINSTALLER
 
 Var KiroInstallDir
@@ -84,6 +141,21 @@ Var KiroAnimationsEnabled
 Var KiroWindowVisible
 Var KiroVisibleUpdate
 Var KiroUpdateCommitted
+; The app executable's filename, carried as a VARIABLE rather than referenced as
+; ${APP_EXECUTABLE_FILENAME} where it is used. That define comes from the
+; template's common.nsh, which is included AFTER this file, so a Function body --
+; compiled at !include time -- cannot see it: NSIS emits `warning 6000: unknown
+; variable/constant "{APP_EXECUTABLE_FILENAME}"` and silently drops it, which
+; would reduce an ownership test to a bare directory path. A !macro body is
+; expanded at its !insertmacro site and CAN see it, so customInit assigns this
+; variable and the Function reads it. (${APP_FILENAME} is fine at include time --
+; it comes from the generated header, not common.nsh.)
+Var KiroAppExeName
+; Bifurcation evidence for the shortcut heal in customInstall: whether a
+; sibling install root (the shape the former collision-nesting produced)
+; physically exists beside the root this update writes.
+Var KiroStaleSibling
+Var KiroStaleSiblingProbe
 
 ; The fade operates on the top-level dialog, the only window type for which
 ; AW_BLEND is supported. It runs once per page boundary and leaves the native
@@ -155,7 +227,87 @@ FunctionEnd
 ; fresh install must therefore own a directory that did not exist beforehand.
 ; Normalize a /D override to a product-name leaf and keep nesting past any
 ; collision. Registered updates retain their existing install root.
+;
+; AN UPDATE NEVER RELOCATES THE INSTALL, and that is checked FIRST -- before the
+; registry-derived guards below, not through them. electron-updater re-runs this
+; installer with `--updated` against an install that by definition already
+; exists, so the collision-nesting further down would resolve $INSTDIR to a
+; FRESH subdirectory and install the new version beside the running one instead
+; of over it. The result is two parallel installs: the update lands in one, the
+; shortcuts and the post-install relaunch keep pointing at the other, and the
+; stale copy re-discovers the very same update on its next feed check -- an
+; update loop the user cannot escape except by launching the new path by hand.
+;
+; The two guards below cannot carry this, because both are downstream of ONE
+; registry value: upstream's initMultiUser reads `InstallLocation` from
+; ${INSTALL_REGISTRY_KEY} into $perUserInstallationFolder /
+; $perMachineInstallationFolder, and customInit turns those into
+; $KiroHasPerUserInstallation / $KiroHasPerMachineInstallation. When that value
+; is missing both flags read 0, the guards fall through, and the update nests.
+; That is not hypothetical: on a machine that hit this loop the uninstall key
+; carried DisplayVersion, UninstallString and DisplayIcon all pointing at the
+; real install root while `InstallLocation` itself was absent from it. Note
+; which key that observation is about: registryAddInstallInfo writes
+; `InstallLocation` under ${INSTALL_REGISTRY_KEY} (Software\<GUID>) and never
+; under the Uninstall entry, so an Uninstall entry WITHOUT it is what every
+; healthy install looks like, and that reading proves nothing about the value
+; initMultiUser actually consults (scripts/smoke-windows-install.ps1 failed its
+; first run on the same misread). Whether the install-info key itself was
+; missing on that machine is not established -- which is exactly why the update
+; path must not depend on it being there.
+;
+; The guard tests $KiroVisibleUpdate rather than ${isUpdated}, and that is NOT
+; interchangeable here. ${isUpdated} expands to a StdUtils::TestParameter plugin
+; call, and this is a Function, so its body is compiled when this file is
+; !included -- before the generated script runs !addplugindir. Writing
+; ${isUpdated} here fails the build at compile time with "Plugin not found,
+; cannot call StdUtils::TestParameter". customInit gets away with it because a
+; !macro body is only expanded at its !insertmacro site, which is late enough.
+; customInit sets $KiroVisibleUpdate from ${isUpdated} before it calls this
+; function, and the install-mode page's leave callback runs later still, so the
+; variable is populated on both call paths.
+;
+; The update bypass is NOT unconditional, and must not be made so. `--updated` is
+; a command-line flag on a user-runnable installer, so it can arrive alongside
+; `/D=<any existing directory>`; an unconditional bypass would then adopt a
+; directory this installer never created, record it as the install root, and the
+; generated uninstaller -- which removes $INSTDIR recursively -- would delete the
+; user's pre-existing contents there on uninstall. So the bypass requires proof
+; that the target IS one of our install roots, and the proof is the presence of
+; this app's own executable in it. Path equality against the canonical default is
+; deliberately not used as the test: a path can match while the directory belongs
+; to something else, whereas our executable being there cannot. A registered root
+; is still short-circuited by the $KiroHasPer*Installation guards below.
+;
+; $KiroAppExeName, not ${APP_EXECUTABLE_FILENAME}: that define is unavailable at
+; !include time, and NSIS drops it with `warning 6000` instead of failing loudly,
+; which would silently reduce this test to a bare directory path and let the
+; bypass fire for a directory we do not own. See the Var declaration.
+;
+; What remains covered: the loop this fixes needs an update whose install root is
+; already a Kiro Crew install, which is exactly the case the executable check
+; admits. An update that cannot prove ownership falls through to the ordinary
+; fresh-install ownership path instead of adopting the directory.
+;
+; $KiroAppExeName is also tested for non-emptiness, BEFORE it is appended.
+; FileExists matches a directory as readily as a file, so an empty name collapses
+; the ownership proof into `FileExists "$KiroInstallDir\"` -- a bare directory
+; test, which is the same "reduce this test to a bare directory path and let the
+; bypass fire for a directory we do not own" outcome the Var declaration warns
+; about, reached by a different route. That warning covers the
+; ${APP_EXECUTABLE_FILENAME} include-time hazard; this covers the variable simply
+; never having been assigned, since only customInit assigns it. Without the test,
+; every safety property here rests on customInit having run first -- true on both
+; call paths today, and not something a page callback inserted ahead of it should
+; be able to quietly invalidate. The cost of being wrong is not a failed update:
+; the generated uninstaller removes $INSTDIR recursively, so adopting a directory
+; we did not create deletes whatever the user already had there.
 Function KiroEnsureAppInstallDir
+  ${If} $KiroVisibleUpdate == 1
+  ${AndIf} $KiroAppExeName != ""
+  ${AndIf} ${FileExists} "$KiroInstallDir\$KiroAppExeName"
+    Return
+  ${EndIf}
   ${If} $KiroScope == "current"
   ${AndIf} $KiroHasPerUserInstallation == 1
     Return
@@ -309,9 +461,31 @@ FunctionEnd
 !macroend
 
 ; Add callbacks around the stock MUI finish page without replacing its controls,
-; localization, run-after-finish behavior, or automatic progress handoff. The
-; packaging contract compares this copied StartApp block with electron-builder's
-; locked template so a dependency upgrade cannot silently drift from upstream.
+; localization, run-after-finish behavior, or automatic progress handoff.
+;
+; StartApp DELIBERATELY DIVERGES from electron-builder's template in exactly one
+; expression, and the packaging contract asserts that divergence instead of
+; equality so a dependency upgrade still cannot change it silently. Upstream
+; launches "$launchLink", which installSection.nsh resolves to $newStartMenuLink
+; whenever that shortcut exists and only falls back to the installed executable
+; when it does not. A shortcut is a POINTER, and on an update it is not
+; necessarily repointed: registryAddInstallInfo records KeepShortcuts="true", so
+; addStartMenuLink keeps whatever the previous install left behind. When that
+; shortcut names a different install root than the one this run just wrote --
+; exactly what the nesting bug guarded against above produces -- the relaunch
+; starts the OLD executable. The user then lands back on the version they just
+; updated away from, the app re-discovers the same update on its next feed check,
+; and every subsequent attempt repeats it. Launching
+; $INSTDIR\${APP_EXECUTABLE_FILENAME} names the bytes this installer just
+; installed, which is the one target that cannot be stale -- and it is not an
+; invented target: installSection.nsh assigns $launchLink exactly this path
+; whenever no Start Menu shortcut exists, so this promotes upstream's own
+; fallback to the only case. ${APP_EXECUTABLE_FILENAME} is defined globally in
+; the template's common.nsh, so it resolves wherever this macro is inserted.
+;
+; Losing the shortcut's AppUserModelID with it costs nothing here: main.js calls
+; app.setAppUserModelId() on win32 during startup, so taskbar grouping and
+; notification identity are established by the app itself either way.
 !macro customFinishPage
   !ifndef HIDE_RUN_AFTER_FINISH
     Function StartApp
@@ -320,11 +494,14 @@ FunctionEnd
       ${else}
         StrCpy $1 ""
       ${endif}
-      ${StdUtils.ExecShellAsUser} $0 "$launchLink" "open" "$1"
+      ${StdUtils.ExecShellAsUser} $0 "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "open" "$1"
     FunctionEnd
 
     !define MUI_FINISHPAGE_RUN
     !define MUI_FINISHPAGE_RUN_FUNCTION "StartApp"
+    !define MUI_FINISHPAGE_TEXT "$(KiroCliPrerequisiteText)"
+    !define MUI_FINISHPAGE_LINK "$(KiroCliPrerequisiteLink)"
+    !define MUI_FINISHPAGE_LINK_LOCATION "https://kiro.dev/cli/"
 
     ; The extraction page is the entire update UI. Once it reaches 100%, start
     ; the updated app through electron-builder's locked launch contract and
@@ -370,10 +547,130 @@ FunctionEnd
   CopyFiles /SILENT "${SOURCE}\*" "${DESTINATION}"
 !macroend
 
+; Heal a PERSISTED shortcut left naming a stale sibling install root.
+;
+; The relaunch half of that staleness is already handled: StartApp launches
+; $INSTDIR\${APP_EXECUTABLE_FILENAME} directly (see customFinishPage). What that
+; cannot reach is the shortcut a user clicks by hand later: with
+; KeepShortcuts="true", addStartMenuLink / addDesktopLink preserve whatever .lnk
+; a previous install left behind, so on a machine carrying two sibling install
+; roots both links can still name the stale one. Launching it lands on the
+; frozen copy, which re-discovers the update and re-runs a full download +
+; install on every launch.
+;
+; GATE. $keepShortcuts, not another FileExists probe, carries the ownership
+; proof here: this macro expands after installApplicationFiles, where
+; "$INSTDIR\${APP_EXECUTABLE_FILENAME}" exists unconditionally because this run
+; just wrote it. installSection.nsh sets $keepShortcuts to "true" only after
+; testing ${FileExists} "$appExe" BEFORE extraction -- the same
+; executable-presence proof KiroEnsureAppInstallDir's update bypass requires --
+; so ($KiroVisibleUpdate == 1) AND ($keepShortcuts == "true") is exactly "an
+; update whose install root was proven ours pre-extraction, and whose shortcuts
+; were preserved rather than recreated". A fresh install never reaches this,
+; and the $keepShortcuts == "false" branch needs no healing: the template
+; itself just re-created both links at $appExe there.
+;
+; REWRITE, NOT READ-AND-COMPARE. Reading a .lnk target needs the ShellLink
+; plugin, which this build does not bundle (the template ships only WinShell /
+; StdUtils / UAC), so an existing link is re-created at the root this run just
+; wrote without reading its current target. CreateShortCut resets any
+; arguments, icon or working directory a user edited onto a link, so the
+; rewrite must never touch a healthy machine: it additionally requires
+; PHYSICAL EVIDENCE OF BIFURCATION -- a sibling Kiro Crew install root in one
+; of the two shapes the former collision-nesting produced (this app's
+; executable directly in $INSTDIR's parent, or in an ${APP_FILENAME} child of
+; $INSTDIR). $KiroStaleSibling defaults to 0 and only the two existence probes
+; can set it, so a machine with a single install root keeps its customized
+; shortcuts untouched on every update. On a bifurcated machine the rewrite
+; discards customization on the two links it heals; a customized link naming a
+; frozen copy is already broken, and that loss is the accepted cost of not
+; bundling ShellLink. The ${FileExists} link gates keep a shortcut the user
+; deleted deleted. Arguments mirror the template's own CreateShortCut calls
+; ($appExe is "$INSTDIR\${APP_EXECUTABLE_FILENAME}"), and $newStartMenuLink /
+; $newDesktopLink are the template's own resolved names (setLinkVars), so a
+; template upgrade that renames a link moves this code with it.
+;
+; The AppUserModelID is re-stamped because CreateShortCut writes a fresh .lnk
+; without one. This does not contradict customFinishPage's "costs nothing"
+; note: main.js's app.setAppUserModelId() covers the running PROCESS identity,
+; which is why the relaunch can name the executable directly, while the stamp
+; here keeps the persisted .lnk itself carrying the id the shell groups and
+; pins by. The two cover different surfaces; neither substitutes for the other.
+;
+; KNOWN UNCOVERED SURFACE: a taskbar PIN is the shell's own .lnk copy under
+; the user's "User Pinned\TaskBar" tree, not either link rewritten here, so a
+; pin created before the machine bifurcated keeps naming the stale root.
+; Healing it would mean writing a literal shell path this template does not
+; manage; that is a deliberate follow-up, not part of this change.
+;
+; A failed rewrite is surfaced, not swallowed: the details pane is muted on
+; this path (installSection.nsh runs SetDetailsPrint none), and a silent
+; failure here would mean the update reports success while the shortcut still
+; names the stale root, with no trace to diagnose. The template's own
+; unconditional ClearErrors covers a cosmetic "already exists" create; here
+; the write IS the fix, so failure gets a breadcrumb first.
+;
+; THE STALE SIBLING DIRECTORY IS DELIBERATELY LEFT IN PLACE. Removing it would
+; be a recursive delete under %LOCALAPPDATA%\Programs keyed off a path this run
+; did not write; a wrong deletion there is unrecoverable for the user, and an
+; ownership proof for a DELETE would have to be at least as strong as the one
+; guarding the update bypass -- no such proof exists for the sibling. An
+; unreferenced directory costs disk only.
+!macro customInstall
+  ; Default-deny: only the two probes below may arm the heal. Probe 1 catches
+  ; a stale PARENT root (this update runs in the nested child); probe 2
+  ; catches a stale NESTED child (this update runs in the parent). Both are
+  ; the executable-presence test, the same evidence standard as the update
+  ; bypass in KiroEnsureAppInstallDir.
+  StrCpy $KiroStaleSibling 0
+  ${GetParent} "$INSTDIR" $KiroStaleSiblingProbe
+  ${If} $KiroStaleSiblingProbe != ""
+  ${AndIf} $KiroStaleSiblingProbe != "$INSTDIR"
+  ${AndIf} ${FileExists} "$KiroStaleSiblingProbe\${APP_EXECUTABLE_FILENAME}"
+    StrCpy $KiroStaleSibling 1
+  ${EndIf}
+  ${If} ${FileExists} "$INSTDIR\${APP_FILENAME}\${APP_EXECUTABLE_FILENAME}"
+    StrCpy $KiroStaleSibling 1
+  ${EndIf}
+  ${If} $KiroVisibleUpdate == 1
+  ${AndIf} $keepShortcuts == "true"
+  ${AndIf} $KiroStaleSibling == 1
+    !ifndef DO_NOT_CREATE_START_MENU_SHORTCUT
+      ${If} ${FileExists} "$newStartMenuLink"
+        ClearErrors
+        CreateShortCut "$newStartMenuLink" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0 "" "" "${APP_DESCRIPTION}"
+        ${If} ${Errors}
+          SetDetailsPrint both
+          DetailPrint "Could not rewrite the Start Menu shortcut; it keeps its old target."
+          SetDetailsPrint lastused
+          ClearErrors
+        ${EndIf}
+        WinShell::SetLnkAUMI "$newStartMenuLink" "${APP_ID}"
+      ${EndIf}
+    !endif
+    !ifndef DO_NOT_CREATE_DESKTOP_SHORTCUT
+      ${If} ${FileExists} "$newDesktopLink"
+        ClearErrors
+        CreateShortCut "$newDesktopLink" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" "" "$INSTDIR\${APP_EXECUTABLE_FILENAME}" 0 "" "" "${APP_DESCRIPTION}"
+        ${If} ${Errors}
+          SetDetailsPrint both
+          DetailPrint "Could not rewrite the Desktop shortcut; it keeps its old target."
+          SetDetailsPrint lastused
+          ClearErrors
+        ${EndIf}
+        WinShell::SetLnkAUMI "$newDesktopLink" "${APP_ID}"
+      ${EndIf}
+    !endif
+  ${EndIf}
+!macroend
+
 ; Preserve only the install-root ownership guard from the former custom UI.
 ; This runs for silent installs too and does not replace or restyle any page.
 !macro customInit
   StrCpy $KiroWindowVisible 0
+  ; Resolved HERE, not at the use site: see the Var declaration for why a
+  ; Function body cannot reference ${APP_EXECUTABLE_FILENAME} directly.
+  StrCpy $KiroAppExeName "${APP_EXECUTABLE_FILENAME}"
   StrCpy $KiroVisibleUpdate 0
   StrCpy $KiroUpdateCommitted 0
   ${If} ${isUpdated}

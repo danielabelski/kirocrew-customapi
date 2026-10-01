@@ -43,6 +43,7 @@ from kiro_crew.apps.builtins.issue_radar.backend import crew_store as cs
 from kiro_crew.apps.builtins.issue_radar.backend import provider
 from kiro_crew.apps.builtins.issue_radar.backend import store as store_mod
 from kiro_crew.apps.builtins.issue_radar.backend import watch as watch_mod
+from kiro_crew.crew_log import projection as crew_log_projection
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.safety_override import reset_singleton, safety_override
 
@@ -63,7 +64,7 @@ def _effectively_trusted(slot: Any) -> bool:
 
 @pytest.fixture(autouse=True)
 def _private_sel_root_per_test(sel_private_root):
-    """Every test in this module gets its OWN SEL root (issue #7029).
+    """Every test in this module gets its OWN SEL root.
 
     The trust assertions here transitively depend on a fail-closed critical SEL
     audit WINNING the chain lock: ``sync_trust`` → ``activate_scoped`` audits
@@ -230,8 +231,55 @@ def _crew(root, name="Andromeda", **spec) -> dict[str, Any]:
     return cs.create_crew(OWNER, REPO, {"name": name, **spec}, root)
 
 
+#: crew id -> the live crew log unit its slot runs on. A crew's ledger is the fold of
+#: that unit, so seeding a work item means recording into it as the write route does.
+_UNITS: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True)
+def _isolated_crew_log(monkeypatch):
+    """Crew log on, in this test's own data home, and no warm state carried over.
+
+    FUNCTION-scoped: the data home is the rootdir conftest's per-test
+    ``KIROCREW_HOME`` pin, so the crew log a test writes lands in a directory that
+    test alone owns, and ``KIROCREW_CREW_LOG`` is set through ``monkeypatch`` so it
+    is gone the moment the test is. A module-scoped ``patch.dict`` here set both
+    keys for the whole worker between tests: every other suite the worker ran
+    after this file's first test saw a crew log switched on that none of them
+    asked for, and a data home none of them pinned. The seeding helpers below are
+    called from unittest classes that manage their own store roots; a crew's id is
+    minted fresh per test, so ``_UNITS`` is cleared with the rest.
+    """
+    from kiro_crew.crew_log import emit as crew_log_emit
+
+    monkeypatch.setenv("KIROCREW_CREW_LOG", "1")
+    crew_log_emit.reset_caches()
+    crew_log_projection.forget_slot_folds()
+    _UNITS.clear()
+    yield
+    crew_log_emit.drain_for_shutdown(timeout=2.0)
+    crew_log_emit.reset_caches()
+    crew_log_projection.forget_slot_folds()
+    _UNITS.clear()
+
+
+def _unit_for(crew_id: str) -> str:
+    """The crew's live unit, created on first use."""
+    if crew_id not in _UNITS:
+        from kiro_crew.crew_log.schema import KIND_SESSION
+        from kiro_crew.crew_log.store import CrewLog
+
+        sid = f"acp-{crew_id}"
+        CrewLog.create(KIND_SESSION, sid, owner="owner", agent="kirocrew", slot=cs.slot_key_for(crew_id))
+        _UNITS[crew_id] = sid
+    return _UNITS[crew_id]
+
+
 def _item(root, crew_id, number, **patch) -> dict[str, Any]:
-    return cs.upsert_work_item(OWNER, REPO, crew_id, number, patch, root)
+    """Seed one work item through the real write path: one entry in the crew's log."""
+    return cs.commit_work_progress(
+        OWNER, REPO, crew_id, number, patch, "claim", "seeded", root=root, session_id=_unit_for(crew_id)
+    )["item"]
 
 
 # ── brief injection ─────────────────────────────────────────────────────────
@@ -377,7 +425,7 @@ class TestNudge(unittest.TestCase):
         self.assertNotIn("crew: needs human", nudge)
 
     def test_the_nudge_never_mentions_escalation(self):
-        """A crew must not be told a concept the protocol no longer has.
+        """A crew must not be told a concept the protocol does not have.
 
         The nudge is re-sent every turn and is the most recent instruction in the
         window, so a stale counter here outranks the brief: a crew reading
@@ -631,16 +679,23 @@ class TestCrewStoreScoping(unittest.TestCase):
             base = Path(tmp)
             gh = store_mod.provider_root(root=base, provider="github", host="github.com")
             gl = store_mod.provider_root(root=base, provider="gitlab", host="gitlab.example")
-            self.assertNotEqual(cs.skips_path(OWNER, REPO, gh), cs.skips_path(OWNER, REPO, gl))
+            self.assertNotEqual(cs.crews_dir(OWNER, REPO, gh), cs.crews_dir(OWNER, REPO, gl))
 
-            cs.record_skip(OWNER, REPO, 7, "architecture call", "architecture", "c_11111111", gh)
+            crew = _crew(gh)
+            cs.commit_work_progress(
+                OWNER, REPO, crew["id"], 7, {"phase": "skipped"}, "skip", "architecture call",
+                skip_reason="architecture call", skip_scope="architecture",
+                root=gh, session_id=_unit_for(crew["id"]),
+            )
+            # The index is a fold across the crews UNDER A ROOT, so the scoped roots
+            # are independent indexes.
             self.assertEqual(cs.read_skips(OWNER, REPO, gl), {})
             self.assertIn("7", cs.read_skips(OWNER, REPO, gh))
 
             # The same call with the scope forgotten. It cannot raise and cannot be
             # detected downstream: for public GitHub the scoped root and the base
             # data dir are the same path.
-            self.assertEqual(cs.skips_path(OWNER, REPO, base), cs.skips_path(OWNER, REPO, gh))
+            self.assertEqual(cs.crews_dir(OWNER, REPO, base), cs.crews_dir(OWNER, REPO, gh))
 
 
 # ── session launch / trust ──────────────────────────────────────────────────
@@ -1624,7 +1679,7 @@ class TestTheWakesLivenessGuardIsTotal(unittest.TestCase):
                 ):
                     owners.append(fn.name)
         # ``_reconcile_trust`` reaches ``sync_trust`` through ``_trust_inputs`` so
-        # that the app gate is read in the same hop; it is no longer a direct owner.
+        # that the app gate is read in the same hop; it is not a direct owner.
         self.assertEqual(sorted(owners), ["ensure_crew_session"])
 
     def test_the_app_gate_is_read_in_the_hop_and_never_on_the_loop(self):
@@ -1851,16 +1906,24 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
         slot = _FakeSlot()
         ran: list[str] = []
         origins: list[bool | None] = []
+        actors: list[str | None] = []
 
+        # ``**_rest`` on purpose: this double stands in for ``_run_chat``, whose
+        # keyword surface grows, and a double that enumerates it fails on the next
+        # argument added rather than on anything this test is about. The two
+        # keywords it DOES name are the two it asserts on.
         async def _turn(
             _state: Any,
             _slot: Any,
             prompt: str,
             *,
             _directive_user_origin: bool | None = None,
+            _turn_actor: str | None = None,
+            **_rest: Any,
         ) -> None:
             ran.append(prompt)
             origins.append(_directive_user_origin)
+            actors.append(_turn_actor)
 
         with mock.patch.object(cr, "_run_chat", _turn):
             self.assertTrue(cr.dispatch_crew_turn(state, slot, "advance one item"))
@@ -1868,6 +1931,9 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.capped, [slot.key])
         self.assertEqual(ran, ["advance one item"])
         self.assertEqual(origins, [False])
+        # A crew-composed prompt is not a person typing, and the session ledger
+        # records who caused a turn as fact.
+        self.assertEqual(actors, ["crew"])
 
     async def test_a_turn_that_never_got_a_permit_says_so_in_the_transcript(self):
         """A refused turn and a finished one must not look the same.
@@ -1886,6 +1952,7 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
             prompt: str,
             *,
             _directive_user_origin: bool | None = None,
+            **_rest: Any,
         ) -> None:
             raise AssertionError("the turn must not run without a permit")
 
@@ -1903,6 +1970,41 @@ class TestTurnDispatch(unittest.IsolatedAsyncioTestCase):
             cr.dispatch_crew_turn(state, slot, "advance one item")
             await slot.runners[-1](state, slot, slot.prompts[-1])
         self.assertEqual([m for m in slot.messages if m["role"] == "error"], [])
+
+    async def test_a_dispatch_between_a_plans_stages_queues(self):
+        """``dispatch_crew_turn`` relies on the admission point, so the gate is the gate.
+
+        Its own docstring states the reliance -- "``enqueue_or_run_prompt`` queues
+        instead of racing when the crew is mid-turn" -- and it carries no mid-plan
+        check of its own. Between a plan's stages ``slot.running`` reads False while
+        the plan is still live, so gating on ``running`` alone would put a crew turn
+        alongside the plan, with no recovery once two turns own one slot.
+
+        Driven through a REAL ``_ChatSlot``, not this module's ``_FakeSlot``: the
+        fake implements its own admission, so a test through it would pass on the
+        double's rule rather than on the product's.
+
+        Mutation guard: drop ``or self._in_stage_execution`` from the gate and this
+        starts a turn.
+        """
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        slot = _ChatSlot(key="chat-1")
+        # The inter-stage shape: nothing in flight, plan still executing.
+        slot.task = None
+        slot._in_stage_execution = True
+        state = mock.MagicMock()
+        state._background_tasks = set()
+
+        started = cr.dispatch_crew_turn(state, slot, "advance one item")
+
+        self.assertFalse(started, "a mid-plan crew dispatch must be queued")
+        self.assertIsNone(slot.task, "and must not open a turn alongside the plan")
+        self.assertEqual(
+            [q["content"] for q in slot._queue],
+            ["advance one item"],
+            "the prompt is held for the plan's own drain",
+        )
 
 
 # ── unblock signal detection (pure) ─────────────────────────────────────────
@@ -2949,7 +3051,7 @@ _CLAIMED_SEL_ROOTS: set[str] = set()
 
 
 class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
-    """The per-test SEL root that closes issue #7029, pinned differentially.
+    """The per-test SEL root, pinned differentially.
 
     Every trust assertion in this file requires a fail-closed critical SEL
     audit to WIN the chain lock, and on the event-loop thread that acquire is a
@@ -2981,7 +3083,7 @@ class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(reset_singleton)
 
     async def test_a_holder_of_the_shared_default_root_cannot_refuse_trust(self):
-        """A concurrent writer on the SHARED root no longer reaches this module.
+        """A concurrent writer on the SHARED root does not reach this module.
 
         The holder below stands in for the writer the flake needed: it takes
         the chain lock of the DEFAULT SEL root — the directory ``sel()`` would
@@ -2989,7 +3091,7 @@ class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
         test's writer would actually hold — through its own file description,
         which is how a foreign holder looks to ``flock``. On the shared-root
         arrangement the fail-closed trust audit loses its single-shot acquire
-        against exactly this and the grant is refused (the #7029 failure
+        against exactly this and the grant is refused (the original failure
         verbatim); with a private per-test root the holder is a stranger to the
         audit, and trust must be granted.
         """
@@ -3045,7 +3147,7 @@ class TestSelRootIsolation(unittest.IsolatedAsyncioTestCase):
         self._claim_root()
 
     async def test_this_tests_sel_root_is_private_second_claim(self):
-        """Second claimant: on the pre-#7029 arrangement both tests resolve the
+        """Second claimant: on the shared-root arrangement both tests resolve the
         one session directory, so whichever of the pair runs second trips the
         reuse assertion (and both trip the shared-default one)."""
         self._claim_root()

@@ -27,18 +27,30 @@ import type { ChatMessage, McpServer } from '../../types'
 import {
   buildFileLabels,
   findUnreferencedAttachments,
+  leadingMentionBoundary,
+  MENTION_LINE_SUFFIX,
+  mentionBoundary,
+  mentionTokenRegex,
   parseDirs,
   parseFiles,
   resolveDirSegment,
   resolveFileSegment,
+  restoreUnreferencedImages,
 } from '../../utils/fileTokens'
 import { findTokenRanges, recollapsePastes, type PasteBlock } from '../../utils/pasteTokens'
-import { TURN_OPENER_ROLES } from './groupDisplayItems'
 import McpToolsPanel from './McpToolsPanel'
-import type { DisplayItem, TurnItem } from './types'
 
-export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: {
-  activeSlot: string | null; agent?: string; onReveal?: () => void; onRename?: () => void; mode?: string
+export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, onAutoTitle, mode, sidebarOnScreen, omitPopout, triggerLabel }: {
+  activeSlot: string | null; agent?: string; onReveal?: () => void; onRename?: () => void; onAutoTitle?: () => void; mode?: string
+  /** Whether the sidebar (and its folder-order banner) is on screen -- see SessionActionsMenu. */
+  sidebarOnScreen?: boolean
+  /** See SessionActionsMenu: the phone bar's ⋯ menu owns the pop-out rows. */
+  omitPopout?: boolean
+  /** Phone single top bar: render the session TITLE inside the trigger, ahead of
+   *  the chevron, so title and menu are one control (one tap target, chevron
+   *  flush after the last character). Absent, the trigger is the bare chevron
+   *  the desktop title row places beside its own rename control. */
+  triggerLabel?: React.ReactNode
 }) {
   // Controlled open state: lets the colour-swatch row (not a Radix menu item)
   // close the menu after a pick, via the onColorPicked hook passed below.
@@ -88,9 +100,20 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
-        <button className="px-0.5 py-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none transition-all" aria-label={i18nT('pages.chatPage.session_options')}>
-          <ChevronDown size={14} />
-        </button>
+        {triggerLabel !== undefined ? (
+          /* No aria-label here: the visible title IS the accessible name, and the
+             menu's role is appended as sr-only text -- an aria-label would replace
+             the title, which on the phone this trigger is the only copy of. */
+          <button data-testid="session-title-menu" className="flex min-w-0 items-center gap-1 px-1 py-1 rounded-md text-text-strong cursor-pointer bg-transparent border-none transition-colors hover:bg-bg-hover" aria-haspopup="menu">
+            <span className="session-header-title text-[15px] font-semibold truncate min-w-0">{triggerLabel}</span>
+            <span className="sr-only">, {i18nT('pages.chatPage.session_options')}</span>
+            <ChevronDown size={16} className="shrink-0 text-muted" />
+          </button>
+        ) : (
+          <button className="px-0.5 py-1 rounded-md text-muted hover:text-text cursor-pointer bg-transparent border-none transition-all" aria-label={i18nT('pages.chatPage.session_options')}>
+            <ChevronDown size={14} />
+          </button>
+        )}
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-[180px]">
         {activeSlot && (
@@ -98,6 +121,8 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
           variant="dropdown"
           slotKey={activeSlot}
           mode={mode}
+          sidebarOnScreen={sidebarOnScreen}
+          omitPopout={omitPopout}
           // MCP servers: stateful (lazy fetch gated on the sub's open state), so
           // it stays here as an info slot rather than a generic capability.
           infoSlots={[
@@ -125,6 +150,7 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
             </DropdownMenuSub>,
           ]}
           onReveal={onReveal}
+          onAutoTitle={onAutoTitle}
           onRename={onRename}
           // The header controls its own menu, so close it after a colour pick.
           onColorPicked={() => setOpen(false)}
@@ -143,213 +169,21 @@ export function ChatHeaderMenu({ activeSlot, agent, onReveal, onRename, mode }: 
  *  suffix is as reload-stable as the key it disambiguates. Rows without a
  *  `mid` (locally-minted streaming/optimistic bubbles) fall back to `msgKey`
  *  alone, which is exactly the uniqueness they had before. */
-/** Client-generated one-shot correlation id for an optimistic user bubble.
- *  The server preserves meta fields on the user row it appends, so an echo or
- *  transcript page carries this id back and the bubble is matchable without
- *  relying on content equality (#2845). Shared by the plain send path and the
- *  mid-turn steer path (#6075) so the two cannot drift in id shape. */
-export function mintSendId(): string {
-  return `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
-}
+/** Client-generated one-shot correlation id for an optimistic user bubble; see
+ *  `mintSendId` in `utils/sendDelivery`. Re-exported so the page and the tests
+ *  keep their import path. */
+export { mintSendId } from '../../utils/sendDelivery'
 
-export function msgIdentityKey(m: ChatMessage, msgKey: (m: ChatMessage) => string): string {
-  const mid = m.meta?.mid
-  return typeof mid === 'string' && mid ? `${msgKey(m)}~${mid}` : msgKey(m)
-}
-
-/** Stable key for a single TurnItem — the leading row of a turn OR a top-level
- *  single/group. A `single` and the `turn` it leads resolve to the SAME key so
- *  a mid-stream regroup (single promoted into a grouped turn once it gains
- *  working steps) does NOT change the row's virtual key → no remount / silent
- *  re-measure. `msgKey` supplies the per-message identity (clientTs → ts →
- *  minted id; never the array index — see stableMsgKey). Groups key on their
- *  FIRST MESSAGE's identity, never `startIdx`: a prepend (history backfill)
- *  renumbers every array index but leaves message identities intact, so a
- *  group-led row keeps its key — and with it its cached height, DOM node, and
- *  scroll anchor — across the shift. The index key this replaces was unique by
- *  construction, so group keys go through `msgIdentityKey` to keep that
- *  property across same-tick `ts` ties.
- *
- *  `msgs` is non-empty by construction (both producers emit a group only under
- *  `if (group.length)`), but the type allows `[]` and this is a public export —
- *  degrade to the index rather than throwing inside `msgKey`. */
-export function turnLeadKey(it: TurnItem, msgKey: (m: ChatMessage) => string): string {
-  if (it.kind === 'single') return `row-${msgKey(it.msg)}`
-  const lead = it.msgs[0]
-  return lead ? `grp-${msgIdentityKey(lead, msgKey)}` : `grp-idx-${it.startIdx}`
-}
-
-/** Virtualizer / HeightCache key for a display row. Pure (identity injected)
- *  so the steer-reconcile-stability and regroup-stability guarantees are
- *  unit-testable. A `turn` inherits the key of its leading item so promoting a
- *  single into a turn (and vice-versa) keeps the row identity — and thus its
- *  cached height and DOM node — stable. */
-/** Anchor identity that survives a prepend's key reshuffle: the TAIL message's
- *  identity. A page landing regroups older messages into the top turn's HEAD —
- *  renaming its lead-derived display key — but a turn's newest message is
- *  untouched by content arriving before it, so an anchor held by the tail
- *  resolves across the landing and its compensation is not dropped. Falls back
- *  to positional markers only for degenerate empty rows, mirroring
- *  virtualKeyFor's own fallbacks. */
-/** SECOND anchor identity for a display row: its LEAD message, `l-` prefixed so
- *  it shares no vocabulary with a tail id and the two can never cross-match.
- *
- *  Exists because neither end of a turn is stable on its own. `stableAnchorIdFor`
- *  takes the tail, which a page landing cannot rename -- but a turn STILL
- *  STREAMING gains messages at that end, so its tail id changes under a reader
- *  who has not moved. The lead is untouched by appends (and by a single being
- *  promoted into the turn it leads, which keeps the first message). Persisting
- *  both lets the restore match whichever end survived. */
-export function anchorAltIdFor(
-  it: DisplayItem,
-  index: number,
-  msgKey: (m: ChatMessage) => string,
-): string {
-  const leadOf = (t: TurnItem): ChatMessage | null =>
-    t.kind === 'single' ? t.msg : (t.msgs[0] ?? null)
-  let lead: ChatMessage | null = null
-  if (it.kind === 'turn') {
-    const first = it.items[0]
-    lead = first ? leadOf(first) : null
-  } else {
-    lead = leadOf(it)
-  }
-  if (!lead) return `alt-empty-${index}`
-  return `l-${msgIdentityKey(lead, msgKey)}`
-}
-
-export function stableAnchorIdFor(
-  it: DisplayItem,
-  index: number,
-  msgKey: (m: ChatMessage) => string,
-): string {
-  const tailOf = (t: TurnItem): ChatMessage | null =>
-    t.kind === 'single' ? t.msg : (t.msgs[t.msgs.length - 1] ?? null)
-  let tail: ChatMessage | null = null
-  if (it.kind === 'turn') {
-    const last = it.items[it.items.length - 1]
-    tail = last ? tailOf(last) : null
-  } else {
-    tail = tailOf(it)
-  }
-  if (!tail) return `anchor-empty-${index}`
-  return `a-${msgIdentityKey(tail, msgKey)}`
-}
-
-export function virtualKeyFor(
-  it: DisplayItem,
-  index: number,
-  msgKey: (m: ChatMessage) => string,
-  isTrailing = false,
-): string {
-  if (it.kind === 'turn') {
-    const first = it.items[0]
-    if (!first) return `turn-empty-${index}`
-    // A turn WITH its opening prompt keys on that lead: the lead never
-    // changes once the prompt is loaded, and the trailing turn's tail grows
-    // every stream tick (tail-keying it would remount per token).
-    //
-    // A HEADLESS turn -- the topmost boundary turn of a partially loaded
-    // transcript, whose opening prompt is still in an unloaded older page --
-    // keys on its TAIL instead. Every older-page landing feeds that turn's
-    // HEAD, so a lead-derived key renamed the row per landing: React sees a
-    // new element, unmounts the giant row and remounts it (Pierre surfaces
-    // visibly "reload", and the height cache line is orphaned) -- once per
-    // walk wave, which is the refresh-then-walk bounce. The tail is
-    // untouched by content arriving above it, so the key holds across the
-    // whole walk; when the opening prompt finally lands the key flips to
-    // the lead ONCE (one remount, its height migrated by the departure
-    // rename pass). A headless turn is by construction not the trailing
-    // streaming turn in any live session older than one page, and a fresh
-    // session's single turn has its prompt loaded, so tail growth cannot
-    // re-key it in practice.
-    // ...with one exception: the TRAILING turn is never tail-keyed, even
-    // headless. A refresh into a giant in-flight turn loads a window that
-    // is entirely that one turn -- headless AND growing at the tail, where
-    // a tail key would remount it per stream tick. Lead-keying it merely
-    // keeps the pre-fix behavior (renamed per landing) for the one turn
-    // that is anchored to the viewport bottom anyway.
-    // ...and only at INDEX 0: the walk feeds the head of the TOPMOST row
-    // alone. A mid-list turn without an opener lead (an interim fold, a
-    // single mid-stream promoting into the turn it leads) keeps the #253
-    // lead-key contract -- its head is bounded by settled content, so
-    // landings cannot rename it, and tail-keying it would itself remount
-    // the row at every fold boundary.
-    const leadMsg = first.kind === 'single' ? first.msg : first.msgs[0]
-    // `complete === false` is the running-turn marker (applyRunningState):
-    // an in-flight turn grows at its tail and must never key on it,
-    // whatever its position -- the semantic twin of the positional
-    // isTrailing guard, and the one that holds when the loaded window IS
-    // one giant in-flight turn (refresh mid-turn: index 0 AND trailing).
-    if (index === 0 && !isTrailing && it.complete !== false && leadMsg && !TURN_OPENER_ROLES.has(leadMsg.role)) {
-      const last = it.items[it.items.length - 1]
-      const tail = last
-        ? (last.kind === 'single' ? last.msg : (last.msgs[last.msgs.length - 1] ?? null))
-        : null
-      if (tail) return `hlt-${msgIdentityKey(tail, msgKey)}`
-    }
-    return turnLeadKey(first, msgKey)
-  }
-  return turnLeadKey(it, msgKey)
-}
-
-/** Virtualizer keys for the WHOLE display list, with a collision tie-break.
- *
- *  `virtualKeyFor` is not unique across the list: a `single` keys on
- *  `msgKey` alone (`row-<ts>`), and a coarse OS clock can stamp two rows
- *  appended in one tick with the same `ts` — the exact hazard `msgIdentityKey`
- *  closes for group leads. Two rows sharing one key reach React as duplicate
- *  siblings (one is silently dropped from the DOM — content visibly missing)
- *  and share one HeightCache slot (each re-measure of either row reprices the
- *  other, oscillating the spacers). Same failure from an overlapping older
- *  page whose rows lack the `meta.mid` the prepend dedup keys on.
- *
- *  The tie-break is positional among COLLIDERS ONLY: the first occurrence
- *  keeps the bare key — so the common case is byte-identical to
- *  `virtualKeyFor` and every cached height, DOM node, and scroll anchor keyed
- *  before this pass survives — and each later duplicate gets an occurrence
- *  suffix. Deterministic for a given list order, so keys are stable across
- *  re-renders. An insert BEFORE a collider shifts which physical row holds
- *  the bare key: those rows remount (a `~#N` height or scroll anchor
- *  persisted under the old occupant can also go stale until re-measured) —
- *  bounded to rows that previously rendered broken (dropped sibling), and
- *  strictly better than that render.
- *
- *  NOT folded into `virtualKeyFor`: uniqueness is a property of the list, not
- *  of one row, and a per-row `~mid` suffix instead would rename every
- *  streamed/optimistic row (which lacks `mid`) at the post-turn `refreshSlot`
- *  rebuild (which carries it) — a mass remount per turn end. */
-/** Tie-break suffix for colliding virtualizer keys. Key plumbing only — the
- *  string never renders as user-visible text. */
-const DUP_KEY_SUFFIX = '~#'
-
-export function uniqueRowKeys(
-  items: readonly DisplayItem[],
-  msgKey: (m: ChatMessage) => string,
-): string[] {
-  const seen = new Map<string, number>()
-  return items.map((it, i) => {
-    const base = virtualKeyFor(it, i, msgKey, i === items.length - 1)
-    const n = seen.get(base)
-    if (n === undefined) {
-      seen.set(base, 1)
-      return base
-    }
-    // The suffixed candidate is re-checked against `seen` too: a NATURAL key
-    // can spell `<base>~#1` (msgKey passes through arbitrary meta), so
-    // emitting the suffix unchecked would reintroduce the duplicate this
-    // function exists to remove.
-    let count = n
-    let candidate = `${base}${DUP_KEY_SUFFIX}${count}`
-    while (seen.has(candidate)) {
-      count++
-      candidate = `${base}${DUP_KEY_SUFFIX}${count}`
-    }
-    seen.set(base, count + 1)
-    seen.set(candidate, 1)
-    return candidate
-  })
-}
+/** Row-identity builders live in chat-core (P5-e); re-exported here so the
+ *  page, the store, and the tests keep their import path. */
+export {
+  msgIdentityKey,
+  turnLeadKey,
+  virtualKeyFor,
+  uniqueRowKeys,
+  stableAnchorIdFor,
+  anchorAltIdFor,
+} from '../../chat-core/transcript/rowKeys'
 
 /** React key for a message row's INNER bubble (the virtualizer row key is
  *  virtualKeyFor). Prefer the optimistic client ts (stashed by the steer-echo
@@ -407,16 +241,28 @@ export function KnowledgeBubbleChip({ knowledge }: { knowledge: { items: number;
  *  assistant / note rows hand MarkdownRenderer, so a `/chat?sid=…` link in a
  *  USER message switches session in place exactly like every other row kind
  *  (#8253) instead of falling into the external-link branch and gaining
- *  `target="_blank"`. */
+ *  `target="_blank"`.
+ *
+ *  Shared by every dashboard surface that draws a user row: ChatPage hands
+ *  it directly, and the app-sdk registry's default `user` entry (ChatPane,
+ *  member DMs, embeds) calls it too, so the two can no longer drift on how an
+ *  attachment renders. `onFileOpen` is optional: a host without a file viewer
+ *  still shows every attachment — an image inline, a file as a card — it just
+ *  has no opener to call. Every host with a viewer (main chat, split panes,
+ *  member DMs) supplies it (#9487). */
 export type UserContentRenderOpts = {
   content: string
   meta?: Record<string, unknown>
-  onFileOpen: (path: string) => void
+  onFileOpen?: (path: string) => void
   onFolderOpen?: (path: string) => void
   linkPreviews?: boolean
   onSessionOpen?: (key: string) => void
   sessions?: ReadonlyMap<string, string>
   activeSession?: string
+  /** When this row was written, ISO. Only the session chip's SHORT-name form uses
+   *  it, to refuse a slot minted after the text naming it; absent, no short name
+   *  resolves here (the full key still does). */
+  messageTs?: string
 }
 
 /** renderFileSegment's own two knobs live on a private extension, not on the
@@ -447,7 +293,11 @@ export function renderUserContent(opts: UserContentRenderOpts) {
 
 function renderUserContentInner(opts: UserContentRenderOpts) {
   const { meta, onFileOpen, onFolderOpen } = opts
-  let content = opts.content
+  // An image that only `meta.files` knows about (a split-pane / member-DM row
+  // written before the pane serialized attachments the way the main chat
+  // does) is re-emitted as its `![image](dest)` line FIRST, so everything
+  // below sees the one content shape every surface has always produced.
+  let content = restoreUnreferencedImages(opts.content, meta)
   const pastes = (meta?.pastes as PasteBlock[] | undefined) || []
   const knowledge = meta?.knowledge as { items: number; tokens: number; titles: string[]; content?: { title: string; text: string }[] } | undefined
 
@@ -539,10 +389,13 @@ function renderUserContentInner(opts: UserContentRenderOpts) {
 
 /** Boundary-checked presence of an `@token` in a text segment — the same rule
  *  the split regex uses, so a key is only offered to a segment that can
- *  actually match it. */
+ *  actually match it. The SHARED matcher, not a local pattern: the send path
+ *  widened to the leadingMentionBoundary/mentionBoundary contract, and a
+ *  renderer still splitting on whitespace-only turned every punctuated or
+ *  wrapped mention's attachment invisible — no chip AND no card, where base
+ *  drew a card (fork Opus review). */
 function tokenPresent(text: string, token: string): boolean {
-  const esc = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  return new RegExp(`(^|\\s)@${esc}(?=\\s|$)`).test(text)
+  return mentionTokenRegex(token).test(text)
 }
 
 /** Inline chip for a folder reference in a sent message. Clicking opens the
@@ -563,8 +416,22 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
   )
   if (!onOpen) {
     return (
+      // `title` reaches a pointer only, and the visible text is just the short
+      // label, so the full path is also carried as visually-hidden text. A
+      // screen reader reads it wherever it reads the chip, including browse
+      // mode. It is text rather than a name on the span, because naming needs a
+      // role and a named non-interactive role is announced reliably only once
+      // something moves focus into it -- which nothing here ever does, since an
+      // inert chip has no action to reach and the transcript must not grow a tab
+      // stop per chip. FileHeaderBreadcrumb names a FOCUSABLE region instead.
+      // The visible label is aria-hidden so the path is spoken ONCE and whole,
+      // rather than the basename twice; the path already contains it.
+      // `select-none` keeps the hidden path out of a copied selection: `sr-only`
+      // hides text visually but leaves it in the DOM, so selecting the bubble
+      // would otherwise paste the path alongside the label a reader sees.
       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 mx-0.5 rounded border border-accent/25 bg-accent/10 text-accent text-[12px] font-mono" title={fullPath}>
-        {body}
+        <span aria-hidden="true" className="inline-flex items-center gap-1">{body}</span>
+        <span className="sr-only select-none">{fullPath}</span>
       </span>
     )
   }
@@ -596,7 +463,7 @@ function DirChip({ label, fullPath, onOpen }: { label: string; fullPath: string;
 /** Inline-flow renderer for a text segment adjacent to a paste chip.
  *  Handles @-file tokens as inline chips; other text is rendered as a
  *  whitespace-preserving span (no markdown). */
-function renderInlineSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: (path: string) => void, keyBase: string, dirMap?: Map<string, string>, onFolderOpen?: (path: string) => void) {
+function renderInlineSegment(content: string, meta: Record<string, unknown> | undefined, onFileOpen: ((path: string) => void) | undefined, keyBase: string, dirMap?: Map<string, string>, onFolderOpen?: (path: string) => void) {
   const parsedFiles = parseFiles(content, meta)
   const dirKeys = dirMap ? [...dirMap.keys()].filter(k => tokenPresent(content, k)).slice(0, 20) : []
   if (!parsedFiles.length && !dirKeys.length) {
@@ -615,49 +482,114 @@ function renderInlineSegment(content: string, meta: Record<string, unknown> | un
 
   // Folder tokens join the same split as file mentions. A dir key always ends
   // in `/` and a file key never does, so classification below is unambiguous.
-  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys]
+  // Longest-first so a staged `report,` is tried before `report` at the same
+  // position (ordered alternation); the shared boundary pair keeps the drawing
+  // in lockstep with the send path and findUnreferencedAttachments' decision.
+  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys].sort((a, b) => b.length - a.length)
   const tokPattern = keys.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
   const parts = tokPattern
-    ? display.split(new RegExp(`(@(?:${tokPattern}))(?=\\s|$)`, 'g'))
+    ? display.split(mentionSplitRe(tokPattern))
     : [display]
-  const chipCls = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono cursor-pointer hover:bg-accent/25 transition-colors'
   return (
     <span key={keyBase} style={{ whiteSpace: 'pre-wrap' }}>
       {parts.map((part, i) => {
-        const tok = part.match(/^@(.+)$/)?.[1]
+        const hit = mentionPart(part, key => mentionMap.has(key) || !!dirMap?.has(key))
+        const tok = hit?.key
         const dirPath = tok && dirMap?.get(tok)
         if (dirPath) {
           return <DirChip key={`${keyBase}-d${i}`} label={tok} fullPath={dirPath} onOpen={onFolderOpen} />
         }
         const fullPath = tok && mentionMap.get(tok)
-        if (fullPath) {
-          return (
-            <Clickable key={`${keyBase}-f${i}`} className={chipCls} title={fullPath} onClick={() => onFileOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{tok}</Clickable>
-          )
+        if (hit && fullPath) {
+          return <FileMentionChip key={`${keyBase}-f${i}`} label={hit.label} fullPath={fullPath} onOpen={onFileOpen} />
         }
         return <span key={`${keyBase}-p${i}`}>{part}</span>
       })}
       {cardPaths.map((p, i) => (
-        <Clickable key={`${keyBase}-uc${i}`} className={chipCls} title={p} onClick={() => onFileOpen(p)} aria-label={i18nT('pages.chatPage.open_file', { path: p })}>@{labels.get(p) || p}</Clickable>
+        <FileMentionChip key={`${keyBase}-uc${i}`} label={labels.get(p) || p} fullPath={p} onOpen={onFileOpen} />
       ))}
     </span>
   )
 }
 
+/** Inline chip for a file reference in a sent message: `@label`, the full path
+ *  in the tooltip, opening the file in the host's viewer. Every host that can
+ *  show a user row supplies the handler (#9487); a host without one still
+ *  renders the chip as an inert span (#9921 kept the base's #13855 a11y pin). */
+/** The transcript's mention split. A `:line` suffix rides INSIDE its pill
+ *  (fork UX review): `(@src/main.ts:42)` draws `(` + pill `@src/main.ts:42` +
+ *  `)`, one reference as the user typed it, instead of stranding `:42` as
+ *  text beside the pill. The suffix grammar is the shared MENTION_LINE_SUFFIX
+ *  (anchored for its exec() consumers, so the `^` is sliced off here), and
+ *  the trailing boundary is the same one send serialization uses. */
+function mentionSplitRe(tokPattern: string): RegExp {
+  return new RegExp(`(${leadingMentionBoundary})(@(?:${tokPattern})(?:${MENTION_LINE_SUFFIX.source.slice(1)})?)(?=${mentionBoundary})`, 'g')
+}
+
+/** Resolve one split part to its map key and the label to draw: `@tok`, or
+ *  `@tok:42` whose key is `tok`. A key that itself ends in `:digits` is
+ *  tried whole first, so it is never cut. */
+function mentionPart(part: string, known: (key: string) => boolean): { key: string; label: string } | null {
+  const whole = part.match(/^@(.+)$/)?.[1]
+  if (!whole) return null
+  if (known(whole)) return { key: whole, label: whole }
+  const split = whole.match(/^(.+)(:\d+)$/)
+  return split && known(split[1]) ? { key: split[1], label: whole } : null
+}
+
+function FileMentionChip({ label, fullPath, onOpen }: { label: string; fullPath: string; onOpen?: (path: string) => void }) {
+  const base = 'inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono'
+  if (!onOpen) {
+    // No file viewer on this host (a split pane or member DM without an
+    // opener): the same degrade DirChip makes, so the chip never LOOKS
+    // clickable where clicking does nothing. `title` is pointer-only, so the
+    // full path rides along as visually-hidden text; the visible label is
+    // aria-hidden so the basename is not spoken twice; `select-none` keeps the
+    // path out of a copied selection. Pinned by pointerOnlyPath.a11y.test.tsx.
+    return <span className={base} title={fullPath}><span aria-hidden="true">@{label}</span><span className="sr-only select-none">{fullPath}</span></span>
+  }
+  return (
+    <Clickable className={`${base} cursor-pointer hover:bg-accent/25 transition-colors`} title={fullPath} onClick={() => onOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{label}</Clickable>
+  )
+}
+
 /** Block card for a single user-attached (non-image) file. Clickable to open
- *  the file via the shared onFileOpen callback. Styled after the agent-side
- *  download card (see components/FileCard.tsx) but carries no size/mime — a
- *  user attachment only has a path here. */
-function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string; label: string; onFileOpen: (path: string) => void }) {
+ *  the file in the host's viewer; without a handler it is an inert card (see
+ *  FileMentionChip for why). Styled after the agent-side download card (see
+ *  components/FileCard.tsx) but carries no size/mime — a user attachment only
+ *  has a path here. */
+function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string; label: string; onFileOpen?: (path: string) => void }) {
+  const base = 'flex items-center gap-2.5 max-w-full bg-card border border-border rounded-lg px-3 py-2 text-sm no-underline text-text animate-scale-in'
+  const body = (
+    <>
+      <Paperclip size={15} className="shrink-0 text-muted" />
+      <span className="font-medium truncate">{label}</span>
+    </>
+  )
+  if (!onFileOpen) {
+    // The tooltip says WHERE the file opens, because the card looks exactly
+    // like the main chat's clickable one and a click here answers nothing.
+    // The same sentence rides along as visually-hidden text, since `title`
+    // opens on pointer hover only. The visible body is aria-hidden: the
+    // sentence already contains the path, so reading both would say the
+    // filename twice per card. `select-none` keeps it out of a copied
+    // selection. Pinned by pointerOnlyPath.a11y.test.tsx (#13855).
+    const inert = i18nT('pages.chatPage.attached_file_inert', { path: fullPath })
+    return (
+      <span className={base} title={inert}>
+        <span aria-hidden="true" className="flex items-center gap-2.5 min-w-0">{body}</span>
+        <span className="sr-only select-none">{inert}</span>
+      </span>
+    )
+  }
   return (
     <Clickable
-      className="flex items-center gap-2.5 max-w-full bg-card border border-border rounded-lg px-3 py-2 text-sm no-underline text-text hover:border-accent transition-colors cursor-pointer animate-scale-in"
+      className={`${base} hover:border-accent transition-colors cursor-pointer`}
       title={fullPath}
       onClick={() => onFileOpen(fullPath)}
       aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}
     >
-      <Paperclip size={15} className="shrink-0 text-muted" />
-      <span className="font-medium truncate">{label}</span>
+      {body}
     </Clickable>
   )
 }
@@ -674,7 +606,7 @@ function FileAttachmentCard({ fullPath, label, onFileOpen }: { fullPath: string;
  *  Files referenced inline stay inline chips; the rest become block cards.
  *  Images keep their inline `![image](path)` markdown and are excluded here. */
 function renderFileSegment(opts: FileSegmentOpts) {
-  const { content, meta, onFileOpen, keyBase = 'seg', dirMap, onFolderOpen, linkPreviews, onSessionOpen, sessions, activeSession } = opts
+  const { content, meta, onFileOpen, keyBase = 'seg', dirMap, onFolderOpen, linkPreviews, onSessionOpen, sessions, activeSession, messageTs } = opts
   const parsedFiles = parseFiles(content, meta)
   const dirKeys = dirMap ? [...dirMap.keys()].filter(k => tokenPresent(content, k)).slice(0, 20) : []
 
@@ -694,7 +626,7 @@ function renderFileSegment(opts: FileSegmentOpts) {
   // inline-widget seam; a folder-referencing prompt with block markdown is
   // the uncommon combination.
   if (!parsedFiles.length && !dirKeys.length) {
-    return <MarkdownRenderer content={content} softBreaks compactImages linkPreviews={linkPreviews} onSessionOpen={onSessionOpen} sessions={sessions} activeSession={activeSession} />
+    return <MarkdownRenderer content={content} softBreaks compactImages linkPreviews={linkPreviews} onSessionOpen={onSessionOpen} sessions={sessions} activeSession={activeSession} messageTs={messageTs} />
   }
 
   // Pass the ORIGINAL ordered list (images included) so [attached_file N] token
@@ -727,7 +659,7 @@ function renderFileSegment(opts: FileSegmentOpts) {
   // then the cards.
   if (!mentionMap.size && !dirKeys.length) {
     const caption = display.trim()
-    return <>{caption ? <MarkdownRenderer key={`${keyBase}-cap`} content={caption} softBreaks compactImages linkPreviews={linkPreviews} onSessionOpen={onSessionOpen} sessions={sessions} activeSession={activeSession} /> : null}{cards}</>
+    return <>{caption ? <MarkdownRenderer key={`${keyBase}-cap`} content={caption} softBreaks compactImages linkPreviews={linkPreviews} onSessionOpen={onSessionOpen} sessions={sessions} activeSession={activeSession} messageTs={messageTs} /> : null}{cards}</>
   }
 
   // Inline-mention path: the caption keeps files inline, so render it as a
@@ -739,23 +671,21 @@ function renderFileSegment(opts: FileSegmentOpts) {
   // Cap tokens to prevent ReDoS from many alternations. Folder tokens join
   // the same split; a dir key always ends in `/` and a file key never does,
   // so classification below is unambiguous.
-  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys]
+  const keys = [...[...mentionMap.keys()].slice(0, 20), ...dirKeys].sort((a, b) => b.length - a.length)
   const tokPattern = keys.map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
-  const parts = display.split(new RegExp(`(@(?:${tokPattern}))(?=\\s|$)`, 'g'))
+  const parts = display.split(mentionSplitRe(tokPattern))
   const body = (
     <span key={`${keyBase}-body`} style={{ whiteSpace: 'pre-wrap' }}>
       {parts.map((part, i) => {
-        const tok = part.match(/^@(.+)$/)?.[1]
+        const hit = mentionPart(part, key => mentionMap.has(key) || !!dirMap?.has(key))
+        const tok = hit?.key
         const dirPath = tok && dirMap?.get(tok)
         if (dirPath) {
           return <DirChip key={`${keyBase}-d${i}`} label={tok} fullPath={dirPath} onOpen={onFolderOpen} />
         }
         const fullPath = tok && mentionMap.get(tok)
-        if (fullPath) {
-          return (
-            <Clickable key={`${keyBase}-f${i}`} className="inline-flex items-center px-1.5 py-0.5 mx-0.5 rounded bg-accent/15 text-accent text-[12px] font-mono cursor-pointer hover:bg-accent/25 transition-colors"
-              title={fullPath} onClick={() => onFileOpen(fullPath)} aria-label={i18nT('pages.chatPage.open_file', { path: fullPath })}>@{tok}</Clickable>
-          )
+        if (hit && fullPath) {
+          return <FileMentionChip key={`${keyBase}-f${i}`} label={hit.label} fullPath={fullPath} onOpen={onFileOpen} />
         }
         return part ? <span key={`${keyBase}-p${i}`}>{part}</span> : null
       })}

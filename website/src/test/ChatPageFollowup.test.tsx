@@ -55,6 +55,10 @@ vi.mock('../api/client', () => ({
     // so answer them so the notice does not compete with the assertions below.
     chatFolders: vi.fn().mockResolvedValue([]),
     tagColumns: vi.fn().mockResolvedValue([]),
+    // Same for the settings read behind the sidebar's folder order: unanswered,
+    // it fails and the sidebar renders a second `role="alert"` beside the
+    // worktree-failure notice the assertions below look up by role.
+    kirocrewConfig: vi.fn().mockResolvedValue({}),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -169,14 +173,14 @@ describe('ChatPage follow-up worktree orchestration', () => {
     // not vacuous: chat-1 is filed under 'folder-proj', and the worktree the
     // button opens must be created with that same folder. createChatSlot's
     // folder_id is positional arg index 8
-    // (name, agent, model, mode, memory_mode, title, clean_mode, artifact, folder_id, instance_id).
+    // (name, agent, model, mode, memory_mode, title, artifact, folder_id, instance_id).
     const store = makeStore('folder-proj')
     await renderPage(store)
     fireEvent.click(screen.getByRole('button', { name: /start in new worktree/i }))
     await waitFor(() => expect(api.createChatSlot).toHaveBeenCalled())
     // Locate by stable identity (the create call), not by the value asserted.
     const call = (api.createChatSlot as ReturnType<typeof vi.fn>).mock.calls[0]
-    expect(call[8]).toBe('folder-proj')
+    expect(call[7]).toBe('folder-proj')
   })
 
   it('files the worktree session top-level when the spawning session is unfiled (#6347 fallback)', async () => {
@@ -187,7 +191,7 @@ describe('ChatPage follow-up worktree orchestration', () => {
     fireEvent.click(screen.getByRole('button', { name: /start in new worktree/i }))
     await waitFor(() => expect(api.createChatSlot).toHaveBeenCalled())
     const call = (api.createChatSlot as ReturnType<typeof vi.fn>).mock.calls[0]
-    expect(call[8]).toBeUndefined()
+    expect(call[7]).toBeUndefined()
   })
 
   it('does not activate the new session until scoping has completed', async () => {
@@ -254,5 +258,16 @@ describe('ChatPage follow-up worktree orchestration', () => {
     fireEvent.click(screen.getByRole('button', { name: /add to this session/i }))
     await waitFor(() => expect(composer().value).toContain(ITEM.prompt))
     expect(composer().value).toBe(`half-written thought\n\n${ITEM.prompt}`)
+  })
+
+  it('a redaction card pre-fill appends to an unsent draft instead of destroying it', async () => {
+    const store = makeStore()
+    await renderPage(store)
+    fireEvent.change(composer(), { target: { value: 'half-written thought' } })
+    act(() => {
+      window.dispatchEvent(new CustomEvent('mc:prefill-composer', { detail: { text: 'Please rotate the key.' } }))
+    })
+    await waitFor(() => expect(composer().value).toContain('Please rotate the key.'))
+    expect(composer().value).toBe('half-written thought\n\nPlease rotate the key.')
   })
 })

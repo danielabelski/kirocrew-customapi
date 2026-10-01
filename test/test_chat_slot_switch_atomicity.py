@@ -13,11 +13,12 @@ the mid-turn 409 (clones of the concurrency template in
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.chat import (
     api_chat_slot_agent,
@@ -29,6 +30,8 @@ from kiro_crew.dashboard.chat import (
 )
 from kiro_crew.dashboard.chat_handlers import _slot_switch_session_lock
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
+
+MOD = "kiro_crew.dashboard.chat_handlers"
 
 # Valid registry aliases the model guard accepts (tests are exempt from the
 # hardcoded-model-literal gate; these mirror the ids the existing model-switch
@@ -70,7 +73,201 @@ def _mock_state(slot: _ChatSlot, provider: object = None) -> DashboardState:
     return state
 
 
+@pytest.fixture
+def private_switch_state():
+    from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+    from kiro_crew.history import ConversationLog
+    from kiro_crew.member_memory_auth import bind_private_session_store
+    from kiro_crew.memory_stores import provision_member_memory
+
+    cfg = KiroCrewConfig.load()
+    for name in ("writer", "reviewer"):
+        cfg.agents[name] = KiroCrewAgentConfig(kiro_agent="kirocrew")
+        provision_member_memory(cfg, name)
+    cfg.save()
+    slot = _ChatSlot("private-switch")
+    slot.agent = "writer"
+    slot.memory_store = cfg.agents["writer"].memory_store
+    slot.workspace = "original-workspace"
+    slot.project = "original-project"
+    state = _mock_state(slot)
+    state.sessions.reset.return_value = True
+    state.conversation_log = ConversationLog()
+    key = effective_session_key(slot)
+    bind_private_session_store(key, slot.memory_store)
+    state.conversation_log.update_metadata(
+        key, {"agent": slot.agent, "memory_store": slot.memory_store}
+    )
+    return state, slot, key
+
+
+class TestPrivateChatMemberSwitch:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["reviewer", "default", ""])
+    async def test_cross_member_switch_refuses_before_any_mutation(
+        self, private_switch_state, target
+    ):
+        from kiro_crew.member_memory_auth import read_private_session_store
+
+        state, slot, key = private_switch_state
+        before = (slot.agent, slot.memory_store, slot.workspace, slot.project)
+        metadata = await asyncio.to_thread(state.conversation_log.get_metadata, key)
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
+            # A retry cannot gradually mutate the slot or erase the permanent pin.
+            for _ in range(2):
+                response = await client.post(
+                    f"/api/chat/slots/{slot.key}/agent", json={"agent": target}
+                )
+                assert response.status == 409
+                result = await response.json()
+                assert result["code"] == "member_session_pinned"
+                assert "Start a new conversation" in result["error"]
+        assert (slot.agent, slot.memory_store, slot.workspace, slot.project) == before
+        assert await asyncio.to_thread(state.conversation_log.get_metadata, key) == metadata
+        assert await asyncio.to_thread(read_private_session_store, key) == before[1]
+        state.sessions.reset.assert_not_awaited()
+        state.push_slots_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_linked_session_pin_is_checked_instead_of_the_slot_key(
+        self, private_switch_state
+    ):
+        state, slot, key = private_switch_state
+        slot.linked_session_key = key
+        slot.key = "linked-alias"
+        state._slots = {slot.key: slot}
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
+            response = await client.post(
+                f"/api/chat/slots/{slot.key}/agent", json={"agent": "reviewer"}
+            )
+            assert response.status == 409
+            assert (await response.json())["code"] == "member_session_pinned"
+        assert slot.agent == "writer"
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_member_reset_stays_available(self, private_switch_state):
+        state, slot, key = private_switch_state
+        with patch(f"{MOD}.warm_project_agent_names", new_callable=AsyncMock):
+            async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
+                response = await client.post(
+                    f"/api/chat/slots/{slot.key}/agent", json={"agent": "writer"}
+                )
+                assert response.status == 200
+        state.sessions.reset.assert_awaited_once()
+        assert state.sessions.reset.await_args.args[0] == key
+        assert slot.agent == "writer"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_pin_refuses_without_reset(self, private_switch_state):
+        state, slot, _ = private_switch_state
+        with patch(
+            "kiro_crew.execution_context.read_session_execution",
+            side_effect=ValueError("invalid binding"),
+        ):
+            async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
+                response = await client.post(
+                    f"/api/chat/slots/{slot.key}/agent", json={"agent": "reviewer"}
+                )
+                assert response.status == 503
+                assert (await response.json())["code"] == "member_binding_unavailable"
+        assert slot.agent == "writer"
+        state.sessions.reset.assert_not_awaited()
+
+
 class TestSlotModelSwitchAtomicity:
+    @pytest.mark.asyncio
+    async def test_same_value_pick_during_refusal_fallback_takes_live_path(self):
+        # The pin equals the DISPLAYED primary while a refusal fallback is
+        # serving the wire, so "nothing to switch" is false: the early return
+        # must not be taken, or the pick bumps the generation, the restore
+        # probe drops its record, and the session is stranded on the fallback.
+        # With no live provider the live path lands on the reset — the
+        # observable that the switch actually ran.
+        slot = _ChatSlot("test")
+        slot.model = _MODEL_A
+        slot._refusal_fallback_primary = _MODEL_A
+        slot._refusal_fallback_candidate = _MODEL_B
+        state = _mock_state(slot, provider=None)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/model", json={"model": _MODEL_A})
+            assert resp.status == 200
+            state.sessions.reset.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_same_value_pick_without_fallback_still_short_circuits(self):
+        # The companion guard: with NO fallback state the same-value pick keeps
+        # its cheap path — generation bump, no reset, no session teardown.
+        slot = _ChatSlot("test")
+        slot.model = _MODEL_A
+        gen_before = slot._model_pick_gen
+        state = _mock_state(slot, provider=None)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/model", json={"model": _MODEL_A})
+            assert resp.status == 200
+            assert slot._model_pick_gen == gen_before + 1
+            state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_same_value_pick_stamps_the_shared_epoch(self):
+        # The slot-local bump is invisible across aliases: another slot driving
+        # the SAME wire session compares the shared client's epoch at restore
+        # time, so a same-value pick that skips the stamp is silently undone by
+        # that slot's refusal-fallback restore. The short-circuit must stamp
+        # the shared epoch exactly as the live-switch path does.
+        class _EpochClient:
+            def __init__(self):
+                self._explicit_pick_epoch = 0
+
+        inner = _EpochClient()
+        provider = MagicMock()
+        provider.client = inner
+        slot = _ChatSlot("test")
+        slot.model = _MODEL_A
+        state = _mock_state(slot, provider=provider)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/model", json={"model": _MODEL_A})
+            assert resp.status == 200
+            assert inner._explicit_pick_epoch == 1, (
+                "a same-value pick is still an explicit pick: the shared epoch "
+                "must move so an alias's restore respects it"
+            )
+            state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_epoch_stamped_when_effort_reapply_fails_after_landed_switch(self):
+        # set_model LANDED on the shared wire session — the model changed for
+        # every alias — then the effort reapply failed and the handler fell
+        # back toward reset. The epoch stamp must precede the reapply: a
+        # sibling slot's refusal restore can already observe the landed pick
+        # live, and an unstamped epoch lets that restore overwrite the user's
+        # explicit choice with its recorded primary.
+        from kiro_crew.providers.acp import AcpProvider
+
+        class _EpochClient:
+            def __init__(self):
+                self._explicit_pick_epoch = 0
+                self.set_model = AsyncMock()
+
+        inner = _EpochClient()
+        slot = _ChatSlot("test")
+        slot.model = _MODEL_A
+        slot.reasoning_effort = "high"
+        provider = MagicMock(spec=AcpProvider)
+        provider.is_claude_backend = False
+        provider.has_active_turn.return_value = False
+        provider.client = inner
+        provider.supports_effort = MagicMock(return_value=True)
+        provider.change_effort = AsyncMock(side_effect=RuntimeError("reapply failed"))
+        state = _mock_state(slot, provider=provider)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            await client.post("/api/chat/slots/test/model", json={"model": _MODEL_B})
+            assert inner._explicit_pick_epoch == 1, (
+                "the epoch must stamp as soon as set_model lands — an effort "
+                "reapply failure must not skip it"
+            )
+
     @pytest.mark.asyncio
     async def test_mid_turn_switch_answers_409_without_reset(self):
         # _try_live_model_switch declines a mid-turn live switch, and the old
@@ -405,7 +602,7 @@ class TestSlotModelSwitchAtomicity:
 
     @pytest.mark.asyncio
     async def test_reset_raise_answers_200_with_warning_and_pushes(self):
-        # A teardown that RAISES (#8598): SessionManager.reset pops the
+        # A teardown that RAISES: SessionManager.reset pops the
         # session before its shutdown can fail, so the switch is COMMITTED
         # regardless — the handler must answer 200 with the committed model
         # plus an advisory warning and still push the slots update. The old
@@ -428,7 +625,7 @@ class TestSlotModelSwitchAtomicity:
 
     @pytest.mark.asyncio
     async def test_reset_retry_raise_answers_200_with_warning_and_pushes(self):
-        # The idle-decline RETRY can raise too (#8598): first reset declined
+        # The idle-decline RETRY can raise too: first reset declined
         # (idle live session), the retry's teardown throws. Same
         # committed-switch answer as the first attempt — 200 + warning +
         # slots push, no rollback to the old model.
@@ -468,7 +665,7 @@ class TestSlotModelSwitchAtomicity:
         # A raise with the session STILL REGISTERED came before the pop: the
         # old session survives on the old model, so a 200 would be the false
         # success the decline ladders treat as worse than any retryable
-        # error. The helper re-raises (pre-#8598 semantics) instead of
+        # error. The helper re-raises instead of
         # answering a committed-switch success it cannot vouch for.
         from kiro_crew.providers.base import LLMProvider
 
@@ -520,7 +717,7 @@ class TestSlotModelSwitchAtomicity:
     @pytest.mark.asyncio
     async def test_rebind_during_raising_reset_rolls_back_to_409(self):
         # The teardown-raise path must NOT bypass the rebind guard (GPT
-        # review finding on the #8598 fix): a slot rebound while the raising
+        # review finding): a slot rebound while the raising
         # reset awaited answers the same rollback + 409 as any other rebind —
         # never a 200 that advertises the committed model over a newly bound
         # session that never saw the switch.
@@ -704,13 +901,11 @@ class TestSlotWorkspaceSwitchAtomicity:
             state.sessions.reset.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_message_guard_is_checked_inside_the_lock(self):
-        # The total_messages guard is a check-then-act across the reset
-        # await: an unlocked read could pass while a serialized predecessor
-        # was still running, then mutate a slot whose conversation had
-        # started in the meantime. Checked inside the lock, a message that
-        # lands while the request waits makes it answer 409 and touch
-        # nothing.
+    async def test_message_landing_during_the_lock_wait_still_switches(self):
+        # There is no total_messages refusal, so a message that lands
+        # while this request waits on the slot lock does not turn the switch
+        # into a 409: the switch commits and the session is reset, exactly as
+        # it would have with no message in flight.
         slot = _ChatSlot("test")
         slot.workspace = "old-ws"
         slot.project = "/workspace/old-ws"
@@ -725,10 +920,10 @@ class TestSlotWorkspaceSwitchAtomicity:
                 await asyncio.sleep(0.05)
                 slot.total_messages = 1
             resp = await task
-            assert resp.status == 409
-            assert slot.workspace == "old-ws"
-            assert slot.project == "/workspace/old-ws"
-            state.sessions.reset.assert_not_awaited()
+            assert resp.status == 200
+            assert slot.workspace == "new-ws"
+            assert slot.project == "/workspace/new-ws"
+            state.sessions.reset.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_reset_declined_busy_rolls_back_and_answers_409(self):
@@ -743,7 +938,9 @@ class TestSlotWorkspaceSwitchAtomicity:
         slot.workspace = "old-ws"
         slot.project = "/workspace/old-ws"
         busy = MagicMock(spec=LLMProvider)
-        busy.has_active_turn.return_value = True
+        # Idle at the pre-commit check, mid-turn at the post-decline
+        # re-read: the turn slipped into the reset's own entry window.
+        busy.has_active_turn.side_effect = [False, True]
         state = _mock_state(slot, provider=busy)
         state.sessions.reset = AsyncMock(return_value=False)
         async with TestClient(TestServer(_make_app(state))) as client:
@@ -754,6 +951,137 @@ class TestSlotWorkspaceSwitchAtomicity:
             assert slot.workspace == "old-ws"
             assert slot.project == "/workspace/old-ws"
             assert state.sessions.reset.await_args.kwargs == {"skip_if_busy": True}
+
+    @pytest.mark.asyncio
+    async def test_active_turn_is_refused_before_the_commit(self):
+        # GPT review finding: the reset path calls
+        # _unblock_pending_waits BEFORE SessionManager.reset's atomic busy
+        # decline, so a turn parked on a pending approval had that approval
+        # rejected and only then got a 409. The model handler's early refusal
+        # is copied here: a live turn at the pre-commit check answers 409 with
+        # nothing committed, nothing unblocked and no reset attempted.
+        from kiro_crew.providers.base import LLMProvider
+
+        slot = _ChatSlot("test")
+        slot.workspace = "old-ws"
+        slot.project = "/workspace/old-ws"
+        busy = MagicMock(spec=LLMProvider)
+        busy.has_active_turn.return_value = True
+        state = _mock_state(slot, provider=busy)
+        with patch(f"{MOD}._unblock_pending_waits") as unblock:
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat/slots/test/workspace", json={"workspace": "new-ws"}
+                )
+                data = await resp.json()
+        assert resp.status == 409
+        assert data["code"] == "turn_in_flight"
+        assert slot.workspace == "old-ws"
+        assert slot.project == "/workspace/old-ws"
+        unblock.assert_not_called()
+        state.sessions.reset.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cold_starting_turn_is_refused_via_slot_running(self):
+        # Opus review finding: slot.running is set at dispatch, before
+        # the multi-second provider.start() registers a session, so a
+        # cold-starting turn is invisible to get_provider. Without this check
+        # the switch reported success while that turn ran on the OLD project.
+        slot = _ChatSlot("test")
+        slot.workspace = "old-ws"
+        slot.project = "/workspace/old-ws"
+        # `running` is a property over slot.task: a pending future stands in
+        # for the dispatched-but-not-yet-registered turn.
+        slot.task = asyncio.get_running_loop().create_future()
+        state = _mock_state(slot)  # no provider registered yet
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/workspace", json={"workspace": "new-ws"})
+            data = await resp.json()
+        assert resp.status == 409
+        assert data["code"] == "turn_in_flight"
+        assert slot.workspace == "old-ws"
+        state.sessions.reset.assert_not_awaited()
+        slot.task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_busy_rollback_remarks_the_slot_dirty(self):
+        # GPT review finding: the unlocked periodic flush may have
+        # written the PROVISIONAL bindings to disk during the reset await, so
+        # a 409 rollback must re-mark the slot dirty or the rejected switch
+        # survives a restart. Simulate the flush having cleared the flag
+        # mid-transaction.
+        from kiro_crew.providers.base import LLMProvider
+
+        slot = _ChatSlot("test")
+        slot.workspace = "old-ws"
+        slot.project = "/workspace/old-ws"
+        slot.total_messages = 3
+        busy = MagicMock(spec=LLMProvider)
+        # Idle at the pre-commit check, mid-turn at the post-decline
+        # re-read: the turn slipped into the reset's own entry window.
+        busy.has_active_turn.side_effect = [False, True]
+        state = _mock_state(slot, provider=busy)
+
+        async def _flush_then_decline(*_a, **_k):
+            slot._dirty = False  # the periodic flush ran with the new bindings
+            return False
+
+        state.sessions.reset = AsyncMock(side_effect=_flush_then_decline)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/workspace", json={"workspace": "new-ws"})
+            assert resp.status == 409
+            assert slot.workspace == "old-ws"
+            assert slot._dirty is True
+
+    @pytest.mark.asyncio
+    async def test_rollback_spares_a_concurrent_project_write(self):
+        # Opus review finding: slot.project has lock-free writers (the
+        # in-turn set_project directive) that can land during the reset await.
+        # The rollback is identity-scoped -- it unwinds only THIS request's
+        # commit token -- so a concurrent write of a different project stands
+        # while the workspace (untouched by that writer) is rolled back.
+        from kiro_crew.providers.base import LLMProvider
+
+        slot = _ChatSlot("test")
+        slot.workspace = "old-ws"
+        slot.project = "/workspace/old-ws"
+        busy = MagicMock(spec=LLMProvider)
+        # Idle at the pre-commit check, mid-turn at the post-decline
+        # re-read: the turn slipped into the reset's own entry window.
+        busy.has_active_turn.side_effect = [False, True]
+        state = _mock_state(slot, provider=busy)
+
+        async def _concurrent_set_project(*_a, **_k):
+            slot.project = "/elsewhere/picked-by-turn"
+            return False
+
+        state.sessions.reset = AsyncMock(side_effect=_concurrent_set_project)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/workspace", json={"workspace": "new-ws"})
+            assert resp.status == 409
+            assert slot.workspace == "old-ws"
+            assert slot.project == "/elsewhere/picked-by-turn"
+
+    @pytest.mark.asyncio
+    async def test_rollback_unwinds_a_same_text_own_commit(self):
+        # The identity test distinguishes this handler's own token from a
+        # concurrent write of the SAME text: with no concurrent writer, the
+        # committed project (same text as the token) IS rolled back.
+        from kiro_crew.providers.base import LLMProvider
+
+        slot = _ChatSlot("test")
+        slot.workspace = "old-ws"
+        slot.project = "/workspace/old-ws"
+        busy = MagicMock(spec=LLMProvider)
+        # Idle at the pre-commit check, mid-turn at the post-decline
+        # re-read: the turn slipped into the reset's own entry window.
+        busy.has_active_turn.side_effect = [False, True]
+        state = _mock_state(slot, provider=busy)
+        state.sessions.reset = AsyncMock(return_value=False)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots/test/workspace", json={"workspace": "new-ws"})
+            assert resp.status == 409
+            assert slot.project == "/workspace/old-ws"
 
     @pytest.mark.asyncio
     async def test_reset_declined_idle_session_retries_once(self):
@@ -791,7 +1119,7 @@ class TestSlotWorkspaceSwitchAtomicity:
         slot.project = "/workspace/old-ws"
         live = MagicMock(spec=AcpProvider)
         live.cwd = "/workspace/new-ws"
-        live.has_active_turn.return_value = True
+        live.has_active_turn.side_effect = [False, True]
         state = _mock_state(slot, provider=live)
         state.sessions.reset = AsyncMock(return_value=False)
         async with TestClient(TestServer(_make_app(state))) as client:
@@ -815,7 +1143,11 @@ class TestSlotWorkspaceSwitchAtomicity:
         slot.project = "/workspace/old-ws"
         newborn = MagicMock(spec=LLMProvider)
         newborn.has_active_turn.return_value = True
-        state = _mock_state(slot, provider=newborn)
+        state = _mock_state(slot)
+        # Pre-commit check and the reset helper's identity snapshot see no
+        # provider; the post-decline re-read sees the session a slipped-in
+        # send registered after the commit.
+        state.sessions.get_provider = MagicMock(side_effect=[None, None, newborn])
         state.sessions.reset = AsyncMock(return_value=False)
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.post("/api/chat/slots/test/workspace", json={"workspace": "new-ws"})
@@ -890,7 +1222,7 @@ class TestSlotWorkspaceSwitchAtomicity:
 
     @pytest.mark.asyncio
     async def test_reset_raise_answers_200_with_warning_and_pushes(self):
-        # A teardown that RAISES (#8598): the workspace/project pair is
+        # A teardown that RAISES: the workspace/project pair is
         # committed before the reset and SessionManager.reset pops the
         # session before its shutdown can fail, so the handler must answer
         # 200 with the committed workspace plus an advisory warning and still
@@ -914,7 +1246,7 @@ class TestSlotWorkspaceSwitchAtomicity:
 
     @pytest.mark.asyncio
     async def test_reset_retry_raise_answers_200_with_warning_and_pushes(self):
-        # The idle-decline RETRY can raise too (#8598): first reset declined
+        # The idle-decline RETRY can raise too: first reset declined
         # (idle live session), the retry's teardown throws. Same
         # committed-switch answer — 200 + warning + slots push, no rollback
         # to the old bindings.
@@ -953,7 +1285,7 @@ class TestSlotWorkspaceSwitchAtomicity:
     @pytest.mark.asyncio
     async def test_rebind_during_raising_reset_rolls_back_to_409(self):
         # The teardown-raise path must NOT bypass the rebind guard (GPT
-        # review finding on the #8598 fix): a slot rebound while the raising
+        # review finding): a slot rebound while the raising
         # reset awaited answers the same rollback + 409 as any other rebind.
         slot = _ChatSlot("test")
         slot.workspace = "old-ws"
@@ -1134,7 +1466,7 @@ class TestLinkedSlotSessionKey:
     async def test_rebind_during_live_switch_rolls_back_and_answers_409(self):
         # A binding that lands DURING _try_live_model_switch's provider RPC
         # (after the key was resolved) means whatever set_model did landed on
-        # a session the slot no longer runs on: commit nothing, reset nothing,
+        # a session the slot does not run on: commit nothing, reset nothing,
         # 409 so the retry resolves the current binding.
         from kiro_crew.providers.acp import AcpProvider
 
@@ -1232,7 +1564,7 @@ class TestLinkedSlotSessionKey:
         state = _mock_state(slot, provider=None)
         state.sessions.reset = AsyncMock(return_value=True)
         state.conversation_log = MagicMock()
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
             resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
             assert resp.status == 200
             assert slot.agent == "new-agent"
@@ -1281,7 +1613,7 @@ class TestLinkedSlotSessionKey:
 
     @pytest.mark.asyncio
     async def test_rebind_during_reset_rolls_back_the_agent_switch(self, monkeypatch):
-        # The session torn down is no longer the slot's: the commit — the one
+        # The session torn down is not the slot's: the commit — the one
         # case the agent handler's no-rollback rule unwinds — is rolled back,
         # the metadata write never runs, and the caller retries against the
         # current binding.
@@ -1299,7 +1631,7 @@ class TestLinkedSlotSessionKey:
             return True
 
         state.sessions.reset = AsyncMock(side_effect=_reset_and_rebind)
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
             resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
             data = await resp.json()
             assert resp.status == 409
@@ -1439,7 +1771,7 @@ class TestLinkedSlotSessionKey:
         busy.has_active_turn.side_effect = [False, False, True]
         state.sessions.get_provider = MagicMock(return_value=busy)
         state.sessions.reset = AsyncMock(return_value=False)
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
             resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
             data = await resp.json()
             assert resp.status == 409
@@ -1493,7 +1825,7 @@ class TestLinkedSlotSessionKey:
 
         log.update_metadata = MagicMock(side_effect=_persist_and_rebind)
         state.conversation_log = log
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
             resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
             data = await resp.json()
             assert resp.status == 409
@@ -1528,7 +1860,7 @@ class TestLinkedSlotSessionKey:
             return True
 
         state.sessions.reset = AsyncMock(side_effect=_reset_concurrent_write_and_rebind)
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
             resp = await client.post("/api/chat/slots/test/agent", json={"agent": "new-agent"})
             data = await resp.json()
             assert resp.status == 409
@@ -1553,7 +1885,14 @@ class TestLinkedSlotSessionKey:
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers.resolve_agent_bindings",
-            lambda cfg, name, project_dir=None: MagicMock(workspace_dir="/tmp/ws2"),
+            lambda cfg, name, project_dir=None, **kwargs: MagicMock(
+                workspace_dir="/tmp/ws2",
+                memory_store_name="",
+                kiro_agent=name,
+                selection_kind="template",
+                resolved_alias="",
+                requested_resolved=True,
+            ),
         )
         monkeypatch.setattr(
             "kiro_crew.dashboard.chat_handlers._workspace_name_for_dir",
@@ -1596,7 +1935,7 @@ class TestLinkedSlotSessionKey:
         self, tmp_path, monkeypatch
     ):
         # A binding that lands while the recent-project save awaits means the
-        # deferred-reset flag would name a session the slot no longer runs on
+        # deferred-reset flag would name a session the slot does not run on
         # (and the flag's consumer would tear down a session nobody is on
         # while the actual session keeps the old CWD): the commit is rolled
         # back, the flag stays unarmed, and the caller retries against the
@@ -1765,7 +2104,7 @@ class TestAliasSlotSwitchSerialization:
         state = _mock_state(slot, provider=None)
         state.sessions.reset = AsyncMock(return_value=True)
         state.conversation_log = MagicMock()
-        async with TestClient(TestServer(_make_app(state))) as client:
+        async with TestClient(TestServer(as_owner(_make_app(state)))) as client:
             async with _slot_switch_session_lock(_LINKED_KEY):
                 task = asyncio.create_task(
                     client.post("/api/chat/slots/alias-a/agent", json={"agent": "new-agent"})

@@ -2,7 +2,7 @@ import { safeSetItem } from '../utils/safeStorage'
 import { useState, useEffect, useCallback, useRef, useMemo, Fragment } from 'react'
 import { useImeGuard } from '../hooks/useImeGuard'
 import Clickable from '../components/Clickable'
-import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download, KeyRound } from 'lucide-react'
+import { List, CalendarDays, CalendarClock, Plus, ClipboardList, ChevronRight, Globe, History, Trash2, FolderPlus, MoreHorizontal, Pencil, Folder, LayoutGrid, GitPullRequestArrow, Download, KeyRound, Info, X } from 'lucide-react'
 import { api } from '../api/client'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useArmedDelete } from '../hooks/useArmedDelete'
@@ -20,14 +20,16 @@ import type { CronJob } from '../types'
 import { useAgents } from '../hooks/useAgents'
 import { useCronActions } from '../hooks/useCronActions'
 import { useScrollEdges } from '../hooks/useScrollEdges'
+import { useTableColumnWidths, type TableColumnSpec } from '../hooks/useTableColumnWidths'
 import { useAppSelector, useAppDispatch } from '../store'
 import { triggerRefresh } from '../store/dashboardSlice'
 import { SaveCreateLabel, scheduleLabel, scheduleMinutes } from '../utils/cronUtils'
 import { useSortableTable } from '../hooks/useSortableTable'
-import { SortableTableHead } from '../components/SortableHeader'
+import { ResizableTableHead, SortableTableHead } from '../components/SortableHeader'
 import ExecutionsView from '../components/ExecutionsView'
 import { sanitizeLlmOutput } from '../utils/sanitize'
-import { SCHEDULE_PRESETS, type CronPrefill, type SchedulePreset } from '../utils/schedulePresets'
+import { SCHEDULE_PRESETS, templateUpdate, presetCanonicalPrompt, type CronPrefill, type SchedulePreset } from '../utils/schedulePresets'
+import { contentHash } from '../lib/contentHash'
 import { groupJobsByFolder, loadCollapsedFolders, saveCollapsedFolders } from '../utils/cronFolders'
 import type { CronFolder } from '../utils/cronFolders'
 import CronFolderHeader from '../components/CronFolderHeader'
@@ -61,6 +63,40 @@ const RENDER_TZ_STORAGE_KEY = 'kirocrew.schedule.renderTz'
  * the moment a column is added or removed.
  */
 const SCHEDULE_COLUMNS = 10
+
+/**
+ * The jobs table's declared min-width in px: the number in its
+ * `min-w-[1176px]` class. It exists as a constant only so a user's column
+ * resize can move it (`JOBS_TABLE_MIN_WIDTH + jobCols.extra`); the class stays
+ * the default, and `SchedulePage.columnContract.test.ts` holds the two equal.
+ */
+const JOBS_TABLE_MIN_WIDTH = 1176
+
+/**
+ * The user-resizable jobs columns. Each `base` restates that column's
+ * `w-[Npx]` class, pinned equal by the columnContract test, so an untouched
+ * table is still laid out by the classes alone.
+ *
+ * Three columns are deliberately absent. The checkbox gutter has nothing to
+ * reveal. Message is the residual: it has no width to drag, and it grows by
+ * narrowing anything else. Actions is pinned `sticky right-0` and the overflow
+ * cue anchors on its literal 176px.
+ *
+ * Minimums sit a little under each base rather than at a shared floor: a
+ * Status badge or a relative time clipped to two glyphs reads as a rendering
+ * bug, not as a choice.
+ */
+const JOB_COLUMNS = {
+  id: { base: 68, min: 48, max: 360 },
+  name: { base: 160, min: 80, max: 640 },
+  type: { base: 116, min: 64, max: 480 },
+  schedule: { base: 180, min: 80, max: 480 },
+  status: { base: 86, min: 60, max: 240 },
+  lastRun: { base: 82, min: 56, max: 240 },
+  nextRun: { base: 92, min: 56, max: 240 },
+} satisfies Record<string, TableColumnSpec>
+
+const JOB_COLUMNS_STORAGE_KEY = 'kc:schedule:jobs-column-widths'
 
 /**
  * Literal token the user must type to arm bulk delete.
@@ -356,7 +392,7 @@ export default function SchedulePage() {
   // at the pinned Actions column's edge. Measured, not breakpoint-inferred: the
   // table overflows whenever the CONTAINER is narrower than its min-width,
   // which a resizable nav rail can cause at any viewport size.
-  const [attachJobsScroller, jobsTableEdges] = useScrollEdges<HTMLElement>()
+  const [attachJobsScroller, jobsTableEdges, remeasureJobsEdges] = useScrollEdges<HTMLElement>()
   // Stable wrapper, like the hook's own callback ref: an inline arrow would be
   // a new function every render, and React detaches/reattaches a changed ref —
   // each detach writes edge state, which re-renders, which loops.
@@ -364,6 +400,10 @@ export default function SchedulePage() {
     (el: HTMLTableElement | null) => attachJobsScroller(el?.parentElement ?? null),
     [attachJobsScroller],
   )
+  const jobCols = useTableColumnWidths(JOB_COLUMNS_STORAGE_KEY, JOB_COLUMNS)
+  // A column resize moves the table's min-width, i.e. its scrollWidth, without
+  // resizing the scroller's own box, so no observer reports it.
+  useEffect(() => { remeasureJobsEdges() }, [jobCols.extra, remeasureJobsEdges])
 
   // ── Cron Folder handlers (depend on load) ──
   const handleNewFolder = useCallback(async (moveTo?: boolean): Promise<string | undefined> => {
@@ -446,7 +486,7 @@ export default function SchedulePage() {
       return rank(a) - rank(b);
     },
     lastRun: (a: CronJob, b: CronJob) => (a.last_run_ts || 0) - (b.last_run_ts || 0),
-    nextRun: (a: CronJob, b: CronJob) => (a.next_run_ts || 0) - (b.next_run_ts || 0),
+    nextRun: (a: CronJob, b: CronJob) => (a.next_run_ts ?? Infinity) - (b.next_run_ts ?? Infinity),
   }), [])
   const { sorted: sortedScheduleJobs, sort: schedSort, toggle: toggleSchedSort } = useSortableTable(filteredJobs, 'cron-schedule', scheduleComparators, { key: 'nextRun', dir: 'asc' })
 
@@ -508,7 +548,7 @@ export default function SchedulePage() {
   // Open the create panel blank (from "Create your first job" / "Add Job").
   const openBlankCreate = useCallback(() => { setSelected(null); setDetailOpen(false); setPrefill(null); setCreating(true) }, [])
   // Open the create panel seeded from a pre-canned schedule card.
-  const openPreset = useCallback((p: SchedulePreset) => { setSelected(null); setDetailOpen(false); setPrefill(p.prefill); setPrefillWrites(!!p.writes); setPrefillNonce(n => n + 1); setCreating(true) }, [])
+  const openPreset = useCallback((p: SchedulePreset) => { setSelected(null); setDetailOpen(false); setPrefill({ ...p.prefill, sourcePreset: p.id, sourceTemplatePrompt: presetCanonicalPrompt(p.id) }); setPrefillWrites(!!p.writes); setPrefillNonce(n => n + 1); setCreating(true) }, [])
   // Open the detail dialog on a job (row click / calendar entry click).
   const openDetail = useCallback((job: CronJob) => { setCreating(false); setPrefill(null); setSelected(job); setDetailOpen(true) }, [])
   // Dismiss the dialog. `selected` survives on purpose — see its declaration.
@@ -759,8 +799,13 @@ export default function SchedulePage() {
                 ui/table.tsx); `sticky right-0` on the Actions cells resolves
                 against it, so the overflow measurement must read the same box.
                 `className` stays the FIRST attribute: the columnContract test
-                anchors on the literal `<Table className="table-fixed` opener. */}
-            <Table className="table-fixed min-w-[1176px]" ref={attachJobsTable}>
+                anchors on the literal `<Table className="table-fixed` opener.
+
+                The inline min-width exists only once the user has resized a
+                column, and restates the rule above mechanically: the px
+                columns moved by `extra`, so min-width moves by the same
+                amount and Message keeps its floor. */}
+            <Table className="table-fixed min-w-[1176px]" ref={attachJobsTable} style={jobCols.extra ? { minWidth: JOBS_TABLE_MIN_WIDTH + jobCols.extra } : undefined}>
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="w-[36px] px-2 text-center">
@@ -774,20 +819,20 @@ export default function SchedulePage() {
                       onChange={toggleAllVisible}
                     />
                   </TableHead>
-                  <TableHead className="w-[68px]">{i18nT('pages.schedulePage.id')}</TableHead>
-                  <SortableTableHead label={i18nT('pages.schedulePage.name')} sortKey="name" sort={schedSort} onToggle={toggleSchedSort} className="w-[160px]" />
-                  <TableHead className="w-[116px]">{i18nT('pages.schedulePage.type')}</TableHead>
+                  <ResizableTableHead label={i18nT('pages.schedulePage.id')} className="w-[68px] relative" style={jobCols.style('id')} resizer={jobCols.resizer('id')} />
+                  <SortableTableHead label={i18nT('pages.schedulePage.name')} sortKey="name" sort={schedSort} onToggle={toggleSchedSort} className="w-[160px] relative" style={jobCols.style('name')} resizer={jobCols.resizer('name')} />
+                  <ResizableTableHead label={i18nT('pages.schedulePage.type')} className="w-[116px] relative" style={jobCols.style('type')} resizer={jobCols.resizer('type')} />
                   {/* 180px, not the original 124: the value here is a clock time
                       plus a qualifier (`12:00 AM · Mon,Wed`), and 124px fitted
                       the time alone -- so every midnight job rendered the same
                       truncated string and the column stopped distinguishing
                       rows. Widening is paid for in the table's min-width below,
                       NOT out of Message, which keeps its floor. */}
-                  <SortableTableHead label={i18nT('pages.schedulePage.schedule')} sortKey="schedule" sort={schedSort} onToggle={toggleSchedSort} className="w-[180px]" />
+                  <SortableTableHead label={i18nT('pages.schedulePage.schedule')} sortKey="schedule" sort={schedSort} onToggle={toggleSchedSort} className="w-[180px] relative" style={jobCols.style('schedule')} resizer={jobCols.resizer('schedule')} />
                   <TableHead>{i18nT('pages.schedulePage.message')}</TableHead>
-                  <SortableTableHead label={i18nT('pages.schedulePage.status')} sortKey="status" sort={schedSort} onToggle={toggleSchedSort} className="w-[86px]" />
-                  <SortableTableHead label={i18nT('pages.schedulePage.last_run')} sortKey="lastRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[82px]" />
-                  <SortableTableHead label={i18nT('pages.schedulePage.next_run')} sortKey="nextRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[92px]" />
+                  <SortableTableHead label={i18nT('pages.schedulePage.status')} sortKey="status" sort={schedSort} onToggle={toggleSchedSort} className="w-[86px] relative" style={jobCols.style('status')} resizer={jobCols.resizer('status')} />
+                  <SortableTableHead label={i18nT('pages.schedulePage.last_run')} sortKey="lastRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[82px] relative" style={jobCols.style('lastRun')} resizer={jobCols.resizer('lastRun')} />
+                  <SortableTableHead label={i18nT('pages.schedulePage.next_run')} sortKey="nextRun" sort={schedSort} onToggle={toggleSchedSort} className="w-[92px] relative" style={jobCols.style('nextRun')} resizer={jobCols.resizer('nextRun')} />
                   {/* 176px, not 164: under `table-fixed` a column width is a
                       CONTRACT, so a cell whose controls need more than it spills
                       OUT of the table instead of widening it. The three inline
@@ -929,9 +974,28 @@ export default function SchedulePage() {
                     without it. */}
                 <TableCell className="truncate" title={j.schedule}>{scheduleLabel(j)}{j.timezone && <span className="block truncate text-[11px] text-muted">{j.timezone.replace(/_/g, ' ')}</span>}</TableCell>
                 <TableCell className="align-top"><CollapsibleMessage message={j.script ? j.script : j.command ? j.command : j.safeMessage} /></TableCell>
-                <TableCell title={j.last_error || j.last_result || ''}>{j.is_running ? <Badge variant="ok"><span className="inline-block w-1.5 h-1.5 rounded-full bg-ok animate-pulse mr-1 align-middle" />{i18nT('pages.schedulePage.running')}</Badge> : j.enabled ? (j.last_status === 'ok' ? <Badge variant="ok">{i18nT('pages.schedulePage.ok')}</Badge> : j.last_status === 'error' ? <Badge variant="err">{i18nT('pages.schedulePage.error')}</Badge> : <Badge variant="ok">{i18nT('pages.schedulePage.ready')}</Badge>) : <Badge variant="warn">{i18nT('pages.schedulePage.paused')}</Badge>}</TableCell>
-                <TableCell className="text-muted">{fmtAgo(j.last_run_ts)}</TableCell>
-                <TableCell className="text-muted" title={j.next_run_ts ? fmtDateTimeNumeric(j.next_run_ts) : ''}>{fmtIn(j.next_run_ts)}</TableCell>
+                <TableCell title={j.last_error ? '' : j.last_result || ''}><span className="block truncate">{j.is_running ? <Badge variant="ok"><span className="inline-block w-1.5 h-1.5 rounded-full bg-ok animate-pulse mr-1 align-middle" />{i18nT('pages.schedulePage.running')}</Badge> : j.enabled ? (j.last_status === 'ok' ? <Badge variant="ok">{i18nT('pages.schedulePage.ok')}</Badge> : j.last_status === 'error' ? <Badge variant="err">{i18nT('pages.schedulePage.error')}</Badge> : <Badge variant="ok">{i18nT('pages.schedulePage.ready')}</Badge>) : <Badge variant="warn">{i18nT('pages.schedulePage.paused')}</Badge>}</span></TableCell>
+                <TableCell className="text-muted">
+                  <span className="block truncate">{fmtAgo(j.last_run_ts)}</span>
+                  {/* Retry telemetry for the LAST run only: a job that needed
+                      retries but eventually succeeded (or failed) shows how
+                      many. 0 or absent renders nothing. The note wraps rather
+                      than truncates: the column is narrow and "Retried 3 ti..."
+                      carries no information.
+
+                      Shown only when `last_retry_run_ts` matches the run this row
+                      reports. A cancelled run advances `last_run_ts` (the `every`
+                      scheduler needs it to) without overwriting the count, so
+                      without the comparison this note reads a completed run's
+                      retries as the cancelled run's — a number attached to the
+                      wrong run is worse than no number. */}
+                  {!!j.last_retry_count && j.last_retry_run_ts === j.last_run_ts && (
+                    <span className="block whitespace-normal text-[11px] leading-tight">
+                      {i18nT('pages.schedulePage.retried_n_times', { count: j.last_retry_count })}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell className="text-muted" title={j.next_run_ts ? fmtDateTimeNumeric(j.next_run_ts) : ''}><span className="block truncate">{fmtIn(j.next_run_ts)}</span></TableCell>
                 {/* Two controls plus the overflow menu. Anything wider than this
                     is what pushed the column off screen; see CronRowActions.
                     Pinned like the header cell above, on an OPAQUE `bg-card`.
@@ -1108,7 +1172,7 @@ export default function SchedulePage() {
                 onEnter: () => { if (confirmArmed && !batchDeleting) runBatchDelete() },
               })}
               placeholder={BULK_DELETE_TOKEN}
-              className="w-full px-3 py-2 rounded-md bg-bg border border-border text-sm text-text outline-none focus-visible:border-accent"
+              className="w-full px-3 py-2 rounded-md bg-bg border border-border text-sm text-text outline-hidden focus-visible:border-accent"
             />
             {/* askAgent on: the only input here is the typed confirm token,
                 which is a safety gesture, not a draft worth protecting — the
@@ -1416,6 +1480,55 @@ export function JobSecretsPanel({ job, onSaved }: { job: CronJob; onSaved: () =>
  * keeps `selected` alive across dismissal so the calendar highlight and the
  * Executions filter survive.
  */
+/**
+ * "This template changed since you saved" hint on a saved job's detail panel.
+ *
+ * Attribution: `templateUpdate` compares the job's SAVED template snapshot
+ * against the template's current prompt, so this fires only when the TEMPLATE
+ * moved -- never when the user edited their own copy (see schedulePresets).
+ *
+ * Dismissible: an un-clearable notice becomes wallpaper. The dismissal is
+ * persisted against the value we compared (job id + the current template
+ * prompt), so clearing it silences THIS change but the hint returns if the
+ * template moves AGAIN -- a later prompt yields a different key. localStorage
+ * access is guarded (private mode throws); a storage failure just means the
+ * notice is not remembered as dismissed, never a crash.
+ */
+function TemplateUpdatedNotice({ job }: { job: CronJob }) {
+  const update = templateUpdate(job)
+  // Key the dismissal on the CANONICAL prompt -- the same locale-stable
+  // operand detection uses -- so dismissing then switching language does not
+  // resurrect the notice, and a genuine later template change (new canonical
+  // prompt -> new key) re-shows it.
+  const key = update
+    ? `kc-tpl-upd-dismissed:${job.id}:${contentHash(presetCanonicalPrompt(job.source_preset || ''))}`
+    : ''
+  const [dismissed, setDismissed] = useState(() => {
+    if (!key) return false
+    try { return localStorage.getItem(key) === '1' } catch { return false }
+  })
+  if (!update || dismissed) return null
+  const dismiss = () => {
+    safeSetItem(key, '1')
+    setDismissed(true)
+  }
+  return (
+    <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-accent-subtle text-[12.5px] text-muted" role="note" data-testid="schedule-template-updated-notice">
+      <Info size={14} className="shrink-0 mt-0.5" aria-hidden="true" />
+      <span className="flex-1">{i18nT('pages.schedulePage.template_updated_notice', { name: update.title })}</span>
+      <Btn
+        onClick={dismiss}
+        aria-label={i18nT('pages.schedulePage.template_updated_dismiss')}
+        title={i18nT('pages.schedulePage.template_updated_dismiss_hint')}
+        data-testid="schedule-template-updated-dismiss"
+        className="shrink-0 -mr-1 -mt-0.5 border-0 px-1 py-0.5 text-muted hover:bg-accent-hover hover:text-text"
+      >
+        <X size={13} aria-hidden="true" />
+      </Btn>
+    </div>
+  )
+}
+
 function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, rosterFailure, onClose, onSaved }: {
   job?: CronJob; prefill?: CronPrefill; prefillWrites?: boolean; agents: KiroCrewAgent[]; defaultAgent: string; rosterFailure?: { reloading: boolean; onReload: () => void }; onClose: () => void; onSaved: () => void
 }) {
@@ -1462,8 +1575,9 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, ro
           <JobLogsView jobId={job.id} isRunning={job.is_running} runningSince={job.running_since} cancelError={panelError} onCancel={async () => { setPanelError(null); try { await api.cancelCron(job.id); onSaved() } catch (e: unknown) { setPanelError(e instanceof Error ? e.message : i18nT('pages.schedulePage.failed')) } }} />
         ) : (
           <>
+            {job && <TemplateUpdatedNotice job={job} />}
             {prefillWrites && (
-              <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-warn-subtle text-[12.5px] text-warn-fg" role="note">
+              <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-warn-subtle text-[12.5px] text-warn-fg" role="note" data-testid="schedule-writes-notice">
                 <GitPullRequestArrow size={14} className="shrink-0 mt-0.5" aria-hidden="true" />
                 <span>{i18nT('pages.schedulePage.writes_notice')}</span>
               </div>
@@ -1477,8 +1591,15 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, ro
                 FAILED), so it takes the shared surface with the 'Last Error'
                 label as its title. `whitespace-pre-wrap` on the notice body
                 keeps the log's line structure; `font-mono` keeps it reading as
-                output rather than prose. */}
-            {job?.script && job.last_error && (
+                output rather than prose.
+
+                NOT gated on `script`: a `command` job fails the same way and
+                carries the same `last_error`, and gating the only in-page
+                surface on the job's TYPE left that reader with the row's
+                `title=` tooltip alone -- invisible on touch, unreadable to a
+                screen reader, and no hand-off. The failure decides the
+                surface, never the shape of the job that produced it. */}
+            {job?.last_error && (
               <>
                 {/* No hand-off: JobForm draft */}
                 <ErrorNotice
@@ -1489,7 +1610,7 @@ function JobDetailDialog({ job, prefill, prefillWrites, agents, defaultAgent, ro
                 />
               </>
             )}
-            {job?.script && !job.last_error && job.last_result && (
+            {job && !job.last_error && job.last_result && (
               <div className="flex flex-col gap-1.5">
                 <div className="text-[12px] text-muted font-medium">{i18nT('pages.schedulePage.last_output')}</div>
                 <pre className="text-[12px] font-mono whitespace-pre-wrap break-words rounded border px-2.5 py-2 max-h-[200px] overflow-y-auto bg-bg-elevated border-border text-text">{job.last_result}</pre>

@@ -87,7 +87,6 @@ describe('productName interpolation variable', () => {
       // interpolates {{productName}} for the user, the catalog keeps the raw
       // fork brand so those component tests can match it.
       'components.agentImportFlow.existing_kirocrew_setup_is_never_overwritten_mat',
-      'components.pullRequestPanel.kiro_crew_uses_your_local_provider_cli_to_load_p',
       'pages.overview.mcpTab.kirocrew',
       'pages.settings.securityPanel.i_understand_this_weakens_kirocrew_s_protection',
     ])

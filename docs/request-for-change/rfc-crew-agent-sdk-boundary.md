@@ -1,6 +1,6 @@
 ---
 title: Crew Agent SDK Boundary — isolate the codebase from ACP, and name the host contract
-status: partially-implemented
+status: partial
 revision: v4
 author: zejiangg, with Kiro
 created: 2026-08-28
@@ -17,20 +17,14 @@ superseded-by: []
 ---
 # RFC: Crew Agent SDK Boundary — isolate the codebase from ACP, and name the host contract
 
-- Status: partially implemented. **PR 1 has landed**: the shrink-only import
-  gate (`scripts/check_agent_sdk_boundary.py`), its baseline
-  (`.github/agent-sdk-boundary-baseline.txt`, seeded at **58 files / 107
-  edges**), the `ci.yml` wiring, and the `src/kiro_crew/agent_sdk/`
-  package — which already carries more than the layer docstring PR 1 proposed:
-  `drivers/acp.py`, `backend_install.py`, `backend_identity.py`,
-  `provider_identity.py` and `native_commands.py`. **Part of PR 4 has landed**
-  too, on this branch: the import cycle §2.4 exists to break is closed, and the
-  cycle v3 named was the wrong one. PRs 2, 3, 5 and 6 remain unstarted.
-  The migration is additive: the boundary package sits beside the current
-  provider layer and consumers move behind it one wave at a time under the
-  ratchet. Every question in §12 carries a disposition: the two that gated PR 2
-  and PR 4 are decided, and the rest record a conservative default plus the
-  condition that reopens it.
+- Status: partially implemented. PR 1's shrink-only boundary gate and package
+  are live; PR 3a moved backend/capability tables behind `agent_sdk` and replaced
+  six identity branches with `SessionCapabilities`; the import-cycle half of PR 4
+  is also complete. The current ratchet baseline is **57 files / 102 edges**
+  (64 via `kiro_crew.acp`, 38 via `kiro_crew.providers`). PR 2's SDK-owned event
+  and approval types, the remaining role protocols and supervisor ownership, the
+  consumer migration waves, and the final seal remain incomplete. The migration
+  stays additive: consumers move behind the boundary one wave at a time.
 - Author: zejiangg, with Kiro
 - Created: 2026-08-28
 - Audited against: `73d60a83d`
@@ -131,6 +125,18 @@ The first domain vocabulary now owned by `kiro_crew.agent_sdk` is the minimal
 completed-turn contract used by structured monitors: provider-neutral input and
 output token dimensions plus terminal stop reasons. Monitor accounting consumes
 that SDK surface instead of importing ACP's `TurnUsage` and constants directly.
+
+Prompt delivery consumes the SDK-owned `ContextStreamEvent` read-only protocol
+and semantic event vocabulary. `ContextPromptProvider` exposes only context
+capabilities, not ACP handles. `context_provider_of()` delegates implementation
+recognition to the single SDK ACP driver; structural mocks and proxies cannot
+opt in by advertising attributes or a forged `__class__`. The bridge uses
+function-local concrete imports so the SDK remains import-light and does not
+cycle through provider receipt state. The workflow test scenario uses
+`drivers.acp.projected_session_mcp_servers(agent, work_dir=...)` to delegate the
+existing filtered projection through that same driver. It returns plain
+dictionaries without granting authority or starting MCP and is not exported
+from the SDK root.
 
 ### 2.2 The boundary is bypassed
 
@@ -377,17 +383,20 @@ host contract and declaration.
   on the wire for the frontend to read. A capability the backend knows and the UI
   re-derives by string compare is the §2.3 defect one layer further out, where no
   Python-side gate can see it.
-- **Its sessions get an empty MCP array.** `_codex_session_mcp_servers()`
-  (`acp/client.py`) returns `[]`, so **nothing is projected** onto a codex
-  session — not a reduced set, and not Crew's own control plane. The only entries
-  it can carry are the shared MCP gateway's broker stubs, appended for every
-  backend alike and empty when that gateway is off, so with the gateway off the
-  session has no tools at all.
-  `providers/mirrors/`'s `NO_MIRROR` entry states this outright and calls it "a
-  real user-visible state". It is §2.6's `_session_mcp_servers() -> []` row
-  returning on a *selectable* provider, after the core had closed that hole for
-  CC — which is the evidence that a neutral-return override is a hole in the
-  contract and not a one-off.
+- **Its sessions got an empty MCP array — since closed.** As this section was
+  written, `_codex_session_mcp_servers()` (`acp/client.py`) returned `[]`, so
+  **nothing was projected** onto a codex session — not a reduced set, and not Crew's
+  own control plane; with the shared MCP gateway off, the session had no tools at
+  all. That was §2.6's `_session_mcp_servers() -> []` row returning on a *selectable*
+  provider, after the core had closed the same hole for CC, which is the evidence
+  that a neutral-return override is a hole in the contract and not a one-off. The
+  hole is closed and the evidence stands: codex has a mirror
+  (`providers/mirrors/codex.py`), the runtime applies its session projection on the
+  `AcpRuntime` path, and `CodexHarness.session_mcp_servers` narrows the projected
+  array to what the adapter advertises — so the array a codex session mounts is now
+  built rather than defaulted. The method named above no longer exists; the argument
+  for a DECLARED extension point rather than an override does, which is what §7's
+  `mcp_servers` row carries.
 
 The enforcement that was missing is landing with this revision: the host-contract
 spec gains a Codex column and a parity test in the same PR as this document. The
@@ -398,12 +407,16 @@ build offered — and each used that as the *justification* for supplying nothin
 `acp_backends.py`'s comment on the id, `AcpClient._codex_session_mcp_servers`'s
 docstring, the "dormant seam" comment on the `_is_codex` spawn branch, and the
 `NO_MIRROR` rationale string in `providers/mirrors/registry.py`. A reader who
-believes any of them concludes the empty MCP array costs nobody anything. `main`
+believed any of them concluded the empty MCP array cost nobody anything. `main`
 rewrote the two comments in #8905 before this revision landed, together with the
 same retracted claim about the CC branch in `docs/system-specs/modules/providers.md`;
-this revision corrects the remaining two, and goes one step further on both — the
+this revision corrected the remaining two, and went one step further on both — the
 docstring and the rationale also inferred "nothing is mounted" from "nothing is
-projected", which the shared MCP gateway's pooled stubs make false.
+projected", which the shared MCP gateway's pooled stubs make false. All four are now
+moot rather than merely corrected: the method and the `_is_codex` spawn branch were
+both deleted when codex moved onto the shared runtime, and `NO_MIRROR` gave way to a
+real mirror. What survives is the lesson the passage was written for — a bucket left
+silent should fail a test — and that is what §12.4 turns into code.
 
 ## 3. Goals
 
@@ -473,6 +486,11 @@ consumers        dashboard/  slack/  discord/  telegram/  messaging/
 
 If this goes red you introduced a boundary violation; fix the import direction,
 do not relax the rule.
+
+Provider-neutral process setup also crosses through this surface. The SDK's ACP
+driver applies the shared suspended-child resource policy and translates the ACP
+failure into a boolean, so application transports can fail in their own vocabulary
+without importing an ACP exception or lifecycle helper.
 
 `kiro_crew.providers` becomes a thin deprecated shim during migration (§9) and
 its **shim surface** is deleted at the end. Not the whole package: since v3,
@@ -796,7 +814,7 @@ that silence is not an answer and nothing was enforcing it.
 | 2 Session persistence | A foreign transcript store keyed by an encoded `realpath(cwd)`, a path-less `session/load`, in-band synchronous `/compact`, one session per process | CC |
 | 3 Identity and auth | Its own sign-in and its own credential command; a host logout must **not** retire its children | CC |
 | 4 Sandbox | No internal sandbox, so Crew's own wrap must stay — the one membership set that fails *open* | CC |
-| 5 MCP server injection | Reads no file; servers must ride `session/new` **and** `session/load`, in a different shape. Codex: nothing is projected — `_codex_session_mcp_servers()` returns `[]`, so a session mounts zero tools (§2.7) | CC, Codex |
+| 5 MCP server injection | Reads no file; servers must ride `session/new` **and** `session/load`, in a different shape. Codex: the same, and answered — its mirror projects the spec onto both verbs and `CodexHarness.session_mcp_servers` narrows the array to the transports the adapter advertises (§2.7 records the state before that landed) | CC, Codex |
 | 6 Usage, billing, credits | Dollars per token instead of host credits | CC |
 | 7 Security and permission parity | A native permission engine upstream of and invisible to the host gate; a different option vocabulary with a real `reject`; auto mode as a per-session file. Codex: asks only under an applied `("mode", "read-only")` config option, with a residual read gap ACP v1 cannot close | CC and KAS, Codex |
 | 8 Auxiliary runtimes | A second native binary the adapter's own SDK will not find | CC |
@@ -1010,11 +1028,24 @@ out of the boundary entirely as a policy module above it. Pick one and record it
 the current state, where a policy module reads a leaf's id tables and neither is
 inside the boundary, is not a resting place.
 
+**Decision: option 1 — the tables moved into `agent_sdk`** (landed in PR 3a,
+below). Option 2 was rejected on a property options 1 and 3 do not share: a table
+left outside the boundary keeps its old import path reachable, and a reachable old
+path is the one a new consumer finds, so the SDK would be an alternative rather
+than the way. Option 3 was rejected because it inverts the dependency it claims to
+simplify — a policy module above the boundary would still have to read the id
+tables, so the id key survives and the module that owns the security verdict ends
+up outside the surface every consumer is told to use. The per-driver declaration
+half of option 1 is deferred: the tables are now inside, still keyed on id, and
+moving the key onto each driver waits for PR 4, where the drivers get an owner.
+
 It also lands the two promoted host-contract contracts: a declared per-session
 `mcp_servers` extension point on `SessionRequest`, replacing the
 `_session_mcp_servers()` override hole (the core now implements that method for
-CC, so what PR 3 removes is the untyped override seam, not the behaviour — and
-`_codex_session_mcp_servers()` returning `[]` is the same hole still open, §2.7),
+CC, so what PR 3 removes is the untyped override seam, not the behaviour — codex's
+instance of the same hole, §2.7, has since been closed by its mirror rather than by
+this extension point, which leaves the seam's cost argument intact and its last
+neutral-return caller gone),
 and `writes_own_transcripts` + `AgentSupervisor.cleanup_session` as the declared
 home of transcript ownership.
 
@@ -1027,6 +1058,53 @@ with `#6921` and later splits, so PR 3 re-derives them rather than working from 
 line list. Rewriting them to stop *dispatching* on the answer is PR 4's move; PR 3
 only changes where the answer comes from, which is why the exits record those files
 as carried rather than clean.
+
+#### PR 3a LANDED — the tables moved, and the six identity checks are gone
+
+Shipped as a single `refactor:` commit with no behaviour change: every routing
+verdict, permission config, membership answer and capability field is pinned to a
+literal copied from a clean `main` checkout, for every backend id and for an
+unknown one.
+
+What moved:
+
+- `acp_backends.py` → `agent_sdk/backends.py`, and `acp_tool_gate.py` →
+  `agent_sdk/tool_gate.py`. Both top-level modules survive as pure re-export
+  shims, so no existing call site changed in the same commit as the move; a test
+  asserts each shim defines nothing, because a definition left in a shim is a
+  definition reachable without crossing the boundary. The private registry pair is
+  deliberately NOT re-exported — a second binding to a mutable set is how two
+  views of one registry start disagreeing — so the two tests that mutate it now
+  reach `agent_sdk.backends` directly.
+- `agent_sdk/capabilities.py` is new: `SessionCapabilities`, a frozen record with
+  one field per question a consumer outside the boundary actually asks, plus
+  `capabilities_for(backend)` and `capabilities_of(provider)`. Every field is a
+  translation of a table that already existed, so no membership changed.
+  `AcpProvider.capabilities` is where a live session's record comes from.
+- Each of the six identity checks now reads a field: the model-id namespace
+  (`config/loader.py`, `dashboard/chat_handlers.py`), whether the backend's own
+  advertised list must be read back (`dashboard/handlers/agents.py`,
+  `dashboard/chat_runner.py`'s pinned-model verdict), which provider seam serves
+  the session (`dashboard/chat_runner.py`'s billing label, `subagent.py`'s
+  session-file cleanup), whether compaction finishes inline
+  (`dashboard/chat_runner.py`), and which channel carries an effort change
+  (`knowledge/llm_pool.py`, which had been reading `AcpClient`'s private
+  `_is_claude`).
+- One capability set is new, `ACP_BACKENDS_INLINE_COMPACTION`, because the
+  compaction branch was the one question with no table behind it. Its membership is
+  exactly what the identity check it replaced answered, and it is a strict subset of
+  `ACP_BACKENDS_COMPACT`.
+- The boundary baseline SHRANK: `dashboard/chat_runner.py` 5 → 4 and `subagent.py`
+  8 → 7, because both stopped importing `providers.acp`.
+
+What PR 3a did NOT do, so the rest of PR 3 still has a job: the role protocols of
+§5.3, the `SessionRequest.mcp_servers` extension point, `writes_own_transcripts` +
+`AgentSupervisor.cleanup_session`, and `spawnable_multiplexed_selections()`. One
+identity read also stays, in `dashboard/handlers/agents.py`'s `api_models`: it asks
+whether the backend has a `--list-models` catalog to shell out to, which is a
+pre-session question whose capability answer would have to be DECIDED for KAS and
+Codex rather than translated. It is pinned by enclosing function in
+`test_agent_sdk_capabilities`, so a seventh read cannot appear beside it.
 
 - Exit: `ACP_BACKEND_*` constants and `ACP_BACKENDS_*` sets are read only inside
   `agent_sdk/` and whichever module PR 3's decision leaves owning the tables.
@@ -1410,6 +1488,24 @@ An `ast`-based test in house style, modelled on
   both, and never neither. This is what stops an implement-and-raise stub.
 - The existing dialect-parity harness continues to run against the driver
   unchanged.
+- A per-backend frame-replay snapshot. `test/fixtures/acp_frames/<id>/` holds
+  recorded agent-to-client JSON-RPC sequences per backend and
+  `test/test_acp_frame_replay.py` replays each one through the dispatch parsers,
+  comparing the whole resulting event stream against a committed snapshot.
+
+The replay corpus is what makes the field-level tests above sufficient rather
+than merely necessary. A per-field translation test asserts one field of one
+frame it constructs inline, so it passes while the SHAPE of a turn changes
+underneath it — a `tool_call_update` that stops emitting the refinement event
+beside its result, a tool input that stops being redacted, two events reordered.
+Each of those is a behaviour change every field test tolerates and the snapshot
+does not. It landed ahead of PR 2 deliberately, so the baseline it locks is
+pre-refactor behaviour: a PR in this sequence that changes an event stream shows
+up as a snapshot diff a reviewer reads, and one that does not touch behaviour
+leaves the snapshots alone. Two ratchets keep it honest for backends added later
+— a backend in `ACP_BACKENDS_KNOWN` with no fixture directory fails rather than
+skips, and an action `classify_notification` can return that the replay harness
+does not handle fails too.
 
 ## 9. Backward compatibility
 

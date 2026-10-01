@@ -26,7 +26,11 @@ async def test_patch_with_mask_does_not_overwrite(tmp_path, monkeypatch) -> None
     app = web.Application()
     app.router.add_patch("/api/config/kirocrew", api_kirocrew_config_patch)
     app["state"] = SimpleNamespace(subagents=MagicMock(spec=["update_completion_keep"]), sessions=SimpleNamespace(refresh_defaults=AsyncMock(), reload_provider_factory=AsyncMock()), _slots={}, push_slots_update=MagicMock())
-    # also needs _beacon_governance etc not used
+    # Config writes are owner-gated upstream; act as the owner like the
+    # upstream redaction tests do.
+    from dashboard_owner_helpers import as_owner
+
+    as_owner(app)
     async with TestClient(TestServer(app)) as client:
         resp = await client.patch("/api/config/kirocrew", json={"path": "agent.provider_api_key", "value": _SENSITIVE_MASK})
         assert resp.status == 200

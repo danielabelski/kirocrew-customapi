@@ -67,3 +67,81 @@ def test_skill_states_the_dependency_and_the_three_line_shapes():
     assert "- **title**" in skill
     assert "do not accept a deferral as a ruling on a security" in skill
     assert "argue *not a defect*, not *disproportional*" in skill
+
+
+# ---------------------------------------------------------------------------
+# The whole-design extractor (_review_contract.extract_design_items) parses the
+# lanes' OUTPUT TEMPLATES: the machine-parsed `<Lane>-Verdict:` line and the
+# `### <section>` headings. Those templates live in the workflows and prompt
+# files, so a rename there makes the extractor silently yield nothing -- which
+# looks exactly like a lane that raised no items. Pin the anchors, not the
+# whole template: a lane may gain a section without breaking anything.
+# ---------------------------------------------------------------------------
+
+CONTRACT = (
+    REPO_ROOT
+    / "src"
+    / "kiro_crew"
+    / "builtin_skills"
+    / "kirocrew-dev"
+    / "prepare-pr"
+    / "scripts"
+    / "_review_contract.py"
+)
+DESIGN_LANE_TEMPLATES = {
+    "DESIGN": (REPO_ROOT / ".github" / "workflows" / "design-review.yml", "Design-Verdict:"),
+    "UX": (REPO_ROOT / ".github" / "workflows" / "ux-review.yml", "UX-Verdict:"),
+    "FIRST-PRINCIPLES": (
+        REPO_ROOT / ".github" / "review-prompts" / "first-principles.md",
+        "First-Principles-Verdict:",
+    ),
+}
+
+
+# The heading each lane files its CONCERNS-level items under. Design and UX
+# use `### Watch`; First Principles folds its items into `### Not justified as
+# shipped` (one entry per item, carrying its own `Clears when:` /
+# `Subtraction:` lines) and emits no Watch or Subtractions section, so that a
+# finding is stated once. Both headings are on the extractor's allowlist.
+DESIGN_LANE_ITEM_HEADINGS = {
+    "DESIGN": "### Watch",
+    "UX": "### Watch",
+    "FIRST-PRINCIPLES": "### Not justified as shipped",
+}
+
+
+def test_each_whole_design_lane_still_emits_the_anchors_the_extractor_reads():
+    for lane, (path, verdict_key) in DESIGN_LANE_TEMPLATES.items():
+        text = path.read_text(encoding="utf-8")
+        assert verdict_key in text, f"{lane}: the machine-parsed verdict line moved"
+        heading = DESIGN_LANE_ITEM_HEADINGS[lane]
+        assert heading in text, f"{lane}: the {heading} section heading moved"
+        assert "### Blockers" in text, f"{lane}: the Blockers section heading moved"
+        assert f"[{lane}-REVIEWED]" in text, f"{lane}: the freshness stamp moved"
+    # First Principles must not grow the restating sections back: they are
+    # what buried its findings under three copies of the same item.
+    fp = DESIGN_LANE_TEMPLATES["FIRST-PRINCIPLES"][0].read_text(encoding="utf-8")
+    assert "### Watch" not in fp
+    assert "### Subtractions" not in fp
+
+
+def test_the_extractor_allowlist_covers_the_shared_item_sections():
+    contract = CONTRACT.read_text(encoding="utf-8")
+    for section in ("Blockers", "Watch", "Subtractions", "Suggestions"):
+        assert f'"{section}"' in contract, section
+    # Deliberately EXCLUDED: an inventory line and an evidence note are not
+    # items an author rules on one by one.
+    assert "What this change ships" in (
+        DESIGN_LANE_TEMPLATES["FIRST-PRINCIPLES"][0].read_text(encoding="utf-8")
+    )
+    assert '"What this change ships"' not in contract
+    assert '"Evidence gaps"' not in contract
+
+
+def test_the_skill_states_the_local_only_scope_of_the_concerns_stop():
+    """The stop is the LOCAL loop's, never the required status: CONCERNS stays
+    advisory server-side, and SKILL.md has to say so or a reader will expect a
+    red check that never comes."""
+    skill = SKILL.read_text(encoding="utf-8")
+    assert "unanswered CONCERNS" in skill
+    assert "required status" in skill

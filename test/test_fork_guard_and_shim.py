@@ -41,9 +41,11 @@ def test_acp_provider_never_produces_router_problems():
     assert validate_provider_settings(_agent()) == []
 
 
-def test_claude_code_without_url_or_key_flagged():
+def test_claude_code_without_url_or_key_is_a_subscription_login():
+    # No base URL and no key means claude-agent-acp uses the Claude
+    # subscription login (`claude /login`) -- a valid setup, not a 401.
     problems = validate_provider_settings(_agent(provider="claude_code"))
-    assert any("401" in p for p in problems)
+    assert not any("401" in p for p in problems)
 
 
 def test_claude_code_router_with_auto_model_flagged():

@@ -30,6 +30,7 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.state import (
     DashboardState,
 )
+from kiro_crew.dashboard.status_counts import cached_status_snapshot
 from kiro_crew.embeddings import get_shared_embedder, model_file_present
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
@@ -164,27 +165,38 @@ def _yolo_duration_fields() -> tuple[str, bool, list[str]]:
     return label, permitted, disabled_modes
 
 
+def _gateway_memory_fields() -> tuple[int, int]:
+    """``(gateway_rss_mb, watchdog_rss_max_mb)`` for the status payload.
+
+    The live resident set of THIS process (``platform_compat.proc_rss_bytes``,
+    the same reading ``/api/system`` reports as ``proc_mem_mb``) and the
+    configured per-session tree ceiling (``session.watchdog_rss_max_mb``; ``0``
+    when disabled). Both reads can touch the filesystem, so this runs in a
+    worker thread. Each degrades independently to ``0`` — an unreadable RSS
+    must not hide the ceiling, nor the reverse.
+    """
+    try:
+        rss_mb = int(platform_compat.proc_rss_bytes() // (1024 * 1024))
+    except Exception:
+        logger.debug("could not read gateway RSS for status", exc_info=True)
+        rss_mb = 0
+    try:
+        ceiling = int(KiroCrewConfig.load().session.watchdog_rss_max_mb)
+    except Exception:
+        logger.debug("could not read session.watchdog_rss_max_mb for status", exc_info=True)
+        ceiling = 0
+    return rss_mb, max(0, ceiling)
+
+
 async def api_status(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     uptime = time.time() - state.start_time
-    from kiro_crew.dashboard.handlers import (
-        _UPDATE_CHECK_INTERVAL,
-        _do_update_check,
-    )
-    from kiro_crew.dashboard.handlers import updates as _updates_mod
 
-    # Auto-recheck every 12h in background. Tracked in ``_background_tasks`` (this
-    # module's own documented pattern) rather than left as a bare create_task: the
-    # check now performs network I/O with a multi-second timeout, so an untracked
-    # task can be garbage-collected mid-flight or still be pending when the loop
-    # closes. ``_do_update_check`` is additionally single-flight, because the
-    # interval clock is only stamped once a check finishes.
-    if time.time() - _updates_mod._last_update_check > _UPDATE_CHECK_INTERVAL:
-        _bg = asyncio.create_task(_do_update_check())
-        state._background_tasks.add(_bg)
-        _bg.add_done_callback(state._background_tasks.discard)
-
-    data = state.status_snapshot(**_updates_mod.status_update_fields())  # type: ignore[arg-type]
+    # Route the lesson/cron counts through the ONE gateway-wide cache all three
+    # status emitters share, so the counts never compute inline on the event
+    # loop (JSONL + sqlite COUNT under the vector store lock, and a crons.json
+    # parse) — the freeze class no-blocking-call-on-event-loop guards against.
+    data = await cached_status_snapshot(state)
     static_info = _get_static_system_info()
     if state._owner_hash is not None:
         owner_hash = state._owner_hash
@@ -199,6 +211,9 @@ async def api_status(request: web.Request) -> web.Response:
     yolo_duration, until_shutdown_ok, disabled_approval_modes = await asyncio.to_thread(
         _yolo_duration_fields
     )
+    # Off-loop for the same reason: the RSS read is procfs I/O on Linux and the
+    # ceiling is a config read.
+    gateway_rss_mb, watchdog_rss_max_mb = await asyncio.to_thread(_gateway_memory_fields)
     data.update(
         {
             "uptime_secs": int(uptime),
@@ -209,6 +224,12 @@ async def api_status(request: web.Request) -> web.Response:
             "update_progress": state._update_progress,
             "version": kiro_crew.__version__,
             "platform": sys.platform,
+            # The gateway's own live resident set and the per-session tree
+            # ceiling the cleanup watchdog recycles at (0 = disabled), so
+            # `kirocrew status` can show what is bounding memory without the
+            # operator opening the System page.
+            "gateway_rss_mb": gateway_rss_mb,
+            "watchdog_rss_max_mb": watchdog_rss_max_mb,
             "yolo": so_status.active,
             "yolo_active": so_status.active,
             "yolo_expires_at": so_status.expires_at_iso or "",
@@ -482,6 +503,28 @@ def _apply_mcp_process_counts(data: dict[str, object]) -> None:
     data.update(_proc_scan_cache)
 
 
+def _local_ip() -> str:
+    """The address the kernel would source an outbound packet from, best-effort.
+
+    A UDP socket ``connect`` sends nothing (no handshake for a datagram socket),
+    it only selects a route, so ``getsockname`` yields the interface address
+    without a packet leaving the host; ``8.8.8.8`` is just a public address any
+    default route covers. Falls back to loopback when there is no route or no
+    network stack (an offline runner, a sandbox). The one place system-info
+    rendering reaches for the network, kept as its own seam so a test can pin
+    the answer instead of stubbing ``socket.socket`` -- replacing that CLASS
+    breaks ``isinstance`` checks inside asyncio's proactor loop on Windows.
+    """
+    try:
+        # Context manager guarantees the socket fd is closed on every path,
+        # including when connect()/getsockname() raise (CWE-772 fd leak).
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return str(s.getsockname()[0])
+    except Exception:
+        return "127.0.0.1"
+
+
 def _collect_system_metrics() -> dict[str, object]:
     """Collect system metrics synchronously (runs in thread pool).
 
@@ -586,15 +629,7 @@ def _collect_system_metrics() -> dict[str, object]:
                 cpu_pct = 0
     data["cpu_pct"] = cpu_pct
 
-    # Local IP address
-    try:
-        # Context manager guarantees the socket fd is closed on every path,
-        # including when connect()/getsockname() raise (CWE-772 fd leak).
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            data["ip"] = s.getsockname()[0]
-    except Exception:
-        data["ip"] = "127.0.0.1"
+    data["ip"] = _local_ip()
 
     # Network bytes + speed — cross-platform
     try:

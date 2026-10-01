@@ -133,5 +133,6 @@ reader the picture but never the content.
 
 ## Multiple images
 
-Author sequentially, or fan out with `spawn_run` (one task per image; each
-task gets the full brief + exact output path).
+Author sequentially, or -- for 2+ images -- fan out with `spawn_run(tasks=[...])`
+(one task per image; each task gets the full brief + exact output path). A
+single image is authored inline, not through a one-task `spawn_run`.

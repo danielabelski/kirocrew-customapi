@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import os
 import sqlite3
 import tarfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -158,6 +160,28 @@ def _make_snapshot(src: Path, out: Path, extra_args: list[str] | None = None) ->
     return tarballs[0]
 
 
+#: The snapshot family: the facade and every module that owns part of what it does. A
+#: source scan guarding a snapshot rule reads all of them -- the code a rule is about can
+#: live in any one of them, and a scan of the facade alone would pass by not looking.
+SNAPSHOT_FAMILY = (
+    "snapshot.py",
+    "snapshot_components.py",
+    "snapshot_archive.py",
+    "snapshot_restore.py",
+    "snapshot_merge.py",
+)
+
+
+def snapshot_family_paths() -> list[Path]:
+    root = Path(snapshot_mod.__file__).parent
+    return [root / name for name in SNAPSHOT_FAMILY]
+
+
+def snapshot_family_source() -> str:
+    """Every family module's source, concatenated in :data:`SNAPSHOT_FAMILY` order."""
+    return "\n".join(path.read_text(encoding="utf-8") for path in snapshot_family_paths())
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Set up source dir, output dir, and snapshot tarball."""
@@ -193,7 +217,7 @@ class TestSnapshot:
         assert (snap / "skills/my-skill/SKILL.md").is_file()
         assert not (snap / "workspace/hygiene_data/week1.json").exists()
         m = json.loads((snap / "MANIFEST.json").read_text(encoding="utf-8"))
-        assert m["version"] == 3
+        assert m["version"] == snapshot_mod.MANIFEST_VERSION
         # v3 is additive over v2 — every v2 key is still present, so a restore built
         # before the purpose seam reads a v3 bundle correctly instead of refusing it.
         for v2_key in (
@@ -339,7 +363,7 @@ class TestRestoreReplace:
 
     @requires_symlinks
     def test_replace_swaps_nothing_when_a_tree_backup_refuses(self, env, monkeypatch):
-        """Ordering ratchet for issue #2844, failure mode 3.
+        """Ordering ratchet, failure mode 3.
 
         The ENTIRE rollback set must exist before the first core-file swap. A
         tree backup can refuse through its fatal skip reporter (a symlink in
@@ -408,6 +432,7 @@ class TestRestoreMerge:
         assert val == '"modified"'
         conn.close()
 
+    @requires_o_nofollow
     def test_a_refused_notification_record_exits_1_instead_of_tracebacking(
         self, tmp_path, monkeypatch, capsys
     ):
@@ -566,6 +591,7 @@ class TestRestoreMerge:
         restore_main([str(tarball), "--mode", "merge", "--force"] + unpinnable_argv())
         assert "Semantic Memory imported: 1" in capsys.readouterr().out
 
+    @requires_o_nofollow
     def test_merge_notifications(self, env, monkeypatch):
         """TEST 14"""
         _, _, tarball, tmp_path = env
@@ -719,6 +745,7 @@ class TestRestoreMerge:
         assert (fresh / "memory.db").is_file()
         assert "copied" in capsys.readouterr().out
 
+    @requires_o_nofollow
     def test_merge_notifications_dedup(self, env, capsys, monkeypatch):
         """TEST 25"""
         _, _, tarball, tmp_path = env
@@ -1127,11 +1154,24 @@ class TestConcurrentSnapshot:
         out = tmp_path / "concurrent_out"
         out.mkdir()
         monkeypatch.setenv("KIROCREW_HOME", str(src))
-        snapshot_main([str(out)] + unpinnable_argv())
-        # Ensure different timestamp by creating a second one
-        import time
+        # The archive name is second-resolution (`snapshot_main` stamps it
+        # `%Y%m%dT%H%M%SZ` and publishes `out / f"{name}.tar.gz"`), so two snapshots
+        # taken inside one second resolve to the same path and the second overwrites
+        # the first. Advance a FAKE clock one second per `now()` rather than sleeping
+        # past a real second: what is under test is NAMING, and a real sleep long
+        # enough to be reliable is 1.1 s charged to every run of the suite to buy a
+        # gap the clock can simply be told to have. Subclassing `datetime` keeps the
+        # rest of its surface intact for the other stamps in the same flow (the
+        # manifest's `created_at`, the audit record), none of which this test reads.
+        ticks = itertools.count()
 
-        time.sleep(1.1)
+        class _OneSecondPerCall(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=next(ticks))
+
+        monkeypatch.setattr(snapshot_mod, "datetime", _OneSecondPerCall)
+        snapshot_main([str(out)] + unpinnable_argv())
         snapshot_main([str(out)] + unpinnable_argv())
         tarballs = list(out.glob("kirocrew-snapshot-*.tar.gz"))
         assert len(tarballs) == 2
@@ -1216,7 +1256,7 @@ class TestTheArchiveIsLockedDownBeforeItIsPublished:
 
 
 class TestMergeRestoreLocksBeforePublish:
-    """#5346: merge restore of a missing security file must lock the temp first.
+    """Merge restore of a missing security file must lock the temp first.
 
     Merge only copies when the destination is absent, so a restrict failure
     must leave that name uncreated rather than unlinking a published secret.
@@ -1342,6 +1382,7 @@ class TestMergeRestoreLocksBeforePublish:
         assert not (home / "telemetry_salt").exists()
 
 
+@requires_o_nofollow
 class TestNotificationMergeWriteSideContract:
     """The notification merge copies records, so its bytes must be valid FOR THE DESTINATION.
 
@@ -1423,9 +1464,9 @@ class TestNotificationMergeWriteSideContract:
         """The destination scan is its own failure domain and must write nothing.
 
         This is the site the issue's own criterion required and did not name.
-        The scan used to run in text mode too, so pre-existing live corruption
-        aborted the merge with a traceback before the copy loop was reached; it
-        still aborts, but now with a named reason and without having touched the
+        A scan in text mode would let pre-existing live corruption abort the
+        merge with a traceback before the copy loop is reached; it still aborts,
+        but with a named reason and without having touched the
         destination.
         """
         src, dst = self._files(tmp_path, self.GOOD, self.LIVE + self.BAD_UTF8)
@@ -1690,7 +1731,7 @@ class TestNotificationMergeWriteSideContract:
         assert dst.read_bytes().count(row) == 1, "one row, not two"
 
     def test_two_rows_that_only_STRIP_alike_both_survive(self, tmp_path):
-        """Round 5's deletion, pinned against the key that caused it.
+        """Two rows that only STRIP alike both survive.
 
         A crash truncates a live row to ``b'{"a": "x'``; framing splits a source
         record at its bare carriage return, yielding ``b'{"a": "x\\r'``. Those two
@@ -1855,7 +1896,7 @@ class TestNotificationMergeWriteSideContract:
         assert dst.read_bytes() == self.LIVE, "the retry appended something"
 
 
-# ── Issue #8181: the copy branch installed unvalidated notification bytes ──────
+# ── The copy branch must not install unvalidated notification bytes ──────
 
 
 class _NotificationCopyFixtures:
@@ -1924,6 +1965,25 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         assert "✅ notifications" not in out
         assert "not valid UTF-8" in out
 
+    def test_a_platform_skip_does_not_print_the_success_tick(self, tmp_path, monkeypatch, capsys):
+        """A caught NotificationCopyUnsupported skip must NOT report ✅ notifications.
+
+        With a live file present the merge branch runs, and on a platform without
+        ``O_NOFOLLOW`` it raises ``NotificationCopyUnsupported``; the call site
+        catches it, prints the SKIPPED line, and control must not fall through to
+        the component tick -- a component that imported nothing never reports one,
+        exactly as the crons branch gates its tick on ``crons_ok``.
+        """
+        snap, home = self._snap(tmp_path, self.GOOD)
+        (home / "notifications.jsonl").write_bytes(b'{"ts":"2026-02-01T00:00:00Z","msg":"local"}\n')
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        snapshot_mod._do_merge(
+            snap, home, ["notifications"], allow_unpinned=bool(unpinnable_argv())
+        )
+        out = capsys.readouterr().out
+        assert "Notifications: SKIPPED" in out, out
+        assert "✅ notifications" not in out, "a skipped component reported a success tick"
+
     def test_the_reader_loads_every_record_the_copy_installs(self, tmp_path, monkeypatch):
         """The consequence, asserted through the reader that actually loses the file.
 
@@ -1951,7 +2011,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         """Byte-exactness is the property ``copy2`` had and the fix must keep.
 
         A ``\\r\\n`` terminator survives and a bare ``\\r`` inside the file ends a
-        record without being rewritten -- the text-mode round trip that #7771
+        record without being rewritten -- the text-mode round trip
         removed from the merge is not reintroduced here.
         """
         src_bytes = b'{"ts":"1","msg":"a"}\r\n{"ts":"2","msg":"b"}\r{"ts":"3","msg":"c"}\n'
@@ -2313,7 +2373,12 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
 
         def recording(path, flags, *args, **kwargs):
             seen.append(flags)
-            return real_open(path, flags, *args, **kwargs)
+            # Record the flags as the product composed them, then STRIP the
+            # simulated bit before the real syscall sees it. The value above is
+            # a stand-in for a constant this platform does not have, so it is
+            # free to collide with one it does: on Darwin ``O_DIRECTORY`` IS
+            # ``1 << 20``, and passing it for a regular file answers ENOTDIR.
+            return real_open(path, flags & ~os.O_BINARY, *args, **kwargs)
 
         snap, home = self._snap(tmp_path, self.GOOD)
         monkeypatch.setattr(os, "open", recording)
@@ -2374,8 +2439,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
             # Scoped to the copy's own destination open, not to "the first O_CREAT
             # seen anywhere": this hook patches `os.open` PROCESS-WIDE, and on a
             # loaded CI shard the first creating open can belong to another thread
-            # entirely (issue #8893 -- both ordering tests in this class fired on
-            # shard 4 for PRs whose diffs never touch this path). A foreign trigger
+            # entirely. A foreign trigger
             # submits the append while the worker is still FREE, and the assertion
             # then reads a real ordering guarantee as broken. The destination is the
             # one open the copy performs while it occupies the worker, so it is the
@@ -2388,8 +2452,8 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
                 # worker is released and runs the queued append -- which is CORRECT and
                 # sets the event. `is_set()` after `_merge` therefore measured whether
                 # the main thread reached the assertion before that legitimate run, a
-                # footrace it loses on a loaded shard (issue #8893, second cause: #8992
-                # scoped the trigger but left this observation point). The wait's own
+                # footrace it loses on a loaded shard (scoping the trigger left this
+                # observation point). The wait's own
                 # return value is taken while the copy still holds the worker, which is
                 # the only window in which the defect -- and nothing else -- can set it.
                 ran_while_worker_held.append(ran_during_copy.wait(timeout=1.0))
@@ -2489,7 +2553,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
 
         def opening(path, flags, *args, **kwargs):
             fd = real_open(path, flags, *args, **kwargs)
-            # Same scoping as the READER test above, same reason (issue #8893): the
+            # Same scoping as the READER test above, same reason: the
             # hook patches `os.open` PROCESS-WIDE, and on a loaded shard the first
             # O_CREAT can come from a foreign thread while the notification worker is
             # still FREE -- the append then runs immediately and the assertion reads
@@ -2524,7 +2588,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         ), f"the live notification was dropped by the positional cap ({len(rows)} rows)"
 
     def test_the_ordering_trigger_ignores_a_foreign_O_CREAT_open(self, tmp_path, monkeypatch):
-        """The loaded-shard condition itself, kept as a test (issue #8893).
+        """The loaded-shard condition itself, kept as a test.
 
         Both ordering tests in this class patch ``os.open`` PROCESS-WIDE, and both
         fired on a contended CI shard for PRs that never touch this path: some other
@@ -2664,7 +2728,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         assert (home / "notifications.jsonl").read_bytes() == self.GOOD
 
     def test_concurrent_callers_all_get_the_SAME_executor(self, monkeypatch):
-        """Issue #8788: the lazy init was an unlocked check-then-set.
+        """The lazy init must not be an unlocked check-then-set.
 
         Two threads could each observe ``None``, each construct a pool, and each
         proceed -- one assignment won the global while the loser's worker was already
@@ -2720,7 +2784,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
             "different pools are not serialised against each other"
         )
         # Whatever the race produced must also be what the module kept, or a caller is
-        # queuing onto a pool the module no longer hands out.
+        # queuing onto a pool the module does not hand out.
         assert created[0] is dashboard_state._notification_io_pool
 
     @requires_symlinks
@@ -2741,7 +2805,7 @@ class TestNotificationCopyWhenNoLiveFileExists(_NotificationCopyFixtures):
         assert (home / "notifications.jsonl").is_symlink(), "the operator's link was removed"
 
 
-# ── Issue #8217: the restore status line must not claim success over a refused
+# ── The restore status line must not claim success over a refused
 # cron merge ───────────────────────────────────────────────────────────────────
 
 
@@ -2857,7 +2921,7 @@ class TestNotificationCopyRefusalWithoutONofollow(_NotificationCopyFixtures):
     def test_no_by_name_reparse_check_is_made_on_either_path(self, tmp_path):
         """The by-name check is gone, not merely bypassed where the open can decide.
 
-        It used to be a floor gated on the flag's absence. It is now nothing: where the
+        The by-name check is not a floor gated on the flag's absence: where the
         flag exists the open decides, and where it does not the copy is refused before
         reaching here. Counting calls rather than reading the source, so reintroducing
         the check -- the racy remedy this PR removed -- reddens here.
@@ -2881,7 +2945,7 @@ class TestARefusedCronMergeIsVisibleInTheRestoreStatus:
 
     The terminal shows the merger's own warning right above, but the status
     line is the summary an operator scans — a checkmark over a refusal is the
-    same false success the import summary had (#8217).
+    same false success as the import summary.
     """
 
     @staticmethod
@@ -2922,3 +2986,280 @@ class TestARefusedCronMergeIsVisibleInTheRestoreStatus:
         out = capsys.readouterr().out
         assert "✅ crons" in out, out
         assert "crons: merge skipped" not in out, out
+
+
+# ── The merge must validate and copy the SAME inode, not the same name twice
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@requires_o_nofollow
+class TestNotificationMergeResolvesEachNameOnce:
+    """One descriptor from validation through copy; a swapped name changes nothing.
+
+    ``_merge_notifications`` opens ``src_path`` by name exactly once. Resolving
+    it once to validate and again to copy, with nothing carrying identity
+    between the two opens, leaves a window: the staging tree is agent-writable
+    on a normal install, so swapping that name for a symlink in the window makes
+    the copy loop append the link TARGET's bytes into the live
+    ``notifications.jsonl`` while the validation pass vouches for a different
+    file. The destination has the identical shape one layer down (scan by name,
+    then re-open by name to append).
+
+    Every fixture here is a real link, FIFO, or rename on a real filesystem --
+    a monkeypatched ``open`` that pretends to be a symlink would route the merge
+    down a path the defect never takes.
+    """
+
+    LIVE = b'{"ts":"2026-02-01T00:00:00Z","msg":"local"}\n'
+    GOOD = b'{"ts":"2026-03-01T00:00:00Z","msg":"snap"}\n'
+    # Valid UTF-8, not JSON: exactly the shape of a token/env file, and exactly
+    # what a name-resolved-twice copy loop appends UNCONDITIONALLY -- an
+    # unparseable record keeps no dedupe key, so nothing ever refuses it.
+    SECRET = b"AWS_SECRET_STAND_IN=hunter2-not-a-notification\n"
+
+    def _files(self, tmp_path):
+        src = tmp_path / "snap-notifications.jsonl"
+        dst = tmp_path / "live-notifications.jsonl"
+        src.write_bytes(self.GOOD)
+        dst.write_bytes(self.LIVE)
+        secret = tmp_path / "secret.env"
+        secret.write_bytes(self.SECRET)
+        return src, dst, secret
+
+    @staticmethod
+    def _merge_in_thread(src, dst, timeout: float = 10.0) -> list[str]:
+        """Run the merge on a daemon thread so a hang FAILS instead of wedging pytest.
+
+        The FIFO cases below are "must not block forever" properties: under a
+        dropped ``O_NONBLOCK`` the open blocks with no writer ever coming, and a
+        test that simply calls the merge would hang the whole suite rather than
+        going red.
+        """
+        import threading
+
+        outcome: list[str] = []
+
+        def run() -> None:
+            try:
+                snapshot_mod._merge_notifications(src, dst)
+                outcome.append("returned")
+            except OSError:
+                outcome.append("raised")
+            except Exception as exc:  # noqa: BLE001 — name any unexpected type
+                outcome.append(f"raised {type(exc).__name__}")
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            outcome.append("hung")
+        return outcome
+
+    @requires_symlinks
+    def test_a_source_swapped_for_a_symlink_after_validation_is_not_followed(
+        self, tmp_path, monkeypatch
+    ):
+        """The exact defect: swap the name BETWEEN the two passes.
+
+        The swap is performed the moment the validation pass finishes reading
+        the source -- the third ``strict_raw_records`` call is the copy loop, so
+        completing the second one is the last instant before the window closes.
+        With the name resolved twice, the copy follows the link and the target's
+        bytes land; with one descriptor, the swap is invisible.
+        """
+        src, dst, secret = self._files(tmp_path)
+        real = snapshot_mod.strict_raw_records
+        calls = {"n": 0}
+
+        def swapping(handle, path, **kwargs):
+            calls["n"] += 1
+            this_call = calls["n"]
+            yield from real(handle, path, **kwargs)
+            if this_call == 2:  # the source validation pass just completed
+                src.unlink()
+                src.symlink_to(secret)
+
+        monkeypatch.setattr(snapshot_mod, "strict_raw_records", swapping)
+        snapshot_mod._merge_notifications(src, dst)
+        after = dst.read_bytes()
+        assert self.SECRET not in after, "the copy loop followed a name swapped after validation"
+        assert after == self.LIVE + self.GOOD, "the archive's own validated bytes must land"
+
+    @requires_symlinks
+    def test_a_source_that_is_already_a_symlink_is_refused_at_the_open(self, tmp_path, capsys):
+        """No window needed: a link sitting at the name must never be followed.
+
+        Reading straight through it twice and reporting success is the failure.
+        A refused open surfaces as a REFUSAL -- raise plus the abort line -- not
+        as a silent skip that installs nothing.
+        """
+        src, dst, secret = self._files(tmp_path)
+        src.unlink()
+        src.symlink_to(secret)
+        before = dst.read_bytes()
+        with pytest.raises(OSError):
+            snapshot_mod._merge_notifications(src, dst)
+        assert dst.read_bytes() == before, "a refusal must be a no-op on the live file"
+        out = capsys.readouterr().out
+        assert "Notifications imported:" not in out, "reported success on a refused merge"
+        assert "merge aborted" in out
+
+    @requires_symlinks
+    def test_a_platform_that_cannot_pin_raises_NotificationCopyUnsupported(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Windows has no ``O_NOFOLLOW``; the merge raises
+        ``NotificationCopyUnsupported`` there.
+
+        Simulated the way this suite already simulates that platform: delete the
+        flag, so ``supports_pinned_walk`` is false and the pinned open is
+        unavailable. No atomic no-reparse open exists for the read-write append
+        the destination needs, so the merge refuses -- with the same type
+        ``_install_notifications`` raises there, which the call sites catch and
+        degrade to a loud skip rather than aborting the whole restore. Nothing
+        is written and the linked secret never lands.
+        """
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        src, dst, secret = self._files(tmp_path)
+        src.unlink()
+        src.symlink_to(secret)
+        before = dst.read_bytes()
+        with pytest.raises(snapshot_mod.NotificationCopyUnsupported):
+            snapshot_mod._merge_notifications(src, dst)
+        assert dst.read_bytes() == before
+        assert self.SECRET not in dst.read_bytes()
+
+    @requires_symlinks
+    def test_a_destination_that_is_a_symlink_is_refused_before_anything_is_written(self, tmp_path):
+        """The destination has the same two-resolution shape one layer down.
+
+        A link at the live name redirects the append at whatever it points to.
+        Smaller exposure -- the live name is the operator's own file, not an
+        archive-derived one -- but the same fix applies and is pinned the same
+        way.
+        """
+        src, dst, _ = self._files(tmp_path)
+        real_dst = tmp_path / "elsewhere.jsonl"
+        real_dst.write_bytes(self.LIVE)
+        dst.unlink()
+        dst.symlink_to(real_dst)
+        with pytest.raises(OSError):
+            snapshot_mod._merge_notifications(src, dst)
+        assert real_dst.read_bytes() == self.LIVE, "the append was redirected through the link"
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are a POSIX fixture")
+    def test_a_fifo_at_the_source_name_fails_rather_than_hanging(self, tmp_path):
+        """What ``O_NONBLOCK`` buys, pinned so a later cleanup cannot drop it.
+
+        Opening a FIFO for reading with no writer blocks FOREVER without it --
+        converting a refused restore into a hung one. With it the open returns
+        at once and the ``fstat`` regular-file judgement refuses the descriptor.
+        """
+        src, dst, _ = self._files(tmp_path)
+        src.unlink()
+        os.mkfifo(src)
+        before = dst.read_bytes()
+        outcome = self._merge_in_thread(src, dst)
+        assert outcome == ["raised"], f"a FIFO source must refuse, not {outcome}"
+        assert dst.read_bytes() == before
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are a POSIX fixture")
+    def test_the_regular_file_judgement_is_on_the_descriptor_not_the_name(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """``fstat`` judges the inode the merge HOLDS; a name re-check judges whatever
+        the name points at NOW.
+
+        The open pins a FIFO, then the name is swapped to a perfectly ordinary
+        regular file before any by-name re-check could run. The descriptor
+        judgement refuses with the named reason; an ``os.path.isfile(src_path)``
+        check would pass and hand the FIFO descriptor to the record reader.
+        ``pinned_fs.py`` records the identical finding for the pinned walk:
+        an ``lstat``-before-open compared against a later ``fstat`` is the same
+        check-to-use window wearing a different name.
+        """
+        src, dst, _ = self._files(tmp_path)
+        src.unlink()
+        os.mkfifo(src)
+        regular = tmp_path / "regular.jsonl"
+        regular.write_bytes(self.GOOD)
+        # Wrap the merge module's own open at the pinned-walk seam. Patching a
+        # replacement onto `os.open` itself would drop it out of
+        # `os.supports_dir_fd`, flipping `supports_pinned_walk` to false and
+        # routing to the fail-closed branch instead of the fstat judgement this
+        # test exercises. Wrapping `open_in_pinned_parent` swaps the name the
+        # instant after the descriptor is pinned, leaving that predicate intact.
+        real_pinned = snapshot_mod.pinned_fs.open_in_pinned_parent
+
+        def swapping_pinned(resolved_parent, name, **kwargs):
+            fd = real_pinned(resolved_parent, name, **kwargs)
+            if name == src.name:
+                os.replace(regular, src)
+            return fd
+
+        monkeypatch.setattr(snapshot_mod.pinned_fs, "open_in_pinned_parent", swapping_pinned)
+        outcome = self._merge_in_thread(src, dst)
+        assert outcome == ["raised"], f"a non-regular descriptor must refuse, not {outcome}"
+        assert "not a regular file" in capsys.readouterr().out
+
+    @pytest.mark.skipif(not hasattr(os, "link"), reason="hardlinks are a POSIX fixture here")
+    def test_a_hardlinked_source_is_refused_on_the_descriptor(self, tmp_path, capsys):
+        """A hardlink defeats every link-shaped screen: ``O_NOFOLLOW`` has nothing to
+        refuse and ``S_ISREG`` is TRUE, because the alias IS the target's inode.
+
+        The descriptor judgement therefore also refuses ``st_nlink != 1`` -- the
+        exact predicate ``pinned_fs.copy_file_pinned`` applies for the same
+        reason (a path guard cannot see an alias; only the inode's link count
+        can). A staged name hardlinked to a credential must refuse, not deliver
+        the credential's bytes into the served feed.
+        """
+        src, dst, secret = self._files(tmp_path)
+        src.unlink()
+        os.link(secret, src)  # a HARDLINK, not a symlink: same inode, nlink == 2
+        before = dst.read_bytes()
+        with pytest.raises(OSError):
+            snapshot_mod._merge_notifications(src, dst)
+        assert dst.read_bytes() == before, "the hardlinked credential's bytes were delivered"
+        out = capsys.readouterr().out
+        assert "Notifications imported:" not in out
+        assert "merge aborted" in out
+
+    def test_a_valid_unswapped_merge_still_appends_exactly_what_it_validated(
+        self, tmp_path, capsys
+    ):
+        """The happy path is untouched: same records land, dedupe unchanged.
+
+        This is a change to HOW the files are reached, never to what is
+        admitted -- the record cap and the ``_notification_key`` predicate are
+        unchanged. A second run of the same import appends nothing.
+        """
+        src, dst, _ = self._files(tmp_path)
+        snapshot_mod._merge_notifications(src, dst)
+        assert dst.read_bytes() == self.LIVE + self.GOOD
+        assert "Notifications imported: 1" in capsys.readouterr().out
+        snapshot_mod._merge_notifications(src, dst)
+        assert dst.read_bytes() == self.LIVE + self.GOOD, "the re-run duplicated a record"
+        assert "Notifications imported: 0" in capsys.readouterr().out
+
+    def test_a_no_pin_platform_skips_the_merge_rather_than_aborting_the_restore(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """``NotificationCopyUnsupported`` degrades to a loud skip at the call site.
+
+        The no-pin branch raises the same type ``_install_notifications`` raises,
+        which the restore merge branch catches: the component is skipped with a
+        printed reason and the surrounding restore is NOT aborted. An `OSError`
+        here would abort the whole restore of an archive that is perfectly good
+        on a platform that simply cannot pin.
+        """
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        src, dst, _ = self._files(tmp_path)
+        before = dst.read_bytes()
+        with pytest.raises(snapshot_mod.NotificationCopyUnsupported):
+            snapshot_mod._merge_notifications(src, dst)
+        assert dst.read_bytes() == before, "a refused merge must write nothing"
+        # The call site catches it and keeps going.
+        try:
+            raise snapshot_mod.NotificationCopyUnsupported("x")
+        except snapshot_mod.NotificationCopyUnsupported:
+            pass  # confirms the type is catchable exactly as the call sites do

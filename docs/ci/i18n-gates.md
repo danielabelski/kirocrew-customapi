@@ -5,7 +5,8 @@ what can fail a PR, what only reports, and the rule that governs relaxing a
 ratchet. The authoring rules (how to add a catalog key, the `src/i18n/format.ts`
 seam, the glossary) live in the frontend docs under `website/`.
 
-Run the whole chain locally before pushing:
+Run the static and catalog chain locally before pushing (the Vitest-only guards
+and browser render gate run separately, as shown below):
 
 ```bash
 cd website && npm run i18n:check
@@ -17,7 +18,7 @@ cd website && npm run i18n:check
 |---|---|---|
 | `frontend-lint` | Check i18n extraction, key references and plurals | `npm run i18n:check` (the runner below) |
 | `frontend-test` | Unit tests | `npx vitest run --coverage`, which includes the diff-scoped `localeFormatting.test.ts` gates and the catalog duplicate-key guard `duplicateKeys.test.ts` (see below) |
-| `e2e` | i18n render-time gate | `npm run i18n:render` (`scripts/check-i18n-render.mjs --build`) |
+| `e2e` | Run E2E and dedicated memory UI evidence in parallel | `python scripts/ci_e2e_parallel.py`; its `i18n` lane runs `npm --prefix website run i18n:render` (`scripts/check-i18n-render.mjs --build`) |
 
 The render gate lives in the `e2e` job to reuse the Chromium install that job
 already pays for. It needs no gateway, no token and no backend: it serves the
@@ -239,6 +240,28 @@ the same change. Being exact, they break on unrelated drift in main, so expect t
 re-measure when you rebase. If you add a diff-scoped gate covering one of them, it
 may be relaxed.
 
+### The rule covers an inline ceiling too, not just the generated ledger
+
+A `toBeLessThanOrEqual(N)` written straight into a style test is the same shape as a
+ledger entry and is bound by the same rule: it needs a diff-scoped companion over the
+same defect. Without one it is strictly worse than the ledger, because nothing
+re-snapshots it, so the violations pile up silently until the count crosses — and the
+run that finally reds is some unrelated branch's, whose own diff contains nothing to
+fix.
+
+`bnStyle.test.ts`'s numerals ceiling was exactly that, and it collected the bill:
+two values carrying Bengali digits landed in separate PRs, the second crossed the
+ceiling of 8, and the next CI round took **every open pull request's Frontend Tests
+shard red at once**, naming a key none of their authors had touched. The register
+check (§5) in the same file already had the right shape, so the fix was to give the
+numerals rule the same one: the count keeps guarding the inherited catalog, while the
+values the branch itself wrote are held at zero and the failure names the key and its
+owner.
+
+So when you add or relax an inline ceiling, add the `[changed-values]` half in the
+same change. A ceiling with no diff-scoped companion is not a lenient gate, it is a
+gate that bills a stranger.
+
 ## The render-time gate: what a source scan structurally cannot see
 
 Every check above reads **source** (an ESLint pass over `src`) or **catalog JSON**.
@@ -257,7 +280,18 @@ on: every catalog value is wrapped in `[` … `]`, and every ASCII letter outsid
 preserved region is accented. So inside one inline run, a `]…[` seam **is** a
 surviving concatenation, and plain Latin **is** text that never reached a catalog.
 
-Five things to know before touching it:
+An explicit `group`, `tablist`, `radiogroup` or `toolbar` ends its parent's inline
+run. Its contents are still scanned independently, including hardcoded labels,
+attributes and multiple catalog units inside one control. Ungrouped inline-flex
+content does not receive this boundary. Use these roles for actual control groups;
+they do not exempt text from translation checks.
+
+Locale-formatted machine timestamps may use a semantic `<time dateTime="...">`
+with `data-i18n-opaque` around only the formatted value. Keep surrounding labels
+in the catalog and keep active-locale formatting. Memory record fixture keys,
+like other visible fixture values, use digit-shaped identifiers.
+
+Seven things to know before touching it:
 
 1. **It builds its own bundle with `NODE_ENV=development`.** `en-XA` is DEV-only in
    three independent places, all keyed on `import.meta.env.DEV`. `vite build --mode
@@ -290,6 +324,20 @@ Five things to know before touching it:
    placeholder would render the surface while hiding the defect it exists to show.
    Read those numbers as a fixed structural probe, not as the size of the debt,
    because the scanner counts per word.
+6. **Fetched content must be ready before it is measured.** The App Details
+   surface waits for its fixture description to mount before its existing settle
+   interval. The shell alone exceeds the generic text-volume check while the
+   manifest requests are pending; comparing that loading state with the populated
+   body would report different findings for identical code. A missing readiness
+   marker fails the run instead of silently measuring less content.
+7. **A new query-param panel has no old panel to measure.** A surface may declare
+   its required `sourceFile`, relative to `website/`. If both the source file and
+   the surface registration are absent from the exported base, the base sweep
+   omits that panel and its findings are compared against zero. HEAD still renders
+   it and must satisfy `readyText`; a missing declared HEAD source fails the run.
+   Newly registered panels whose implementation already existed remain measured
+   on the base. This prevents waiting for member-memory content on an older
+   overview page that keeps the query URL but cannot render that panel.
 
 Known limits of the render gate, named rather than papered over:
 

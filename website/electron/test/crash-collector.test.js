@@ -14,6 +14,7 @@ const {
   parseIpsHead,
   ipsBelongsToApp,
   isOwnModule,
+  isElectronShaped,
   appendCrashLog,
   readSeenState,
   writeSeenState,
@@ -23,9 +24,14 @@ const {
   MAX_CRASH_LOG_LINES,
 } = require("../crash-collector");
 
-const LOGS = path.join("logs") + path.sep;
-const DUMPS = path.join("dumps");
-const REPORTS = path.join("reports");
+// `path.normalize` here, not a bare literal: every file key below is built
+// with `path.join`, which on Windows collapses `/reports` to `\reports` — a
+// raw `"/reports"` passed straight to `collectCrashReports` as
+// `diagnosticReportsDir` then mismatches the backslash-prefixed keys in
+// `fakeFs.readdirSync`'s prefix match and reads back empty.
+const LOGS = path.normalize("/logs");
+const DUMPS = path.normalize("/dumps");
+const REPORTS = path.normalize("/reports");
 // The name the packaged bundle, its executable, and therefore every crash
 // artifact on disk actually carry: electron-builder derives all three from
 // `build.productName`, which is the joined form. The collector is handed the
@@ -135,6 +141,7 @@ function fakeFs(initial = {}) {
   const api = {
     files,
     writes: [],
+    unlinked: [],
     readdirSync(dir) {
       const prefix = dir.endsWith(path.sep) ? dir : dir + path.sep;
       const names = [];
@@ -169,6 +176,11 @@ function fakeFs(initial = {}) {
       if (!buf) throw new Error(`ENOENT: ${from}`);
       files.delete(from);
       files.set(to, buf);
+    },
+    unlinkSync(p) {
+      if (!files.has(p)) throw new Error(`ENOENT: ${p}`);
+      files.delete(p);
+      api.unlinked.push(p);
     },
     openSync(p) {
       const buf = files.get(p);
@@ -792,6 +804,98 @@ describe("collectCrashReports — filtering", () => {
     assert.match(messages.join("\n"), /not-a-crash/);
   });
 
+  it("deletes a proven-foreign dump so the inherited-handler leak stops growing", () => {
+    // Crashpad never prunes `pending/` when uploads are off, and every dump a
+    // child wrote through our inherited handler stays there forever. Proof of
+    // foreignness is what licenses the delete, the same proof that licenses
+    // the acknowledgement.
+    const ruby = path.join(PENDING, "r1.dmp");
+    const rubyCrash = path.join(PENDING, "r2.dmp");
+    const ownSnapshot = path.join(PENDING, "self-snapshot.dmp");
+    const fs = fakeFs({
+      [ruby]: buildMinidump({ moduleName: "/usr/bin/ruby", exceptionCode: 0 }),
+      [rubyCrash]: buildMinidump({ moduleName: "/usr/bin/ruby", exceptionCode: 0x8000000b }),
+      [ownSnapshot]: buildMinidump({ exceptionCode: 0 }),
+    });
+    const scan = collectCrashReports(withBaseline(fs));
+    assert.equal(scan.removed, 3);
+    assert.deepEqual(fs.unlinked.sort(), [ruby, rubyCrash, ownSnapshot].sort());
+    assert.equal(fs.files.has(ruby), false);
+    // Still acknowledged, so a later scan does not look for the vanished file.
+    const state = JSON.parse(fs.readFileSync(STATE));
+    assert.ok(state.seen.includes("minidump:r1.dmp"));
+  });
+
+  it("never deletes our own crash, an unreadable dump, or a pending one", () => {
+    const own = path.join(PENDING, "own.dmp");
+    const torn = path.join(PENDING, "torn.dmp");
+    const fs = fakeFs({
+      [own]: buildMinidump(),
+      [torn]: buildMinidump().subarray(0, 40),
+    });
+    const scan = collectCrashReports(withBaseline(fs));
+    assert.equal(scan.newCrashes.length, 1);
+    assert.equal(scan.removed, 0);
+    assert.deepEqual(fs.unlinked, []);
+    assert.equal(fs.files.has(own), true);
+    assert.equal(fs.files.has(torn), true);
+  });
+
+  it("keeps the acknowledgement when a foreign dump cannot be removed", () => {
+    const ruby = path.join(PENDING, "r1.dmp");
+    const fs = fakeFs({ [ruby]: buildMinidump({ moduleName: "/usr/bin/ruby" }) });
+    fs.unlinkSync = () => { throw new Error("EROFS"); };
+    const messages = [];
+    const scan = collectCrashReports(withBaseline(fs, { log: (m) => messages.push(m) }));
+    assert.equal(scan.removed, 0);
+    assert.match(messages.join("\n"), /could not remove foreign r1\.dmp/);
+    const state = JSON.parse(fs.readFileSync(STATE));
+    assert.ok(state.seen.includes("minidump:r1.dmp"));
+    assert.equal(fs.files.has(ruby), true);
+  });
+
+  it("keeps, but acknowledges, another Electron build's crash in the shared database", () => {
+    // `crashDumps` is `<userData>/Crashpad`, keyed on `app.getName()`, so a dev
+    // `npm start` of this same app writes into the installed build's database
+    // with main module `Electron`. That is a REAL crash belonging to the other
+    // build; not ours to report, and not ours to destroy. Children that
+    // inherited our handler (ruby here) are still removed in the same scan.
+    const devElectron = path.join(PENDING, "dev.dmp");
+    const devHelper = path.join(PENDING, "helper.dmp");
+    const ruby = path.join(PENDING, "r1.dmp");
+    const fs = fakeFs({
+      [devElectron]: buildMinidump({
+        moduleName: "/repo/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron",
+        exceptionCode: 0x8000000b,
+      }),
+      [devHelper]: buildMinidump({
+        moduleName: "/repo/node_modules/electron/dist/Electron Helper (Renderer)",
+        exceptionCode: 0x8000000b,
+      }),
+      [ruby]: buildMinidump({ moduleName: "/usr/bin/ruby", exceptionCode: 0x8000000b }),
+    });
+    const scan = collectCrashReports(withBaseline(fs));
+    assert.deepEqual(scan.newCrashes, []);
+    assert.equal(scan.removed, 1);
+    assert.deepEqual(fs.unlinked, [ruby]);
+    assert.equal(fs.files.has(devElectron), true);
+    assert.equal(fs.files.has(devHelper), true);
+    // Acknowledged all the same: the other build's collector owns the report.
+    const state = JSON.parse(fs.readFileSync(STATE));
+    assert.ok(state.seen.includes("minidump:dev.dmp"));
+    assert.ok(state.seen.includes("minidump:helper.dmp"));
+  });
+
+  it("isElectronShaped keeps electron runtimes and nothing else", () => {
+    assert.equal(isElectronShaped("/x/Electron"), true);
+    assert.equal(isElectronShaped("C:\\x\\electron.exe"), true);
+    assert.equal(isElectronShaped("/x/Electron Helper (GPU)"), true);
+    assert.equal(isElectronShaped("/usr/bin/ruby"), false);
+    assert.equal(isElectronShaped("/x/chrome-headless-shell"), false);
+    assert.equal(isElectronShaped("/x/electron-updater-thing"), false);
+    assert.equal(isElectronShaped(""), false);
+  });
+
   it("never re-reads a rejected dump on the next launch", () => {
     const fs = fakeFs({ [path.join(PENDING, "r1.dmp")]: buildMinidump({ moduleName: "/usr/bin/ruby" }) });
     collectCrashReports(withBaseline(fs));
@@ -1165,4 +1269,105 @@ describe("crashNoticeSummary", () => {
   it("is safe on a scan that never ran", () => {
     assert.deepEqual(crashNoticeSummary(null), { newCount: 0 });
   });
+});
+
+// ---------------------------------------------------------------------------
+// The facade's surface. main.js and ipc-registrar.js destructure it at load,
+// so every name must be there, in this order, with no Electron at load time.
+// ---------------------------------------------------------------------------
+
+const nodeFs = require("node:fs");
+
+const CRASH_COLLECTOR_EXPORTS = [
+  "armCrashCollector",
+  "collectCrashReports",
+  "crashNoticeSummary",
+  "crashLogPath",
+  "crashStatePath",
+  "parseMinidump",
+  "classifyMinidump",
+  "parseIpsHead",
+  "ipsBelongsToApp",
+  "ipsTimestampToIso",
+  "isOwnModule",
+  "isElectronShaped",
+  "appendCrashLog",
+  "readSeenState",
+  "writeSeenState",
+  "CRASH_LOG_BASENAME",
+  "CRASH_STATE_BASENAME",
+  "MAX_CRASH_LOG_LINES",
+  "MAX_INSPECT_PER_RUN",
+  "MAX_PENDING_ATTEMPTS",
+];
+
+it("the crash collector exports its twenty names, in order, with their values", () => {
+  const collector = require("../crash-collector");
+  assert.deepStrictEqual(Object.keys(collector), CRASH_COLLECTOR_EXPORTS);
+  assert.strictEqual(collector.CRASH_LOG_BASENAME, "crashes.log");
+  assert.strictEqual(collector.CRASH_STATE_BASENAME, "crashes-seen.json");
+  assert.strictEqual(collector.MAX_CRASH_LOG_LINES, 500);
+  assert.strictEqual(collector.MAX_INSPECT_PER_RUN, 25);
+  assert.strictEqual(collector.MAX_PENDING_ATTEMPTS, 3);
+  assert.deepStrictEqual(collector.crashNoticeSummary({ newCrashes: [{}, {}] }), { newCount: 2 });
+  assert.deepStrictEqual(collector.crashNoticeSummary(null), { newCount: 0 });
+});
+
+it("the crash collector loads without Electron and touches no file at load", () => {
+  const NodeModule = require("node:module");
+  const electronDir = path.join(__dirname, "..");
+  const files = [path.join(electronDir, "crash-collector.js")];
+  const runtimeDir = path.join(electronDir, "runtime", "crash");
+  if (nodeFs.existsSync(runtimeDir)) {
+    for (const name of nodeFs.readdirSync(runtimeDir)) {
+      if (name.endsWith(".js")) files.push(path.join(runtimeDir, name));
+    }
+  }
+  const cached = new Map(files.map((file) => [file, require.cache[file]]));
+  for (const file of files) delete require.cache[file];
+  const originalLoad = NodeModule._load;
+  NodeModule._load = function load(request, ...rest) {
+    if (request === "electron" || request === "fs" || request === "node:fs") {
+      throw new Error(`${request} must not load at module scope`);
+    }
+    return originalLoad.call(this, request, ...rest);
+  };
+  try {
+    assert.deepStrictEqual(Object.keys(require("../crash-collector")), CRASH_COLLECTOR_EXPORTS);
+  } finally {
+    NodeModule._load = originalLoad;
+    for (const [file, entry] of cached) {
+      if (entry) require.cache[file] = entry;
+      else delete require.cache[file];
+    }
+  }
+});
+
+it("the facade re-exports each runtime owner's own function, not a copy", () => {
+  const collector = require("../crash-collector");
+  const runtimeDir = path.join(__dirname, "..", "runtime", "crash");
+  assert.deepStrictEqual(
+    nodeFs.readdirSync(runtimeDir).filter((name) => name.endsWith(".js")).sort(),
+    ["artifact-parsers.js", "candidates.js", "ownership.js", "persistence.js", "scan.js"],
+  );
+  const owners = {
+    ownership: ["isOwnModule", "isElectronShaped", "ipsBelongsToApp"],
+    "artifact-parsers": ["parseMinidump", "classifyMinidump", "parseIpsHead", "ipsTimestampToIso"],
+    persistence: [
+      "armCrashCollector", "crashLogPath", "crashStatePath", "appendCrashLog",
+      "readSeenState", "writeSeenState", "CRASH_LOG_BASENAME", "CRASH_STATE_BASENAME",
+      "MAX_CRASH_LOG_LINES",
+    ],
+    scan: ["collectCrashReports", "MAX_INSPECT_PER_RUN", "MAX_PENDING_ATTEMPTS"],
+  };
+  for (const [owner, names] of Object.entries(owners)) {
+    const module = require(path.join(runtimeDir, `${owner}.js`));
+    for (const name of names) {
+      assert.strictEqual(collector[name], module[name], `${name} is ${owner}.js's own`);
+    }
+  }
+  for (const owner of nodeFs.readdirSync(runtimeDir)) {
+    const source = nodeFs.readFileSync(path.join(runtimeDir, owner), "utf8");
+    assert.doesNotMatch(source, /require\(\s*["'](?:electron|fs|node:fs)["']\s*\)/, `${owner} takes fs from its caller`);
+  }
 });

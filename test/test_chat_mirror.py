@@ -16,7 +16,7 @@ from chat_test_helpers import _make_state
 # eight-channel roster so there is one place a new channel has to be added.
 from test_options_cap_contract import _all_channel_capabilities
 
-from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
+from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink, binding_token
 from kiro_crew.messaging.transport import ConfiguredChannelTarget
 
 #: Channels whose REAL capabilities refuse a proactive send, so the mirror-link
@@ -213,8 +213,8 @@ class TestMirrorLink:
     async def test_governance_narrowing_mid_delivery_fails_closed(self, tmp_path, monkeypatch):
         # Permit the initial link + the announcement, then deny once the
         # historical context-delivery loop starts. The endpoint must fail closed:
-        # return 403 and NOT persist the mirror link (regression for a denial
-        # that only broke the loop and still persisted + returned 200).
+        # return 403 and NOT persist the mirror link: a denial mid-delivery must
+        # fail closed, not persist the link and return 200.
         transport = _fake_transport("telegram")
 
         def _permits(*args, **kwargs):
@@ -453,6 +453,167 @@ class TestMirrorLink:
         link = state.sessions.set_mirror_link.call_args.args[1]
         assert link.thread_id == "T"
 
+    @pytest.mark.asyncio
+    async def test_an_allow_listed_telegram_dm_links(self, tmp_path, monkeypatch):
+        """The dashboard-direction repro, on the REAL transport's authorization.
+
+        The permissive ``_fake_transport`` cannot catch this: its ``may_send_to``
+        answers True for anything, while Telegram's real one tests the id against
+        a roster of BARE user ids. A pre-check that hands it the configured
+        -target spelling (``user:123``) can never match, so it refuses a
+        recipient the user explicitly allow-listed.
+        """
+        from kiro_crew.telegram.transport import TelegramTransport
+
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value=7)
+        transport = TelegramTransport(client, allowed_user_ids=[123])
+        state = _prep(tmp_path, monkeypatch)
+        state.register_channel_transport(transport)
+        state.sessions.set_mirror_link = MagicMock()
+        async with TestClient(TestServer(_make_mirror_app(state))) as http:
+            resp = await http.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "telegram", "target_id": "user:123"},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["conversation_id"] == "123"
+        link = state.sessions.set_mirror_link.call_args.args[1]
+        assert link == ChannelLink("telegram", channel_id="123", thread_id=None)
+
+    @pytest.mark.asyncio
+    async def test_a_non_allow_listed_telegram_target_is_still_refused(self, tmp_path, monkeypatch):
+        """The companion negative, on the same real transport: the fix must not
+        have widened anything. An id absent from ``allowed_user_ids`` is refused
+        by ``resolve_configured_target`` (409), and the denial is SEL-audited."""
+        from kiro_crew.telegram.transport import TelegramTransport
+
+        recorded: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_mirror.sel",
+            lambda: type("S", (), {"log_api_access": lambda self, **kw: recorded.append(kw)})(),
+        )
+        client = MagicMock()
+        client.send_message = AsyncMock(return_value=7)
+        transport = TelegramTransport(client, allowed_user_ids=[123])
+        state = _prep(tmp_path, monkeypatch)
+        state.register_channel_transport(transport)
+        state.sessions.set_mirror_link = MagicMock()
+        async with TestClient(TestServer(_make_mirror_app(state))) as http:
+            resp = await http.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "telegram", "target_id": "user:999"},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "configured_target_unavailable"
+        state.sessions.set_mirror_link.assert_not_called()
+        client.send_message.assert_not_awaited()
+        assert ("chat.mirror_target_resolve", "denied") in [
+            (kw["operation"], kw["outcome"]) for kw in recorded
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_recipient_refusal_after_resolution_is_403_and_audited(
+        self, tmp_path, monkeypatch
+    ):
+        """Moving the recipient leg after the resolve must not delete it.
+
+        A transport whose resolver still yields a conversation while its roster
+        refuses the recipient (a roster narrowed between the two, or a resolver
+        that does not itself consult it) must be refused with the same 403
+        contract, with nothing sent, nothing persisted, and the denial on the
+        SEL trail — an unaudited authz denial is a security-contract regression.
+        The audit is recorded by the shared ``_authorize_recipient`` helper in
+        ``chat_runner``, which is why the seam patched here is that module's.
+        """
+        recorded: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.sel",
+            lambda: type("S", (), {"log_api_access": lambda self, **kw: recorded.append(kw)})(),
+        )
+        state = _prep(tmp_path, monkeypatch)
+        transport = _fake_transport("telegram")
+        transport.may_send_to = lambda conversation_id, thread_id=None, principal="": False
+        state.register_channel_transport(transport)
+        state.sessions.set_mirror_link = MagicMock()
+        async with TestClient(TestServer(_make_mirror_app(state))) as http:
+            resp = await http.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "telegram", "target_id": "user:123"},
+            )
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "channel_not_permitted"
+        state.sessions.set_mirror_link.assert_not_called()
+        transport.send_message.assert_not_awaited()
+        assert ("channel.proactive_send_authorize", "denied") in [
+            (kw["operation"], kw["outcome"]) for kw in recorded
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_raising_recipient_check_fails_closed(self, tmp_path, monkeypatch):
+        """An allow-list check that errored has authorized nobody (egress boundary)."""
+
+        def _boom(conversation_id, thread_id=None, principal=""):
+            raise RuntimeError("roster unavailable")
+
+        state = _prep(tmp_path, monkeypatch)
+        transport = _fake_transport("telegram")
+        transport.may_send_to = _boom
+        state.register_channel_transport(transport)
+        state.sessions.set_mirror_link = MagicMock()
+        async with TestClient(TestServer(_make_mirror_app(state))) as http:
+            resp = await http.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "telegram", "target_id": "user:123"},
+            )
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "channel_not_permitted"
+        state.sessions.set_mirror_link.assert_not_called()
+        transport.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_recipient_check_receives_the_resolved_id_and_principal(
+        self, tmp_path, monkeypatch
+    ):
+        """The re-decision runs against the RESOLVED conversation id, with the
+        principal taken from the target spelling — the posture
+        ``handlers/messaging._deliver_channel_dm`` already established for a
+        ``user:<id>``-shaped target. That is what lets a transport whose
+        conversation id is opaque (Discord's DM channel id) reach its roster.
+        The decision is audited on the ALLOWED outcome too, like the resolver
+        audit beside it: both are authorization decisions at an egress boundary.
+        Recorded by the shared ``_authorize_recipient`` helper in ``chat_runner``,
+        hence the patched seam."""
+        recorded: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            "kiro_crew.dashboard.chat_runner.sel",
+            lambda: type("S", (), {"log_api_access": lambda self, **kw: recorded.append(kw)})(),
+        )
+        state = _prep(tmp_path, monkeypatch)
+        transport = _fake_transport("discord")
+        transport.resolve_configured_target = AsyncMock(return_value=("dm-chan-9", None))
+        calls: list[tuple[str, str | None, str]] = []
+
+        def _may_send_to(conversation_id, thread_id=None, *, principal=""):
+            calls.append((conversation_id, thread_id, principal))
+            return True
+
+        transport.may_send_to = _may_send_to
+        state.register_channel_transport(transport)
+        state.sessions.set_mirror_link = MagicMock()
+        async with TestClient(TestServer(_make_mirror_app(state))) as http:
+            resp = await http.post(
+                "/api/chat/slots/s1/mirror-link",
+                json={"channel_type": "discord", "target_id": "user:42"},
+            )
+            assert resp.status == 200
+        assert ("dm-chan-9", None, "42") in calls
+        # And no call ever saw the unresolved configured-target spelling.
+        assert all(not cid.startswith("user:") for cid, _, _ in calls)
+        assert ("channel.proactive_send_authorize", "allowed") in [
+            (kw["operation"], kw["outcome"]) for kw in recorded
+        ]
+
 
 class TestMirrorUnlink:
     @pytest.mark.asyncio
@@ -481,6 +642,157 @@ class TestMirrorUnlink:
             assert (await resp.json())["was_linked"] is False
 
     @pytest.mark.asyncio
+    async def test_a_stale_row_cannot_unlink_a_replacement_binding(self, tmp_path, monkeypatch):
+        """The menu names the binding it believes it is severing; a mismatch clears nothing.
+
+        Two tabs: one misses a slots push while its socket reconnects and still
+        shows the Discord row; the other rebinds the slot to Telegram. The first
+        tab's Unlink click must not delete the Telegram binding it never saw --
+        the answer is 409 ``mirror_changed`` and the store is untouched. The
+        same for a replacement on the SAME channel whose id shares the row's
+        redacted tail: the token is a digest of the whole binding, so a row drawn
+        from ``777001`` never names ``999777001``.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.set_mirror_link(
+            "dashboard:s1", ChannelLink(channel_type="telegram", channel_id="999777001")
+        )
+        state.sessions.clear_mirror_link = MagicMock(return_value=True)
+        stale_rows = (
+            ChannelLink(channel_type="discord", channel_id="dm-chan-9"),
+            ChannelLink(channel_type="telegram", channel_id="777001"),
+        )
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            for stale in stale_rows:
+                resp = await client.post(
+                    "/api/chat/slots/s1/mirror-unlink",
+                    json={
+                        "channel_type": stale.channel_type,
+                        "binding": binding_token(stale),
+                    },
+                )
+                assert resp.status == 409, stale
+                body = await resp.json()
+                assert body["code"] == "mirror_changed"
+                assert body["error"] == (
+                    "the session's linked channel changed; nothing was unlinked"
+                )
+        state.sessions.clear_mirror_link.assert_not_called()
+        state.push_slots_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_matching_row_unlinks_and_a_namespaced_id_still_matches(
+        self, tmp_path, monkeypatch
+    ):
+        """The compare spells the row exactly as the slots projection does.
+
+        A Discord id can arrive namespaced (``discord:<id>``) in the store while the
+        row's token was minted from the bare id; the token strips the namespace
+        the same way, so a row drawn from the current binding always passes.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.set_mirror_link(
+            "dashboard:s1", ChannelLink(channel_type="discord", channel_id="discord:dm-chan-9")
+        )
+        row_token = binding_token(
+            ChannelLink(channel_type="discord", channel_id="dm-chan-9"),
+            state.sessions.mirror_link_nonce("dashboard:s1"),
+        )
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink",
+                json={"channel_type": "Discord", "binding": row_token},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["was_linked"] is True
+        # Through the map's compare-and-clear, never a separate clear.
+        state.sessions.clear_mirror_link_if.assert_called_once()
+        state.sessions.clear_mirror_link.assert_not_called()
+        assert state.sessions.get_mirror_link("dashboard:s1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_row_from_before_an_unlink_cannot_unlink_the_same_target_relinked(
+        self, tmp_path, monkeypatch
+    ):
+        """A binding recreated to the SAME target is a new binding, not the old row.
+
+        The ABA the coordinates alone cannot see: tab A draws the Discord row and
+        its Unlink request is delayed; meanwhile tab B unlinks and reconnects the
+        very same DM. A's request arrives naming a binding that is byte-identical
+        in channel, id and thread -- and must still be refused, because the
+        binding it names is gone and the one standing was never on A's screen.
+        The token digests the binding's own persisted nonce, minted on every
+        create or target change and dropped with the binding, so unlink ->
+        reconnect the same target yields a token the old row never carried.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        target = ChannelLink(channel_type="discord", channel_id="dm-chan-9")
+        state.sessions.set_mirror_link("dashboard:s1", target)
+        old_token = binding_token(target, state.sessions.mirror_link_nonce("dashboard:s1"))
+        # Tab B: unlink, then reconnect the same target. Real clear -- the nonce
+        # has to go with the binding for the recreation to mint a new one.
+        assert state.sessions.clear_mirror_link("dashboard:s1") is True
+        state.sessions.set_mirror_link("dashboard:s1", target)
+        new_token = binding_token(target, state.sessions.mirror_link_nonce("dashboard:s1"))
+        assert new_token != old_token
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            # Tab A's delayed request: refused, the new binding untouched.
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink",
+                json={"channel_type": "discord", "binding": old_token},
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "mirror_changed"
+            assert state.sessions.get_mirror_link("dashboard:s1") == target
+            state.push_slots_update.assert_not_called()
+            # A row drawn from the new binding unlinks it.
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink",
+                json={"channel_type": "discord", "binding": new_token},
+            )
+            assert resp.status == 200
+            assert (await resp.json())["was_linked"] is True
+        assert state.sessions.get_mirror_link("dashboard:s1") is None
+
+    @pytest.mark.asyncio
+    async def test_a_body_that_names_a_row_is_judged_whole_and_no_body_clears(
+        self, tmp_path, monkeypatch
+    ):
+        state = _prep(tmp_path, monkeypatch)
+        current = ChannelLink(channel_type="telegram", channel_id="777001")
+        state.sessions.set_mirror_link("dashboard:s1", current)
+        state.sessions.clear_mirror_link = MagicMock(return_value=True)
+        current_token = binding_token(current, state.sessions.mirror_link_nonce("dashboard:s1"))
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            # The right channel with no token: the caller tried to name a row and
+            # failed, so the compare is armed with a token nothing matches --
+            # refused, never the unconditional clear.
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink", json={"channel_type": "telegram"}
+            )
+            assert resp.status == 409
+            # The right token under the wrong channel: refused too.
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink",
+                json={"channel_type": "discord", "binding": current_token},
+            )
+            assert resp.status == 409
+            state.sessions.clear_mirror_link.assert_not_called()
+            # No binding left, and a row that names one: refused, not "unlinked".
+            # The binding really goes (the route reads nothing itself; the map's
+            # compare-and-clear is what answers), so the double's clear runs.
+            state.sessions.set_mirror_link("dashboard:s1", None)
+            resp = await client.post(
+                "/api/chat/slots/s1/mirror-unlink",
+                json={"channel_type": "telegram", "binding": current_token},
+            )
+            assert resp.status == 409
+            # No body at all: the unconditional clear, for callers with no row.
+            resp = await client.post("/api/chat/slots/s1/mirror-unlink")
+            assert resp.status == 200
+        state.sessions.clear_mirror_link.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_unlink_names_the_dashboard_as_the_reason(self, tmp_path, monkeypatch):
         """The audit has to say which surface cleared the binding.
 
@@ -499,6 +811,68 @@ class TestMirrorUnlink:
         assert state.sessions.clear_mirror_link.call_args.kwargs["reason"] == (
             UNBIND_REASON_DASHBOARD_UNLINK
         )
+
+    @pytest.mark.asyncio
+    async def test_a_garbled_body_is_refused_and_clears_nothing(self, tmp_path, monkeypatch):
+        """Only an EMPTY body is "no body"; a body that is present but garbled is 400.
+
+        Reading unparseable JSON as "no body" would hand a caller that tried to
+        name a row -- and failed -- the unconditional clear, the one answer the
+        stale-row guard exists to withhold from a caller with a row in hand. So
+        malformed JSON and a JSON value that is not an object are both refused
+        with ``invalid_body`` and the binding stands; an empty body keeps the
+        unconditional clear for callers that have no row.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.set_mirror_link(
+            "dashboard:s1", ChannelLink(channel_type="telegram", channel_id="999777001")
+        )
+        headers = {"Content-Type": "application/json"}
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            for garbled in ('{"channel_type": "telegram", ', "[]", '"telegram"', "42"):
+                resp = await client.post(
+                    "/api/chat/slots/s1/mirror-unlink", data=garbled, headers=headers
+                )
+                assert resp.status == 400, garbled
+                body = await resp.json()
+                assert body["code"] == "invalid_body"
+                assert state.sessions.get_mirror_link("dashboard:s1") is not None, garbled
+            state.push_slots_update.assert_not_called()
+            # The empty body is the documented unconditional clear, unchanged.
+            resp = await client.post("/api/chat/slots/s1/mirror-unlink")
+            assert resp.status == 200
+            assert (await resp.json()) == {"ok": True, "was_linked": True}
+        assert state.sessions.get_mirror_link("dashboard:s1") is None
+
+    @pytest.mark.asyncio
+    async def test_an_undecodable_body_is_refused_like_a_garbled_one(self, tmp_path, monkeypatch):
+        """Bytes that do not decode, or an unknown charset, are the garbled body: 400.
+
+        ``request.text()`` raises ``UnicodeDecodeError`` on invalid UTF-8 and
+        ``LookupError`` on a ``charset=`` Python does not know. Both raise before
+        any read or mutation, so the guard's fail-closed answer already holds;
+        letting them escape answered a 500 where the 400 the guard has built for
+        exactly this caller belongs. The binding stands and nothing is pushed.
+        """
+        state = _prep(tmp_path, monkeypatch)
+        state.sessions.set_mirror_link(
+            "dashboard:s1", ChannelLink(channel_type="telegram", channel_id="999777001")
+        )
+        async with TestClient(TestServer(_make_mirror_app(state))) as client:
+            for data, headers in (
+                (b"\xff\xfe{", {"Content-Type": "application/json; charset=utf-8"}),
+                (
+                    b'{"channel_type": "telegram"}',
+                    {"Content-Type": "application/json; charset=zzq-no-such"},
+                ),
+            ):
+                resp = await client.post(
+                    "/api/chat/slots/s1/mirror-unlink", data=data, headers=headers
+                )
+                assert resp.status == 400, headers
+                assert (await resp.json())["code"] == "invalid_body"
+                assert state.sessions.get_mirror_link("dashboard:s1") is not None, headers
+            state.push_slots_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_link_reports_a_conversation_claimed_mid_flight(self, tmp_path, monkeypatch):

@@ -49,7 +49,12 @@ REQUIRED_ARTIFACT_NAMES = {
 # fork without that infrastructure), and unsigned app bytes must never be
 # recorded under these roles -- stable promotion would republish them as if
 # they were verified. A candidate claims macOS only when the gated notarized
-# artifact exists.
+# artifacts exist -- and then ALL of them: the universal DMG and the two
+# single-arch legs (release.yml's sign-and-notarize-arm64 / -x64) under the
+# names their gated artifacts already carry, the arch in the FILE name because
+# the bundle is one flat directory. They are one group (see MAC_GROUP): a
+# stable that promoted the universal DMG alone would strand single-arch
+# installs on a version that never advances.
 #
 # Optionality does NOT weaken byte identity. Verification compares the on-disk
 # file set against what THIS bundle's manifest claims (not against the union of
@@ -59,6 +64,10 @@ REQUIRED_ARTIFACT_NAMES = {
 OPTIONAL_ARTIFACT_NAMES = {
     "mac_zip": re.compile(r"^notarized\.zip$"),
     "dmg": re.compile(r"^KiroCrew\.dmg$"),
+    "mac_zip_arm64": re.compile(r"^notarized-arm64\.zip$"),
+    "dmg_arm64": re.compile(r"^KiroCrew-arm64\.dmg$"),
+    "mac_zip_x64": re.compile(r"^notarized-x64\.zip$"),
+    "dmg_x64": re.compile(r"^KiroCrew-x64\.dmg$"),
     "windows_installer": re.compile(r"^KiroCrew-Setup\.exe$"),
     "windows_blockmap": re.compile(r"^KiroCrew-Setup\.exe\.blockmap$"),
 }
@@ -67,6 +76,11 @@ OPTIONAL_ARTIFACT_NAMES = {
 # the whole installer instead of the changed blocks. Pairing them makes that
 # degradation impossible to ship by accident.
 WINDOWS_PAIR = {"windows_installer", "windows_blockmap"}
+# The six macOS roles are all-or-nothing for the same reason: they come from
+# one gated notarize fan-out, and a partial set would promote some installs and
+# silently strand the rest.
+MAC_GROUP = {"mac_zip", "dmg", "mac_zip_arm64", "dmg_arm64", "mac_zip_x64", "dmg_x64"}
+PAIRED_GROUPS = (WINDOWS_PAIR, MAC_GROUP)
 ARTIFACT_NAMES = {**REQUIRED_ARTIFACT_NAMES, **OPTIONAL_ARTIFACT_NAMES}
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -108,13 +122,15 @@ def _require_string(value: Any, field: str) -> str:
 
 def _require_paired_roles(present: Iterable[str], context: str) -> None:
     """Reject a half-present pair, whose failure mode is silent degradation."""
-    carried = WINDOWS_PAIR & set(present)
-    if carried and carried != WINDOWS_PAIR:
-        missing = sorted(WINDOWS_PAIR - carried)
-        raise PromotionError(
-            f"{context} carries {sorted(carried)} without {missing}; "
-            "these roles must be promoted together or not at all"
-        )
+    present = set(present)
+    for group in PAIRED_GROUPS:
+        carried = group & present
+        if carried and carried != group:
+            missing = sorted(group - carried)
+            raise PromotionError(
+                f"{context} carries {sorted(carried)} without {missing}; "
+                "these roles must be promoted together or not at all"
+            )
 
 
 def _artifact_paths(bundle_dir: Path) -> dict[str, Path]:

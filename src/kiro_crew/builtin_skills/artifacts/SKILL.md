@@ -1,6 +1,6 @@
 ---
 name: artifacts
-description: Persist, version, and iterate on LLM-generated UI (widgets, HTML, markdown). Load when the user wants to save, find, update, or iterate on a previously-rendered widget — anything that should outlive the chat scrollback.
+description: Persist, version, and iterate on LLM-generated UI (widgets, HTML, markdown). Load for Dynamic Dashboards on long workflows and conductor runs, or when saving, finding or updating a previously-rendered widget.
 triggers: artifact, save widget, save this, iterate, iterate on, update the widget, change the widget, version, library, find widget, what have we built, iterate again, redo the
 ---
 
@@ -26,7 +26,73 @@ on across sessions without losing prior versions, or share with peers for
 feedback. The library is curated: it holds work worth keeping, not a mirror of
 every file or a copy of the chat.
 
-## Mental model
+## Dynamic Dashboards for long work
+
+The host's opt-in automatic session cards are separate from saved artifacts:
+session events trigger bounded updates from that session's recent messages,
+without a conductor publishing on its behalf. The model can reuse a card's HTML
+layout and update only text data. Runtime state, Needs you, and exact-session
+answers/approvals belong to the host. Polling an artifact is not a card-generation
+trigger. Use the saved-view flow below for a durable, task-specific publication,
+not to imitate those controls or keep every session's status alive.
+
+Interactive sessions with a Dashboard surface receive a concise saved-view
+pointer, not this whole skill. When the current automatic-cards setting is on,
+their per-turn guidance also requests concise evidence, result and next step at
+milestones, failures or human-only decisions. The next turn observes live setting
+changes, including after resume or compaction. Those messages feed eligible
+automatic cards; no special
+markup, tool-by-tool narration, duplicate artifact or extra builder is needed.
+Load this skill on demand for a distinct durable visualization. Do not enable
+automatic generation yourself, promise an immediate update, or bypass privacy
+or permission limits. Reuse a saved view when it already serves the task.
+
+For a large workflow, conductor run or multi-session task, publish a Dynamic Dashboard
+early and update it at meaningful milestones. The model owns the design: choose
+the information architecture and visual form the task needs, and change it when
+the work changes. A timeline, dependency map, experiment comparison, release
+board or deliverable gallery are examples, NOT required panels or a template.
+Respect any known style preferences; do not interrupt unattended work to ask
+about style when the user delegated that choice.
+
+- Create with `artifact_save(name=<task title>, kind="html", tags=["task-dashboard"],
+  content=<self-contained HTML>)` from the owning session or a descendant
+  dashboard-builder session. Caller provenance, not a title or claimed root id,
+  determines where it appears. A builder in an unrelated session will not appear
+  in this team's dashboard. Never borrow another task's artifact because its
+  name happens to match.
+- Keep the returned slug. Publish subsequent changes with `artifact_update`
+  on that slug; retain the tag. Do not make a new artifact per step. The chat and
+  Crew side panels pick up published changes within ten seconds while visible.
+- Use real status/evidence from the task's existing sources. Show what is stuck,
+  what needs human input, its context, and the next action. Distinguish a proposed
+  default from an authorized action. No invented progress percentages, elapsed
+  times, fabricated approvals or "complete" claims from an idle worker. Stamp
+  the snapshot with the real clock and refresh after a meaningful state change.
+- For decisions, use the real `ask_question` capability. Tool approvals remain
+  the runtime's normal approval flow. The host separately lists questions and
+  approvals by their exact owning session, including Normal permission mode.
+  Do not build imitation approval buttons or claim that clicking HTML can change
+  a session's permissions. Never change approval mode to keep a run moving.
+- HTML/CSS/SVG may freely lay out the presentation. Use theme variables, readable
+  typography and responsive layouts from a 320px phone to an expanded view.
+  Use meaningful task/session names and plain-language summaries: explain what
+  happened, what is stuck, and what decision is needed. Internal session/run IDs
+  belong only in optional technical details, never as the main labels. Avoid
+  fixed-width canvases or tables that force the whole page to scroll sideways;
+  stack or disclose dense content on phones and keep controls touch-friendly. The
+  frame strips model scripts, event handlers, forms, remote resources and outbound
+  links. Use native `details`/`summary` for disclosure; no JavaScript runtime is
+  provided. Do not fetch APIs; publish fresh content through the tool.
+  Native answers and approvals live outside the authored frame.
+- A dashboard is a projection, not a second task store or a reason to widen
+  authority. Read-only conductors can delegate presentation to an authorized
+  descendant; they must not unmount their own restrictions to publish it.
+  If publishing is unavailable or the session is incognito/temporary, keep
+  reporting normally; do not bypass the persistence policy. The host's live
+  activity and approval surfaces still work without an authored page.
+
+## Artifact identity
 
 | Concept | Means |
 |---|---|
@@ -53,7 +119,7 @@ every file or a copy of the chat.
 | `artifact_folder_rename` | Rename a folder |
 | `artifact_folder_move` | Reparent a folder (cycle-guarded) |
 | `artifact_folder_delete` | Remove a folder; safe by default, destructive with `delete_contents=true` |
-| `artifact_get_comments` | Read every comment thread on an artifact |
+| `artifact_get_comments` | Read every comment thread on an artifact; pass `exclude_resolved` to skip threads already resolved |
 | `artifact_post_comment` | Open a thread, optionally anchored to a quoted span |
 | `artifact_reply_comment` | Reply in an existing thread |
 | `artifact_mark_review` | Advance a thread to REVIEW — addressed, awaiting human check |
@@ -91,26 +157,14 @@ don't run a knowledge search just to find artifacts.)
 
 ## Always check before `artifact_save` (kind=widget)
 
-Before calling `artifact_save` with `kind=widget`, **always** call
-`artifact_list(kind="widget", q="<name>")` first to check for an existing
-artifact with the same name. If a match exists, do **not** call
-`artifact_save` — call `artifact_update` on the existing slug instead so
-the new content captures as a new version of the same artifact identity.
-Only call `artifact_save` after `artifact_list` returns no name match.
+Before every `artifact_save(kind="widget")`, call
+`artifact_list(kind="widget", q="<name>")`. Update a name match with
+`artifact_update` instead; save only when none exists. This applies to explicit
+"save this" requests and proactive saves alike.
 
-This rule applies regardless of how the user phrased the request. "Save
-this version", "save this", "remember this", and silent auto-saves all
-go through the same pre-save check. The artifact-store backend also
-attaches a duplicate-warning hint to the `artifact_save` response when
-a same-named widget artifact already exists — if you see that hint, the
-save just created a duplicate and you should `artifact_delete` the new
-one and `artifact_update` the existing one to recover.
-
-The frontend's bookmark click runs an equivalent dedup probe before
-POSTing, so a user clicking the bookmark icon won't create duplicates
-even if you forget the rule above. The rule still matters for
-explicit "save this" turns where the user goes through you, not the
-bookmark.
+A duplicate-warning hint means the save already created a duplicate. Update the
+existing slug; delete the new duplicate only with explicit user direction, as
+required under **Don't** below.
 
 ## Re-emitting a saved widget — slug attribute is REQUIRED
 
@@ -123,28 +177,16 @@ saved artifact, include the slug as an attribute on the opening tag:
 </mcwidget>
 ```
 
-This binds the impression to the saved artifact. The bookmark icon
-renders filled, the title links to `/artifacts/<slug>`, and clicking
-the bookmark un-saves rather than creating a duplicate.
+This binds the impression to the saved artifact, fills the bookmark, and links
+the title to `/artifacts/<slug>`; a bookmark click un-saves rather than duplicates.
+Include the slug on the first render after `artifact_save`, every render after
+`artifact_update`, and every re-emission across sessions (discover with
+`artifact_list` when needed).
 
-**Always emit the slug on:**
-
-- The first re-render right after `artifact_save` returns
-- Every re-render after `artifact_update` (iteration)
-- Any re-emission of a previously-saved widget across sessions
-  (find it via `artifact_list(q="...")` — see "iterate without a slug" below)
-
-The tool responses for `artifact_save`, `artifact_get`, and `artifact_update`
-all return a re-emit hint with the exact `<mcwidget title="..." slug="...">`
-opening tag — copy it verbatim. If you find yourself typing the tag from
-memory you're doing it wrong.
-
-**If you forget the slug**, the user clicking save creates a duplicate
-artifact. The frontend has a title-based safety net that catches most
-cases (it searches for an existing artifact with the same name on save
-click and binds to the most recently updated one), but the safety net
-is a backstop for legacy widgets and agent compliance failures — not a
-substitute for threading the slug correctly.
+`artifact_save`, `artifact_get`, and `artifact_update` return the exact
+`<mcwidget title="..." slug="...">` re-emit hint: copy it verbatim, not from memory.
+The frontend's title-based bookmark dedup binds the most recently updated name
+match as a legacy backstop, not a substitute for threading the slug.
 
 ## Slug semantics
 
@@ -164,22 +206,12 @@ substitute for threading the slug correctly.
 
 ## When the user clicks the bookmark icon
 
-The frontend bookmark POSTs directly to the API and updates its own UI
-state — the icon flips between filled (saved) and unfilled (not saved).
-**You don't get a chat event for this.** The save and un-save are
-intentionally silent so the conversation history stays clean.
-
-What this means in practice:
-
-- Don't expect or wait for a `[UI] saved-as-artifact` message after the
-  user clicks the bookmark.
-- If the user later asks to iterate on something they bookmarked silently,
-  use `artifact_list` (most recent first; filter by `q` if you have a name
-  hint). The "iterate without a slug" decision tree below covers this case.
-- Server is the source of truth for "is it saved?" — every widget impression
-  GETs `/api/artifacts/<slug>` on mount and on tab visibility change, so
-  bookmark state stays consistent across tabs / sessions / refreshes
-  without you doing anything.
+Bookmark save/un-save goes straight to the API and updates the icon; **it emits
+no chat event**, so never wait for `[UI] saved-as-artifact`. For a later request,
+use `artifact_list` (most recent first, optionally filtered by `q`) and the
+"iterate without a slug" flow. The server owns bookmark state: impressions GET
+`/api/artifacts/<slug>` on mount and tab visibility change, keeping tabs and
+sessions in sync without agent action.
 
 ## The "iterate" flow
 
@@ -215,10 +247,10 @@ you re-emitted earlier this session)?
 ├── YES → use that slug, run the iterate flow above
 └── NO ──┬── Did you emit a widget in a recent turn that the user
         │   is plausibly referring to?
-        │   ├── YES → save the previous widget body as v1 with a
-        │   │        descriptive name, THEN apply the change as v2
-        │   │        via artifact_update. Surface the slug to the user
-        │   │        ("Saved as `<slug>` and updated to v2 with the change.")
+        │   ├── YES → find its auto-registered slug via artifact_list,
+        │   │        then run the iterate flow. Only if no record exists
+        │   │        and saving is allowed, use the pre-save check above
+        │   │        to save the old body as v1 before updating to v2.
         │   └── NO ──── call artifact_list (most recent first); if a
         │                strong match exists, confirm with the user
         │                ("Did you mean `cr-queue` (last updated 2m ago)?")
@@ -228,8 +260,9 @@ you re-emitted earlier this session)?
 ```
 
 Critical: **never tell the user "the widget wasn't saved, so I can't
-iterate"** — that contradicts the entire point of the feature. Save it
-yourself, iterate on it, and tell them what slug you assigned.
+iterate"**. Recover or, where permitted, save its identity, then iterate and
+report the slug. Incognito and temporary sessions forbid artifact writes; do not
+try to save there, and say plainly that the revision is not persisted.
 
 ## Comment triage when addressing feedback
 
@@ -363,39 +396,19 @@ widget/html content carries hardcoded colors and no `var(--…)` reference.
 ## Worked example
 
 ```
-User: render a small mcwidget showing today's date and a colored status
-       badge.
-
-You: <mcwidget title="Today's status">… body …</mcwidget>
-     (Heuristic: probable ongoing dashboard intent → auto-save.)
-     [calls artifact_save(name="Today's status", content="<inner html>",
-       kind="widget")]
-     Saved as `today-s-status`.
-
-User: change the badge to red.
-
-You: [calls artifact_get("today-s-status")]
-     [modifies the badge color]
-     [calls artifact_update("today-s-status", content=new_html)]
-     <mcwidget title="Today's status" slug="today-s-status">
-       … body with red badge …
-     </mcwidget>
-     Updated to v2.
+User: change the badge on artifact today-s-status to red.
+You: artifact_get("today-s-status")
+     [modify the badge]
+     artifact_update("today-s-status", content=new_html)
+     <mcwidget title="Today's status" slug="today-s-status">…new body…</mcwidget>
 ```
 
 
 ## Showing diffs that the dashboard can act on
 
-When you summarise a content change to a file-backed artifact (after
-`artifact_update`, `artifact_revert`, or any edit), the dashboard renders
-fenced ```diff blocks specially — including an **Open file** button in
-the diff header that drops the user into the file in the side panel.
-That button only appears when the diff contains standard unified-diff
-file headers. For artifact reverts, iterations, and any edit where you
-have a `source_path` available, **always include those headers** so the
-affordance works.
-
-Required header lines, in order, at the top of the diff body:
+For each file-backed artifact change (`artifact_update`, `artifact_revert`, or
+an edit), show a fenced `diff` block with unified headers so the dashboard can
+render its **Open file** button:
 
 ```
 --- <source_path>
@@ -403,42 +416,9 @@ Required header lines, in order, at the top of the diff body:
 @@ -<oldStart>,<oldLines> +<newStart>,<newLines> @@
 ```
 
-Use `/dev/null` on the `---` line for new files, and on the `+++`
-line for deletions. The dashboard's diff renderer accepts both this
-plain form and git's `--- a/<path>` / `+++ b/<path>` form, but the
-plain form matches `KiroCrew`'s system prompt (`config/prompt.md`)
-so emit it consistently.
-
-Example for an artifact-revert summary where the artifact's
-`source_path` is `~/notes/test-doc.md` and you reverted to v2:
-
-````
-Reverted `test-doc-md` to v2's content, saved as v4.
-
-```diff
---- ~/notes/test-doc.md
-+++ ~/notes/test-doc.md
-@@ -1,6 +1,6 @@
- # Hello
-
- This is **bold**
-
- I am editing this from the side panel.
--
-+This edit is from the Artifact's detail page.
-```
-````
-
-For chat-backed artifacts (no `source_path`), there's no file to open,
-so plain ```diff blocks without headers are fine — the dashboard simply
-doesn't render the Open file button.
-
-How to obtain the source path:
-
-* The full `Artifact` returned by `artifact_get` includes `source_path`
-  (empty string for chat-backed artifacts). Read it once at the start
-  of an edit and reuse for any diff you summarise.
-* Diff line numbers come from comparing the two versions you're showing
-  (e.g. v2 vs v4). If you don't know exact line numbers, a single
-  `@@ -1 +1 @@` hunk header is acceptable — the file path is what
-  matters for the Open file button.
+Read `source_path` from `artifact_get` at the start and reuse it. Use `/dev/null`
+on the `---` line for a new file or the `+++` line for a deletion. Prefer plain
+paths; git's `a/` and `b/` prefixes also work. Compare the shown versions for line
+numbers; if unknown, `@@ -1 +1 @@` is accepted because the button uses the path.
+For chat-backed artifacts (`source_path` is empty), headerless `diff` blocks are
+fine: there is no file to open.

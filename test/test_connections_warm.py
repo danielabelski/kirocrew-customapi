@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from oauth_url_corpus import OPERATOR_EXTENSION_OAUTH_URLS
 from test_connections_mint import _FS_ATTRS, _FS_NAMES, _called_names
 
 from conftest import requires_symlinks
 from kiro_crew import security
 from kiro_crew.agent_files import AGENT_FILENAME
-from kiro_crew.connections import tool_aliases, warm
+from kiro_crew.connections import mint, tool_aliases, warm
 from kiro_crew.connections.mint import _mints
 from kiro_crew.connections.registry import Provider
 
@@ -228,28 +229,45 @@ def _provider(slug: str, url: str = "") -> Provider:
 _WARM_FS_NAMES = _FS_NAMES | {"list_servers", "grant_present", "oauth_url_contains_credential"}
 
 
+def _warm_engine_trees() -> list[tuple[str, ast.Module]]:
+    """The facade plus every module of its private ``warm_runtime`` package.
+
+    One call graph, because a helper the facade re-exports is still called from the facade's
+    coroutines, and a coroutine that moved into an owner still owes the same invariant. Reading
+    the facade alone would silently drop both.
+    """
+    from kiro_crew.connections import warm_runtime
+
+    owners = sorted(Path(warm_runtime.__file__).parent.glob("*.py"))
+    assert len(owners) > 1, "warm_runtime moved; this guard is reading the wrong tree"
+    return [
+        (path.name, ast.parse(path.read_text(encoding="utf-8")))
+        for path in [Path(warm.__file__), *owners]
+    ]
+
+
 def test_no_coroutine_in_the_warm_module_touches_the_filesystem_directly():
-    tree = ast.parse(inspect.getsource(warm))
-    sync: dict[str, Any] = {}
-    coros: dict[str, Any] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            sync[node.name] = node
-        elif isinstance(node, ast.AsyncFunctionDef):
-            coros[node.name] = node
+    sync: dict[str, list[Any]] = {}
+    coros: list[tuple[str, Any]] = []
+    for label, tree in _warm_engine_trees():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                sync.setdefault(node.name, []).append(node)
+            elif isinstance(node, ast.AsyncFunctionDef):
+                coros.append((f"{label}:{node.name}", node))
     assert sync and coros, "module shape changed; this guard is reading the wrong tree"
 
     touches = {
-        name: bool(_called_names(node) & (_FS_ATTRS | _WARM_FS_NAMES))
-        for name, node in sync.items()
+        name: any(_called_names(node) & (_FS_ATTRS | _WARM_FS_NAMES) for node in nodes)
+        for name, nodes in sync.items()
     }
     changed = True
     while changed:
         changed = False
-        for name, node in sync.items():
+        for name, nodes in sync.items():
             if touches[name]:
                 continue
-            if any(touches.get(callee) for callee in _called_names(node)):
+            if any(touches.get(callee) for node in nodes for callee in _called_names(node)):
                 touches[name] = changed = True
     fs_helpers = {name for name, hit in touches.items() if hit}
     # The known set, so a helper silently losing its filesystem work -- and with it
@@ -289,7 +307,7 @@ def test_no_coroutine_in_the_warm_module_touches_the_filesystem_directly():
 
     offenders = {
         f"{coro} -> {callee}"
-        for coro, node in coros.items()
+        for coro, node in coros
         for callee in _called_names(node) & (fs_helpers | _FS_ATTRS | _WARM_FS_NAMES)
     }
     assert not offenders, (
@@ -337,11 +355,10 @@ def test_the_spec_a_warm_plan_writes_only_mounts_aliased_servers(_slash_bearing_
     assert set(body["toolAliases"]) <= {f"@{alias}/shared_tool" for alias in body["mcpServers"]}
 
 
-# ── defect: alias semantics are #3260's, not the pre-#3260 first-server rule ──
+# ── defect: alias semantics rename EVERY claimant, not just later ones ──
 #
-# The draft asserted that the FIRST mounted server keeps the bare name and only later ones are
-# renamed. #3260 shipped rename-EVERY-claimant, slug-keyed: when two mounted servers claim a
-# tool, both are renamed and neither keeps the bare name.
+# Alias handling renames EVERY claimant, slug-keyed: when two mounted servers claim a
+# tool, both are renamed and neither keeps the bare name — the FIRST does not keep it.
 
 
 def test_every_claimant_of_a_collision_is_renamed_not_just_the_later_one():
@@ -503,6 +520,7 @@ async def test_spawn_and_session_mode_both_resolve_from_one_private_generation(
 
     monkeypatch.setattr(warm, "_acp_runtime_factory", lambda: _Spawnable)
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     monkeypatch.setattr(warm, "_MINT_GRANT_POLL_SECONDS", 3600)
 
     plan = await warm._warm_mint._ensure_locked([_provider("linear")])
@@ -532,13 +550,14 @@ async def test_generation_directory_is_removed_only_after_a_confirmed_kill(
             self.failures = failures
             self.kill_attempts = 0
 
-        async def kill(self) -> None:
+        async def kill(self, *, expected: bool = False, reason: str = "") -> None:
             self.kill_attempts += 1
             if self.failures:
                 self.failures -= 1
                 raise TimeoutError("still alive")
 
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     monkeypatch.setattr(warm, "_WARM_KILL_TIMEOUT_SECONDS", 1)
     work_dir = warm._create_warm_generation_dir()
     runtime = _Process(failures=1)
@@ -655,6 +674,7 @@ def test_a_bound_generation_is_untouched_until_its_identity_proves_dead(
         pid = 4242
 
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     monkeypatch.setattr(warm, "_process_identity_live", lambda pid, started: True)
     work_dir = warm._create_warm_generation_dir()
     runtime = _Process()
@@ -679,6 +699,7 @@ def test_startup_scavenging_deletes_only_proven_dead_owned_generations(
             self.pid = pid
 
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
     warm._bind_warm_generation(_Process(101), dead)
     warm._bind_warm_generation(_Process(202), live)
     monkeypatch.setattr(
@@ -696,20 +717,100 @@ def test_startup_scavenging_deletes_only_proven_dead_owned_generations(
 def test_recorded_gateway_identity_reads_back_as_live(_private_warm_home: Path):
     """The gateway token the writer stores must round-trip through the reader.
 
-    Writer and reader have to agree on ONE token format, and two different
-    ``platform_compat`` helpers do not: ``own_process_start_time()`` answers
-    ``"{ticks}:{boot_uuid}"`` on Linux and a ``proc_pidinfo`` microtime on macOS,
-    while ``process_start_time(pid)`` -- what the reader compares against --
-    answers bare ticks and a 1s ``ps`` string respectively. Storing one and
-    comparing the other classifies this very much alive gateway as dead on both
-    platforms, and only coincidentally agrees on Windows, where both helpers
-    return the same creation ``FILETIME``.
+    Writer and reader have to agree on ONE token format, and it must be one
+    whose readers never act on a drifted render: both sides go through
+    ``_marker_process_start_id`` (``get_process_start_id``-first), so the
+    locale-rendered ``ps`` spelling is neither written nor compared. Storing a
+    token from one helper and comparing against another -- e.g. the
+    reboot-unique ``own_process_start_time()`` against the reader -- classifies
+    this very much alive gateway as dead, and only coincidentally agreed on
+    Windows, where both helpers return the same creation ``FILETIME``.
     """
     owner = warm._warm_generation_owner()
 
     assert owner["gateway_pid"] == os.getpid()
     assert owner["gateway_started"], "a readable host must record a gateway token"
     assert warm._process_identity_live(owner["gateway_pid"], owner["gateway_started"]) is True
+
+
+def test_writer_never_emits_a_locale_rendered_identity(_private_warm_home: Path):
+    """A persisted marker must never carry the retired ``ps`` spelling.
+
+    The writer and the reader both go through ``_marker_process_start_id``, so
+    whatever lands in ``gateway_started``/``runtime_started`` is in the current
+    representation by construction. This pins that property directly: a future
+    change that routes the writer back through ``process_start_time``'s
+    locale-rendered ``ps`` leg would still round-trip on a same-locale host and
+    only delete trees after a ``TZ``/``LC_TIME`` change, which no round-trip
+    test can observe.
+    """
+
+    class _Process:
+        pid = os.getpid()
+
+    owner = warm._warm_generation_owner(_Process())
+    for key in ("gateway_started", "runtime_started"):
+        recorded = owner[key]
+        assert recorded, "a readable host must record both identities"
+        assert warm._CURRENT_START_ID_RE.match(
+            recorded
+        ), f"{key} is not in the current representation: {recorded!r}"
+
+
+def test_start_ids_comparable_allows_only_the_current_representation():
+    """The migration guard compares kinds, not values.
+
+    Two current-representation values are always comparable -- even when they
+    differ, in which case the mismatch verdict stands. Anything else on either
+    side is "unknown", never "different".
+    """
+    assert warm._start_ids_comparable("12345", "12345") is True
+    assert warm._start_ids_comparable("12345", "67890") is True
+    assert warm._start_ids_comparable("1730.000042", "1730.000043") is True
+    assert warm._start_ids_comparable("Wed Sep  3 10:00:00 2026", "12345") is False
+    assert warm._start_ids_comparable("12345", "Wed Sep  3 10:00:00 2026") is False
+    assert warm._start_ids_comparable("", "12345") is False
+    assert warm._start_ids_comparable("12345", "") is False
+
+
+def test_scavenging_keeps_a_generation_with_a_legacy_ps_marker(
+    _private_warm_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A pre-migration marker must read as unknown, not dead.
+
+    RED before the fix: the marker below carries the retired ``ps -o lstart=``
+    spelling for a gateway that is still running. The old reader compared that
+    render against the freshly read one, called the mismatch death, and the
+    scavenger removed the live gateway's cwd and private agent scope. The
+    runtime half is pinned ALIVE so the comparability guard is the only thing
+    standing between this tree and the ``rmtree`` -- the PID-liveness shortcut
+    must not be what saves it.
+    """
+    legacy_render = "Wed Sep  3 10:00:00 2026"
+    runtime_pid = 747474
+    current_rep = "99999"
+    monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: current_rep)
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: current_rep)
+    monkeypatch.setattr(
+        warm.platform_compat, "pid_liveness", lambda pid: warm.platform_compat.PID_ALIVE
+    )
+
+    work_dir = warm._create_warm_generation_dir()
+    marker = {
+        "sentinel": warm._WARM_GENERATION_SENTINEL,
+        "version": warm._WARM_GENERATION_MARKER_VERSION,
+        "gateway_pid": os.getpid(),
+        "gateway_started": legacy_render,
+        "runtime_pid": runtime_pid,
+        "runtime_started": legacy_render,
+    }
+    warm._warm_generation_marker_path(work_dir).write_text(json.dumps(marker), encoding="utf-8")
+
+    assert warm._process_identity_live(os.getpid(), legacy_render) is None
+    assert warm._process_identity_live(runtime_pid, legacy_render) is None
+    assert warm._scavenge_warm_generation_dirs() == 0
+    assert work_dir.is_dir(), "a legacy marker must keep the tree it cannot judge"
 
 
 def test_scavenging_keeps_a_generation_whose_gateway_is_still_alive(
@@ -727,12 +828,18 @@ def test_scavenging_keeps_a_generation_whose_gateway_is_still_alive(
     is why it cannot observe a wrong token reaching that function.
     """
     real_start_time = warm.platform_compat.process_start_time
+    real_start_id = warm.platform_compat.get_process_start_id
     dead_pid = 424242
 
     monkeypatch.setattr(
         warm.platform_compat,
         "process_start_time",
         lambda pid: "runtime-token" if pid == dead_pid else real_start_time(pid),
+    )
+    monkeypatch.setattr(
+        warm.platform_compat,
+        "get_process_start_id",
+        lambda pid: "runtime-token" if pid == dead_pid else real_start_id(pid),
     )
     monkeypatch.setattr(
         warm.platform_compat,
@@ -768,11 +875,17 @@ def test_release_keeps_the_tree_when_the_killed_runtime_survived(
     """
     survivor_pid = 525252
     real_start_time = warm.platform_compat.process_start_time
+    real_start_id = warm.platform_compat.get_process_start_id
 
     monkeypatch.setattr(
         warm.platform_compat,
         "process_start_time",
         lambda pid: "runtime-token" if pid == survivor_pid else real_start_time(pid),
+    )
+    monkeypatch.setattr(
+        warm.platform_compat,
+        "get_process_start_id",
+        lambda pid: "runtime-token" if pid == survivor_pid else real_start_id(pid),
     )
     monkeypatch.setattr(
         warm.platform_compat, "pid_liveness", lambda pid: warm.platform_compat.PID_ALIVE
@@ -802,11 +915,17 @@ def test_release_removes_the_tree_once_the_runtime_is_provably_dead(
     """
     gone_pid = 636363
     real_start_time = warm.platform_compat.process_start_time
+    real_start_id = warm.platform_compat.get_process_start_id
 
     monkeypatch.setattr(
         warm.platform_compat,
         "process_start_time",
         lambda pid: "runtime-token" if pid == gone_pid else real_start_time(pid),
+    )
+    monkeypatch.setattr(
+        warm.platform_compat,
+        "get_process_start_id",
+        lambda pid: "runtime-token" if pid == gone_pid else real_start_id(pid),
     )
     monkeypatch.setattr(
         warm.platform_compat,
@@ -1065,7 +1184,7 @@ def test_a_refusal_is_audited_rather_than_raised(monkeypatch: pytest.MonkeyPatch
 # pointed the planner at a file outside the agents dir, and that file's contents then
 # DECIDED the plan: a configured entry whose auth shape differs from the registry's vetoes
 # the provider (``_warm_mintable_entry``). No size cap, no sensitive-target refusal, no SEL
-# denial. #6736 migrated the other ``kirocrew.json`` readers; this one was added after.
+# denial. The other ``kirocrew.json`` readers were migrated; this one was added after them.
 
 
 @requires_symlinks
@@ -1082,7 +1201,9 @@ def test_a_sensitive_symlink_at_the_spec_path_never_reaches_the_plan(
         encoding="utf-8",
     )
     (_agents_dir / AGENT_FILENAME).symlink_to(target)
-    monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+    monkeypatch.setattr(
+        agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+    )
 
     plan = warm._warm_spec_plan([_provider("acme")])
 
@@ -1145,7 +1266,9 @@ def test_a_sensitive_symlink_at_a_warm_spec_path_is_never_judged_ours(
     target.write_text(_ours_shaped_spec_text(stem), encoding="utf-8")
     link = _agents_dir / f"{stem}.json"
     link.symlink_to(target)
-    monkeypatch.setattr(agent_discovery, "is_sensitive_path", lambda p: str(target) in str(p))
+    monkeypatch.setattr(
+        agent_discovery, "is_sensitive_canonical_path", lambda p: str(target) in str(p)
+    )
 
     assert warm._warm_spec_is_foreign(link) is True
 
@@ -1384,7 +1507,7 @@ async def test_expiry_is_narrowed_to_the_one_generation_whose_verifier_died():
     assert _mints["c"]["state"] == "minting"
 
 
-# ── defect #6110: a batch timestamp is not a row identity ──
+# ── defect: a batch timestamp is not a row identity ──
 #
 # The fence separating one activation's rows from the next at the SAME slug was
 # ``entry["started"] == started``, a ``time.monotonic()`` reading taken once per
@@ -1460,6 +1583,51 @@ async def test_a_url_carrying_a_credential_is_refused_rather_than_stored(_stub_a
     )
     assert await warm._absorb_warm_requests(bearing, claims) == []
     assert "linear" not in _mints, "the claim is released so the card asks for a fresh mint"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_premint_stays_slug_only_and_hands_naming_to_the_cold_mint(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, _stub_activation
+):
+    """The warm gate is one half of a two-step surface. It must NOT name the endpoint
+    itself -- the warning and the audit line are logger sinks, and URL-derived text there
+    is what the credential-disclosure scanners flag -- but the URL it refuses must be one
+    the cold mint CAN name, or releasing the claim would send the card to a fresh mint that
+    ends just as opaquely. Both halves are pinned here: the release leaves no row (so the
+    card's poll reads ``idle`` and asks for a cold mint), the warm-side text carries the
+    slug and nothing from the URL, and the display contract the cold mint applies to the
+    same URL yields the copy-ready endpoint."""
+    # The operator-extension corpus: rejected for a long opaque state at an
+    # endpoint outside the allowlist, clean once the endpoint is added -- the
+    # one shape whose cold-mint card must name the endpoint.
+    _, url, (host, path) = OPERATOR_EXTENSION_OAUTH_URLS[0]
+    audited: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        warm, "_log_warm_event", lambda op, res, outcome="ok": audited.append((op, res, outcome))
+    )
+    provider = _provider("linear")
+    claims = await _claim("linear")
+
+    with caplog.at_level(logging.WARNING, logger=warm.logger.name):
+        absorbed = await warm._absorb_warm_requests(
+            _result([provider], [{"serverName": "linear", "oauthUrl": url}]), claims
+        )
+
+    assert absorbed == []
+    assert "linear" not in _mints
+    assert mint.pending_mint_for("linear") is None
+    # Slug-only on every warm-side channel.
+    assert audited == [("connections_warm_mint_url", "provider:linear", "refused")]
+    assert "linear" in caplog.text
+    for never in (host, path, "a1B2c3D4", url):
+        assert never not in caplog.text
+        assert never not in json.dumps(audited)
+    # The hand-off is coherent: the cold mint the card now starts re-hits this URL,
+    # and its card view names exactly this endpoint (host+path, nothing from the query)
+    # -- because this is a rejection the allowlist entry would clear.
+    assert security.oauth_url_contains_credential(url)
+    assert security.oauth_rejection_is_endpoint_exemptible(url)
+    assert security.sanitized_oauth_endpoint_display(url) == f"{host}{path}"
 
 
 @pytest.mark.asyncio
@@ -2483,7 +2651,7 @@ async def test_a_cancel_mid_sweep_leaves_the_unkilled_generations_parked(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """`_sweep_retiring_locked` assigns the keep-list before it kills the drop-list, so a
-    cancellation partway through used to remove BOTH generations from `_retiring` while only
+    cancellation partway through would remove BOTH generations from `_retiring` while only
     one was actually killed -- `parked_count()` then reads zero and the drain exits, so
     nothing ever retries. A generation whose kill completed is gone; one whose kill was
     interrupted stays parked for a later sweep."""
@@ -2533,7 +2701,7 @@ class _UnkillableRuntime:
     def is_alive(self) -> bool:
         return True
 
-    async def kill(self) -> None:
+    async def kill(self, *, expected: bool = False, reason: str = "") -> None:
         self.kill_attempts += 1
         if self.kill_attempts <= self._failures:
             raise TimeoutError("kill timed out")
@@ -2632,6 +2800,7 @@ async def test_a_spec_scope_is_retained_while_an_unkilled_child_still_needs_it(
     doomed = _UnkillableRuntime(failures=1)
     doomed.pid = 6060
     monkeypatch.setattr(warm.platform_compat, "process_start_time", lambda pid: f"start-{pid}")
+    monkeypatch.setattr(warm.platform_compat, "get_process_start_id", lambda pid: f"start-{pid}")
 
     def _liveness(pid: int) -> str:
         """Report the doomed child dead only once its kill has actually taken.
@@ -2785,7 +2954,7 @@ async def test_a_cancel_during_the_stand_down_kill_re_parks_the_process(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """`_park_or_kill_locked` clears `_runtime` and cancels the reaper BEFORE it awaits the
-    kill, so a cancellation inside that kill used to drop the only reference to a process
+    kill, so a cancellation inside that kill would drop the only reference to a process
     that is still running -- neither registered, nor parked, nor dead."""
     doomed = _Runtime(False)
 
@@ -2813,7 +2982,7 @@ async def test_a_cancel_during_the_hard_teardown_re_parks_what_is_left(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """`_retire_locked` empties `_retiring` and clears `_runtime` up front, so a
-    cancellation partway through its kill loop used to leak every remaining process with no
+    cancellation partway through its kill loop would leak every remaining process with no
     reference left anywhere."""
     parked, current = _Runtime(False), _Runtime(False)
     killed: list[Any] = []

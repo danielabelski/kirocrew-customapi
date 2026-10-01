@@ -2,16 +2,36 @@
 
 Third-party account connections: the provider registry and its tiers, the mint
 endpoints a card drives, where credential custody sits, warm prewarming, owner-only
-disconnect, and the two launch-gate rungs. The subsystem is
+disconnect, the automated L0/L1 gates, and the manual L2 gate. The subsystem is
 `src/kiro_crew/connections/` (`registry.py`, `mint.py`, `warm.py`, `status.py`,
-`ownership.py`, `tool_aliases.py`, `alias_record.py`, `l0_probe.py`, `l0_drift.py`,
-`l0_record.py`, `l1_smoke.py`, `tool_test.py`), plus
-`dashboard/handlers/connections.py` and `website/src/pages/connections/`.
+`ownership.py`, `oauth_clients.py`, `tool_aliases.py`, `alias_record.py`,
+`l0_probe.py`, `l0_drift.py`, `l0_record.py`, `l1_smoke.py`, `tool_test.py`, `warm_runtime/`, and
+`control_plane/`), plus `dashboard/handlers/connections.py` and
+`website/src/pages/connections/`.
+
+The `control_plane/` and `vendors/` subtrees are connector-campaign slices rather
+than this subsystem's OAuth-grant plumbing. Their current contracts include the
+[capability-manifest](connector-capability-manifest.md),
+[conformance](connector-conformance.md), [GitHub](connector-github.md),
+[Microsoft Graph](microsoft-graph-runtime.md), and [Zoom](connector-zoom.md)
+specs.
 
 **Kiro Crew never holds a connection's credential.** kiro-cli owns the OAuth chain
 end to end; Kiro Crew observes grant presence by `stat`, and every rule below follows
 from that boundary. The credential-boundary detail lives in
 [`../architecture/design-notes/mcp-oauth-ownership.md`](../../architecture/design-notes/mcp-oauth-ownership.md).
+
+One thing that looks like an exception is not one. A provider whose MCP server
+refuses dynamic client registration (`auth.mode: "preregistered"` in the
+registry — GitHub and Asana today) needs an OAuth **app** an operator registered
+in the vendor console, and a confidential app comes with a `client_secret`. That
+secret is the operator's *application* credential, not any user's grant: the
+grant still lives with kiro-cli and nothing here reads it. Kiro Crew keeps the
+secret in the encrypted vault (`CONNECTIONS_<SLUG>_CLIENT_SECRET`) as the source
+of truth and writes it into the emitted agent spec as `oauth.clientSecret` only
+because that file is the one thing kiro-cli reads — **the same footing the
+existing `headers` secrets have: vault is truth, the spec is a projection.** See
+"Pre-registered OAuth clients" below.
 
 ## Status and cancel
 
@@ -36,6 +56,24 @@ the dashboard, which the runtime calls fine and which raised no `mcp_oauth`
 banner here. Reachability alone cannot separate them, which is why a provider
 with no token file could wear a Connected badge and an authorized one could sit
 on "not verified".
+
+**Static-header entries: the reachability probe presents what the runtime
+presents.** A remote entry may authorize with a static header whose value
+carries a `${VAR}`/`${env:VAR}` reference — a documented config form kiro-cli
+resolves at session runtime. The `/api/mcp` probe resolves those references
+through the gateway rewriter's declared-env expander
+(`mcp_gateway.rewriter._expand_env_placeholders`): same regex, same
+credential-filtered source view (`is_secret_env_key`, `is_credential_env_key`
+and `scrub_agent_denied_env` names are misses), and an unresolved reference is
+left literal for kiro-cli parity. So a header that authenticates in a session
+authenticates in the probe. A still-unresolved reference is **not a supplied
+credential**: a 401 against it reports `needs_auth` rather than a
+rejected-credential error whose remediation advice would be to delete a working
+header. Probe-error redaction keys on the values the probe actually sent —
+including each individually resolved placeholder value, since a partially
+expanded header (`${TOKEN}${MISSING}`) sends a value a server can echo only a
+fragment of — so an error echoing a *resolved* secret is scrubbed by the
+exact-value layer, not left to the generic credential-shaped scanners alone.
 
 `GET /api/connections/status` answers the authorization axis only. It reports
 `grantPresent` — a local, network-free stat of kiro-cli's OAuth artifact
@@ -246,6 +284,8 @@ The gateway imports the dashboard handlers package at boot, and the mint engine
 drags in the ACP client, the credential predicate and the PID registry;
 `test_the_handlers_package_does_not_import_the_mint_engine` enforces that in a
 subprocess, so hoisting either import to module scope turns the suite red.
+`test_no_boot_path_module_loads_any_warm_or_mint_module` probes the same boot imports by
+module prefix, so a `warm_runtime` owner reached without its facade is caught too.
 
 ## Minting and the warm table
 
@@ -253,13 +293,31 @@ Cold mint (`kiro_crew.connections.mint`) spawns one kiro-cli process per provide
 approval URL: ~7.5s per card. `kiro_crew.connections.warm` serves the whole gallery from one
 process, and every rule below answers an observed failure.
 
-**Placement.** Warm engine code remains in `src/kiro_crew/connections/warm.py`; the dashboard
-handler adds only endpoint wiring -- `expire_dead_mints` on the status path,
-`mintable_providers` plus `warm_mint_all` on the premint path, and `adopt_shared_mint` on the
-mint path. The dashboard server registers two lifecycle hooks in both full and headless modes:
-a tracked startup task that scavenges dead private generations off-loop without delaying the
-listener bind, and a cleanup hook that retires the live runtime. Those hooks import the warm
-module lazily, so importing the server alone still does not construct or spawn the engine.
+**Placement.** `src/kiro_crew/connections/warm.py` is the warm engine's one import and patch
+surface, and it composes three private owners under `kiro_crew.connections.warm_runtime`; the
+dashboard handler adds only endpoint wiring -- `expire_dead_mints` on the status path,
+`_audited_mintable_providers` plus `warm_mint_all` on the premint path, and `adopt_shared_mint`
+on the mint path. The dashboard server registers two lifecycle hooks in both full and headless
+modes: a tracked startup task that scavenges dead private generations off-loop without delaying
+the listener bind, and a cleanup hook that retires the live runtime. Those hooks import the warm
+module lazily, so importing the server alone still does not construct or spawn the engine, and
+no boot-path module loads a `warm_runtime` owner either.
+
+| Owner | Holds | Why there |
+|---|---|---|
+| `src/kiro_crew/connections/warm_runtime/spec_plan.py` | `_WarmSpecPlan`; the reuse rules `_plan_is_servable` and `_resident_roster_is_asked_for`; per-provider entry derivation (`_registry_server_entry`, `_operator_oauth_client`, `_auth_shape`, `_warm_mintable_entry`); `_wanted_aliases` | rules over registry and configured entries; `_operator_oauth_client` reads config, env and the vault on every call, so callers reach it only from sync helpers behind `asyncio.to_thread` |
+| `src/kiro_crew/connections/warm_runtime/start_identity.py` | `_process_identity_live` and the start-identity helpers it compares with | the tri-state PID-reuse verdict both generation readers act on |
+| `src/kiro_crew/connections/warm_runtime/shared_rows.py` | the two-axis predicates (`_warm_table_row`, the counts built on it, `_mint_is_cold_held`, `_mint_is_adopted`); the atomic `_claim_shared_mints`, `_dispose_displaced_rows` and `_release_shared_claims` | one claim transaction over the cold engine's table, bound from `mint` exactly as the facade binds it |
+| `src/kiro_crew/connections/warm.py` | the public API; every patch seam; the provider scan; `_warm_spec_plan`; spec ownership (sentinel, judge, gated writer); the generation-directory lifecycle and its owner marker; `_WarmMintRuntime`; adoption, absorb, expiry, drain, reaper and re-arms | pinned to the file by the link-screen baseline, the agent-spec call-site ratchet, the session-registry gate and the security spec's citation of `warm._credential_bearing_slugs`, or a caller of a seam patched on this module |
+
+`warm.py` re-exports every owner name as the same object, and no owner imports the facade,
+`kiro_crew.acp` or `kiro_crew.providers` at module scope. One facade name is reached at call
+time: `shared_rows` disposes a row through `warm._dispose_mint`, the binding the warm engine's
+callers substitute. `test/test_connections_warm_mint_composition_contract.py` pins all four
+properties. The cold engine stays whole in `mint.py`: every rule there either reads the
+module-level table and seams its callers substitute on `mint`, or is held in the file by the
+agent-spec call-site ratchet and the agent-SDK boundary baseline, so an owner split out of it
+would only forward.
 
 ### The handoff: how a premint reaches the click it was minted for
 
@@ -392,7 +450,9 @@ Every flow reads the user's config, a private generation tree, the old global ag
 or kiro-cli's OAuth cache, any of which can sit on a network mount where a stat is unbounded, so
 all of that work lives in SYNCHRONOUS helpers and a coroutine reaches them through
 `asyncio.to_thread` -- enforced by a fixed-point drift guard in `test/test_connections_warm.py`
-that reuses the mint engine's own primitive sets so the two cannot drift apart. What the guard
+that reuses the mint engine's own primitive sets so the two cannot drift apart. It reads
+`warm.py` and every `warm_runtime` owner as one call graph, so a coroutine that moves into an
+owner still owes the invariant and a helper the facade re-exports still counts. What the guard
 pins today is the exact set of helpers doing filesystem work, so the lifecycle slice can neither
 call one from a coroutine nor quietly drop the filesystem work the guard's coverage rests on
 without failing it.
@@ -494,8 +554,8 @@ that mutation's settlement, guarded only by `except Exception`, is the recurring
 class here: a `CancelledError` inherits from `BaseException` and walks straight past
 such a guard, leaving rows nothing withdraws, parked processes with no sweeper, forked
 children, orphan specs, registered sessions with live loopback callback servers, or
-generations with no reference left anywhere. Every mutation window in `warm.py` is
-written to that rule.
+generations with no reference left anywhere. Every mutation window in `warm.py` and its
+`warm_runtime` owners is written to that rule.
 
 
 ## Disconnect
@@ -640,7 +700,7 @@ removes both entries — leaving the credential behind. So a configured row whos
 with provenance. A row the census does *not* carry still votes, so a source the
 census misses can never lose a real sharer.
 
-Residuals, stated rather than papered over: the handler awaits `cancel_mint`first, so a wedged teardown can keep a Disconnect busy for its shutdown timeout
+Residuals, stated rather than papered over: the handler awaits `cancel_mint` first, so a wedged teardown can keep a Disconnect busy for its shutdown timeout
 (firing it as a task would let a grant arrive after the user disowned the
 connection); the census reads the per-project `.kiro/agents` dirs of every OPEN
 chat slot as well as the user-level one, so a project with no open slot is still
@@ -754,7 +814,7 @@ shipped with the tiers note. Test is not broken today; it performs a real probe,
 just a shallower one than its name suggests. Splitting it keeps the
 security-relevant fix from waiting on the expensive one.
 
-## Launch gates: L0 and L1
+## Launch gates: automated L0/L1 and manual L2
 
 A visible Connect card is a promise the flow works; each rung of the launch
 ladder asserts something the rung below structurally cannot:
@@ -865,6 +925,306 @@ governed, audited agent path.
 
 ### Running it by hand
 
-`python3 -m kiro_crew.connections.l1_smoke --report /tmp/l1.json` (under a
+`python3 -m kiro_crew.connections.l1_smoke --report connections-l1-report.json` (under a
 pipx/venv install, use that environment's interpreter). `--min-exercised 1`
 reproduces the lane's gate; `--concurrency`/`--timeout` are in `--help`.
+
+## The registry roster
+
+Every entry in `src/kiro_crew/connections/registry.json`, what stands between it
+and the Connect grid, and the category it fills. `category` is a closed
+vocabulary (`registry.PROVIDER_CATEGORIES`) so the coverage diff against the
+ChatGPT and Claude connector directories is bucket-for-bucket; nothing mints,
+mounts or gates on it.
+
+| Provider | Category | Tier | Auth (DCR / PKCE) | Read-only shape | Grid | What the gate still needs |
+|---|---|---|---|---|---|---|
+| Notion | collaboration-docs | 1 | yes / yes | none (one combined grant) | shown | — |
+| Linear | project-management | 1 | yes / yes | dedicated `/mcp/readonly` endpoint | shown | — |
+| Atlassian (Jira, Confluence) | project-management | 1 | yes / yes | trim on the consent page | shown | — |
+| Stripe | payments-finance | 1 | yes / yes | tool-level | shown | — |
+| Vercel | developer-tools | 1 | yes / yes | none | shown | — |
+| GitLab | developer-tools | 1 | yes / yes | none (single `mcp` scope) | shown | — |
+| GitHub | developer-tools | 2 | **no** / yes — pre-registered client (`auth.mode`) | read-only server variant | shown as "needs configuration" until an operator enters a client; Connect after | manual launch-gate check with an operator-registered app ([runbook](../../guides/oauth-app-registration/github.md)) |
+| Superhuman Mail | calendar-email | 1 | yes / yes | none | gated | logged-in revoke-surface check |
+| Sentry | developer-tools | 2 | yes / yes | grant only the `inspect` + `docs` skills | gated | manual launch-gate check (L2 SOP) |
+| Supabase | developer-tools | 2 | yes / yes | installs `?read_only=true` | gated | manual launch-gate check |
+| Airtable | data-analytics | 2 | yes / yes | decline the `*:write` scopes at consent | gated | manual launch-gate check |
+| PayPal | payments-finance | 2 | yes / yes | none — live endpoint moves money | gated | manual launch-gate check; sandbox first |
+| Asana | project-management | 2 | **no** / yes — pre-registered client (`auth.mode`) | none (single `default` scope) | shown as "needs configuration" until an operator enters a client; Connect after | manual launch-gate check with an operator-registered app ([runbook](../../guides/oauth-app-registration/asana.md)) |
+| Figma | design | 3 | yes / yes | Dev seat is read-only outside drafts | hidden | Figma admits clients from its MCP Catalog waitlist |
+| Canva | design | 3 | yes / yes | none | hidden | Canva allow-lists the redirect URI per client |
+| Dropbox | file-storage | 3 | yes / yes | `/dash` search server (Dash plan) | hidden | Dropbox honours DCR only for its trusted-client list |
+| Miro | design | 2 | yes / yes | none — `boards:read` advertised but consent cannot drop `boards:write` | gated | manual launch-gate check |
+| Webflow | design | 2 | yes / yes | none (per-tool grant, each tool bundles read and write) | gated | manual launch-gate check |
+| Netlify | developer-tools | 2 | yes / yes | none — `read` scope is not enforced by the broker; call only `*-services-reader` | gated | manual launch-gate check |
+| Amplitude | data-analytics | 2 | yes / yes | request `mcp:read` only | gated | manual launch-gate check |
+| Mixpanel | data-analytics | 2 | yes / yes | none (analysis scopes only; role-limited) | gated | manual launch-gate check |
+| Cloudflare (Workers Bindings) | developer-tools | 2 | yes / yes | none — fixed `workers:write` + `d1:write`; `observability` host is the read-only sibling | gated | manual launch-gate check |
+| Hugging Face | developer-tools | 2 | yes / yes | request `read-mcp` only; installs `?login` so the server demands a grant | gated | manual launch-gate check; L1 must not read an anonymous 200 as a held grant |
+| Zapier | developer-tools | 2 | yes / yes | manual server configuration at mcp.zapier.com | gated | manual launch-gate check |
+| Square | payments-finance | 3 | yes / yes | tick `*_READ` permissions only at consent | hidden | Square admits MCP clients from an allowlist (developer-forum request) |
+| Postman | developer-tools | 2 | yes / yes | installs `/minimal` (no delete tools); no scope picker | gated | manual launch-gate check |
+| Neon | developer-tools | 2 | yes / yes | installs `?readonly=true` | gated | manual launch-gate check |
+| Prisma | developer-tools | 2 | yes / yes | none (only `workspace:admin`) | gated | manual launch-gate check |
+| Todoist | project-management | 2 | yes / yes | none — the server lists only `data:read_write`; the entry adds `data:delete` and leaves out `project:delete` | gated | manual launch-gate check, including two sessions held past the one-hour token expiry (refresh tokens rotate on every use) |
+
+Tier is provider *categorization* (see the tiers note above), never mint
+latency: tier 3 means the vendor gates clients by allowlist or waitlist, so
+`vendor_approval_pending` is true and the loader refuses `launch_gate_passed`
+for it; the entry exists so the nightly L0 probe watches the metadata and the
+banner allowlist stays registry-derived while the admission is pursued.
+
+### How an entry gets in, and what each rung buys
+
+1. **Industry baseline.** The candidate is listed by at least one of the two
+   connector directories, ChatGPT's or Claude's. Being listed by both, or
+   filling a category the registry has none of, is what orders the backlog,
+   not what admits an entry: a single-directory listing is a sufficient floor
+   because rungs 2–4 hold the entry launch-gated, so registering it changes
+   nothing a user sees until rung 5. The comparison lives in the research note
+   `research/connectors-industry-baseline.md` in the operator workspace, not in
+   this tree; this section records only the outcome. Of the roster above,
+   Zapier, Postman, Neon, Prisma and Square are single-directory listings; the
+   rest are listed by both.
+2. **Public remote MCP with OAuth discovery.** The vendor hosts the server and
+   publishes RFC 9728 protected-resource metadata naming an RFC 8414 issuer.
+   Without that the L0 probe has nothing to assert and the entry cannot exist.
+   A vendor that publishes the metadata but refuses dynamic client
+   registration (GitHub, Asana, Google Workspace, Slack, HubSpot, Box) clears
+   this rung as a **pre-registered** entry — see "Pre-registered OAuth clients"
+   below; a vendor with no fixed public endpoint at all (Microsoft 365,
+   Snowflake, Databricks) still fails it and would need a Kiro-built
+   connector, which is a different product decision.
+3. **L0 green in record mode, then strict mode.** `l0_probe --record` captures
+   DCR, PKCE and the issuer; a strict run must then pass with those values
+   committed. Issuers are compared as exact strings (RFC 8414 §2) with exactly
+   one equivalence, `l0_probe.same_issuer`: an issuer whose path is empty
+   equals the same issuer with path `/` (RFC 3986 §6.2.3), which is the
+   root-slash disagreement Google and Box publish between their PRM and AS
+   documents. A trailing slash after a **non-empty** path (`/tenant/` vs
+   `/tenant`) remains a mismatch by design and is pinned by tests — that is the
+   realm-substitution boundary the strict comparison exists for. Pre-registered
+   entries record the vendor's DCR value but are not held to it.
+4. **Banner allowlist.** The issuer's `authorization_endpoint` is added to
+   `security.exfil._OAUTH_AUTHORIZATION_ENDPOINTS` and the consent-URL corpus,
+   or the fail-closed banner blocks every connect.
+5. **Manual launch gate (L2).** A human walks Connect → consent → Connected →
+   Test → Disconnect on a pod and records the revoke surface; only then does
+   `launch_gate_passed` flip and the card ship.
+
+Rungs 1–4 are what this roster's gated entries have; rung 5 is what they wait
+on.
+
+## What a card shows inline, and what it hides behind the triangle
+
+A Connections card is one cell of a grid, so every line it renders is paid by
+every card that reaches the same state. The card therefore has exactly three
+kinds of content, and a new state or a new piece of copy lands in one of them:
+
+| Content | Where it renders | Examples |
+|---|---|---|
+| The state, in a word | the header badge (icon + label) | Not connected, Needs configuration, Connected |
+| A **pre-action caveat** — what the user should know before pressing the row's action, or what pressing it entails | the amber warning triangle (`PrerequisiteTip`) placed immediately before that action, in the same row: hover or focus previews the copy, click pins it, Escape or an outside press dismisses it | GitLab's Duo/group requirement and Atlassian's site requirement beside **Connect**; the one-time OAuth-app setup explanation beside **Configure OAuth app** |
+| A **verdict the user must act on**, or a form the state needs | an inline band, the only thing allowed to add a row | the not-verified / not-authorized verdict, the needs-attention diagnosis, the return-address relay while waiting for approval |
+
+The line between the last two is what the copy is *about*. A verdict reports a
+fact about the card's current state; a caveat annotates a button. Copy phrased
+as "X needs …", "Y opens …", "requires …", "before you …" is a caveat and goes
+in the triangle however important it feels — importance is why it sits next to
+the action the user is about to press, not a reason to grow the card. One
+triangle per action row; two caveats for one action merge into one bubble.
+
+This was decided by trying the alternative: the prerequisite warnings were
+built as always-visible bands while under review and were reverted to the
+triangle on the maintainer's ruling before they merged, so the bands never
+reached `main`. The needs-configuration state later shipped a band for its
+setup explanation and was moved behind the triangle the same way. A
+review-lane suggestion to "make the warning visible" is answered by this
+section and by `website/AUTOSDE.yaml`'s blocking `connection-card-caveat-tip`
+rule, which names the same three kinds; the frontend test that renders the
+needs-configuration card pins the explanation as absent from the document
+until the triangle is hovered.
+
+The triangle's copy comes from two places. A provider-side prerequisite is the
+registry's `prerequisite_copy` (English fallback) rendered through the
+slug-keyed `prerequisite_<slug>` catalog entries, kept in lockstep by a test;
+a state-level caveat, like the setup explanation, is an ordinary catalog key
+(`needs_configuration_help`). Both ride under the one `before_you_connect`
+heading with the `prerequisites_for_provider` accessible name — a new state
+reuses them rather than adding a second tooltip component or heading.
+
+## Pre-registered OAuth clients
+
+Most providers let kiro-cli register a public OAuth client at runtime (RFC 7591),
+so nothing about the client exists before the first Connect. A provider that
+refuses that carries an `auth` block in the registry:
+
+```json
+"auth": {"mode": "preregistered", "confidential": true, "redirect_host": "127.0.0.1",
+         "redirect_port": 48101, "registration_guide": "oauth-app-registration/github.md"}
+```
+
+`registry.py` validates the block (`_validate_auth`): the mode vocabulary is
+closed, a `dcr` block carries nothing else, a `preregistered` block names
+`confidential`, a unique `redirect_port` in 1024–49151, an optional
+`redirect_host` of `127.0.0.1` (default, RFC 8252 §7.3) or `localhost` (for a
+vendor whose HTTPS exemption names only that host — HubSpot refuses IP
+literals), and a runbook under `docs/guides/oauth-app-registration/`. The
+callback path is the constant `CALLBACK_PATH = "/callback"`, so
+`registry.redirect_uri(provider)` is the one string both the runbook prints and
+the runtime pins: `http://<host>:<port>/callback`. A shipped `redirect_host` /
+`redirect_port` is immutable: every operator who followed the runbook has
+registered that exact URI in a vendor console Kiro Crew cannot reach, so changing
+it silently breaks each of their apps until they re-register. Retire a port by
+adding a provider, never by renumbering one;
+`test_connections_registry_auth.py` pins the shipped values so a change fails
+loudly.
+
+**Where the client lives.** `connections/oauth_clients.py` resolves it with a
+fixed precedence — environment
+(`KIROCREW_CONNECTIONS_<SLUG>_CLIENT_ID` / `_CLIENT_SECRET`, the container and
+CI shape) over `config.json` (`connections.oauth_clients.<slug>.client_id`, the
+public half) and the vault (`CONNECTIONS_<SLUG>_CLIENT_SECRET`, the secret
+half), with the registry's own `client_id` as a last-resort default for the id
+only. `resolve_oauth_client` answers `None` when what is stored cannot attempt
+an authorization (no id, or a confidential client without a secret), and
+`oauth_client_view` is the dashboard shape, which by construction never carries
+a secret value.
+
+**How it reaches kiro-cli.** kiro-cli's remote-MCP `oauth` block accepts
+`clientId`, `clientSecret` (when both are set DCR is skipped and the secret is
+presented at the token endpoint) and `redirectUri` (pins the loopback host, port
+and path). `agent._apply_operator_oauth_client` writes the three at agent-spec
+emission for a server whose name is the provider slug **and** whose URL is the
+registry `mcp_url` (`provider_for_server` — name alone would land an operator's
+client on a hand-authored stranger); `warm_runtime.spec_plan._registry_server_entry` does the same
+for the premint path and answers `None` for an unconfigured provider so nothing
+warms against a vendor that will only say "unknown client". The mint spec copies
+the emitted entry verbatim, so the cold path inherits it.
+
+**What the user sees.** `get_visible_providers` shows a pre-registered entry
+regardless of `launch_gate_passed` (vendor approval still hides), because until
+a client exists the card is an instruction, not an offer: `/api/connections/status`
+marks the row `needsClientConfig` (only while no grant is held), and the card
+renders the sixth state `needs-configuration` — a lock badge, the Documentation
+link, and a **Configure OAuth app** route to **Settings → OAuth Apps** in place
+of Connect. What the setup involves (a guided settings page, nothing changes
+until saved, removable later, registers an app and enters its client ID and
+secret) is the row's pre-action caveat, so it sits behind the amber triangle
+beside that route, never as a band — see [What a card shows
+inline](#what-a-card-shows-inline-and-what-it-hides-behind-the-triangle). On
+the Settings tab one card per pre-registered provider carries the redirect URI
+to copy, the Client ID field, the Client secret field (write-only, vault-backed)
+and the runbook link. The routes behind it are
+`GET /api/connections/oauth-clients` (any dashboard user; no secret value) and
+owner-only `PUT` / `DELETE /api/connections/oauth-clients/{slug}`. The launch
+gate keeps governing the entry's quality claims: a configured GitHub still runs
+the normal first-connect (`not-verified`) flow, and `launch_gate_passed` flips
+only after the manual L2 walk with an operator-registered app.
+
+**Runbooks.** One per provider under `docs/guides/oauth-app-registration/`
+(index in its `README.md`): console, app type, scopes, the exact redirect URI,
+review or publishing requirements, and where the result goes. Registering the
+app is the operator's action; the tree only ships the instructions. Microsoft
+365 has a runbook and no entry — there is no fixed public endpoint to probe.
+
+## The shared control-plane seam (W01)
+
+`connections/control_plane/` is the single, shared, typed seam every provider
+stream (`W02`..`W14`) dispatches a connector operation through. It exists so the
+vocabulary a downstream manifest entry declares (`operation_kind`, `effect`,
+`service_id`, its auth mode) and the vocabulary a runtime dispatch switches on
+are ONE set of constants, defined once, instead of each stream re-deriving its
+own and drifting. It is pure types with zero IO: descriptors and envelopes, no
+client, no token, no network.
+
+Four typed pieces, in the `TypedDict` + module-level schema-version shape the
+rest of this subsystem uses (`l0_probe.ProbeResult`, `l1_smoke.SmokeResult`,
+`status.ConnectionStatus`):
+
+| Module | Carries |
+|---|---|
+| `operation.py` | `OperationDescriptor` — what an operation *is*: `operation_id`, `service_id`, `operation_kind`, `effect`, and `credential_modes`. THREE enums — `operation_kind` / `effect` / `service_id` — are copied VERBATIM from the closed sets in [connector-capability-manifest.md](connector-capability-manifest.md); that spec owns them, and this seam neither invents a value nor drops one. `credential_modes` is not a new axis: it IS the manifest's per-operation `auth_modes` array, named as the shared `CredentialMode` set. It is PLURAL — the *set of modes the operation permits* — because the manifest defines `auth_modes` as an array and a real operation (W02's GitHub `get_rate_limit`) supports OAuth + PAT + service-to-service. |
+| `context.py` | `OperationContext` — the per-call references: `binding_ref`, `tenant_ref`, `subject_ref`, `deadline`, plus `credential_mode` (singular). No field is a credential VALUE; `binding_ref`/`tenant_ref`/`subject_ref` are references, `deadline` is an absolute POSIX-seconds UTC cutoff, and `credential_mode` is the single SELECTED mode identifier for this call (a mode *type*, never a token), chosen from — and never outside — the descriptor's declared `credential_modes` set. |
+| `result.py` | `OperationResult` — the outcome envelope: `status` (`ok` / `partial`) and `next_cursor` (an opaque continuation token, or `None` when complete). `next_cursor` is deliberately opaque: the manifest declares each operation's own `pagination` contract, and the envelope only says "resume here, or you are done". |
+| `errors.py` | `OperationError` — the RUN-01 typed error taxonomy: a twelve-value closed set (`auth`, `scope`, `consent`, `not_found`, `forbidden`, `quota`, `throttle`, `conflict`, `input`, `temporary`, `partial`, `ambiguous`) copied verbatim from the manifest, plus `detail`. |
+
+**`detail` reuses the subsystem's redaction discipline, opening no new
+channel.** A typed error's `detail` can reflect provider-returned text, so it
+goes through the SAME redact-then-truncate discipline as
+`l1_smoke._redacted_detail`, capped at the same 200 characters. `redacted_detail`
+(and the `operation_error` constructor that calls it) delegate to
+`kiro_crew.security.redact_and_truncate`, which runs the site-wide credential /
+exfiltration-URL scanners over the whole string BEFORE the slice — truncating
+first would bisect a credential straddling the boundary and leak the prefix past
+the regex. There is no un-redacted path onto `detail`.
+
+### Two orthogonal axes, the same word in this repo, kept apart on purpose
+
+Two independent questions wear the word "mode" in this subsystem today, and this
+seam pins the distinction so a later leaf cannot quietly collapse them:
+
+- **Axis A — registration mode** answers *where the OAuth client came from*:
+  `dcr` (dynamic client registration) or `preregistered` (an app an operator
+  registered in the vendor console). It lives in `registry.AuthConfig` and is
+  read through `auth_mode()` / `is_preregistered()`. **W01 changes none of it.**
+- **Axis B — credential mode** answers *what credential this operation
+  authenticates its call with*: `oauth_user`, `fine_grained_pat`, or
+  `service_to_service`. This IS the manifest's per-operation `auth_modes` axis,
+  named as the shared `CredentialMode` set. The operation descriptor declares a
+  SET of them (`credential_modes`, plural, on `control_plane/operation.py`); the
+  single mode a given invocation uses lives on the per-call `OperationContext`
+  (`credential_mode`, singular).
+
+**The two combine freely and neither is derived from the other.** The manifest
+already states the general form of this rule — *"an account type never stands in
+for an auth mode"* — and registration mode standing in for credential mode is
+the same category error. A `preregistered` client (Axis A) can still
+authenticate a given operation as `oauth_user` OR `service_to_service` (Axis B);
+a `dcr` client says nothing about which credential a particular operation uses.
+Any code that inferred one axis from the other would reintroduce exactly the
+collapse the manifest's two-axis design exists to prevent, so a dispatch reads
+`credential_modes` off the operation descriptor directly and never computes it
+from a provider's registration mode.
+
+### Descriptor declares, policy narrows — one source of truth for the mode set
+
+`credential_modes` on the descriptor is the OUTER bound of which credential
+modes an operation permits, and it is the single source of truth for that set.
+A governance policy — for example W05/L05's `permit_operation` / `PermittedModes`
+— may **narrow** which of the declared modes are permitted in a given context,
+but MUST NOT permit a mode the descriptor did not declare: a mode absent from
+`credential_modes` is refused even if a registry or account would otherwise
+allow it. The per-call `OperationContext.credential_mode` is likewise chosen
+from within the declared set. This keeps "what modes exist for this operation"
+in exactly one place (the descriptor); everything downstream only subtracts.
+
+### RUN-01 replaces string-sniffing, but not in this slice
+
+RUN-01 (the twelve-value taxonomy above) is the typed replacement for
+classifying a failure by sniffing substrings out of a free-text message — the
+`l1_smoke._RECONSENT_TOKENS` / `_reconsent_error` matching of `"unauthorized"` /
+`"forbidden"` is the in-repo example of the anti-pattern it supersedes.
+**Reconnecting that classifier to RUN-01 is a separate later slice; W01 only
+fixes the taxonomy it will target and does not touch `l1_smoke`.**
+
+### The `vendors/` container anchor
+
+`connections/vendors/__init__.py` is a committed anchor for an otherwise-empty
+container this slice creates ONCE, for two reasons. First, **packaging**:
+`setup.cfg` builds with `packages = find:` (`find_packages`), which discovers
+only directories containing an `__init__.py` and drops every subpackage beneath
+a directory that lacks one — even a `vendors/<slug>/` that has its own
+`__init__.py`. So without this committed file, `vendors/` and all of it would be
+absent from the wheel/sdist and a non-editable install would ship no provider
+code (a build-artifact effect, not a source one — under an editable/source tree
+PEP 420 namespace packages let `vendors.<slug>` import regardless). Second,
+**race avoidance**: each provider stream (`W02`..`W14`) owns its own
+`vendors/<slug>/` subpackage, and a single owner minting the anchor here stops
+several streams landing in parallel from each trying to create `vendors/` and
+colliding. **W01 creates the anchor and nothing under it** — no `vendors/<slug>/`
+subdirectory is this slice's to make. The name is `vendors`, not `providers`,
+deliberately: `src/kiro_crew/providers/` already exists and means LLM providers,
+so a `connections/providers/` here would be one word for two different things in
+one package tree.

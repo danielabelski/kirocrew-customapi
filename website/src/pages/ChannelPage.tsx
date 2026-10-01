@@ -9,6 +9,7 @@ import ApprovalCard from '../components/ApprovalCard'
 import ErrorNotice from '../components/ErrorNotice'
 import { Btn, Input, Badge, EmptyState, PageHeader } from '../components/ui'
 import MarkdownRenderer from '../components/MarkdownRenderer'
+import MessageErrorBoundary from '../components/MessageErrorBoundary'
 import AgentSelector from '../components/AgentSelector'
 import { useAgents } from '../hooks/useAgents'
 import { useImeGuard } from '../hooks/useImeGuard'
@@ -43,6 +44,20 @@ interface ChannelMessage {
   threadId?: string
   replyTo?: string
   replyCount: number
+  /** Structured facts the backend posts beside an approval's prose (its
+   *  `ChannelMessage.meta`): the server's own verdict on which trust tiers it
+   *  can record. Absent on every other message and on approvals persisted
+   *  before the field existed, which keep the prose-parsing fallback. */
+  meta?: ApprovalMeta
+}
+
+/** Flat string map, mirroring chat's `perm_meta`: "1" is true, "" is false. */
+export interface ApprovalMeta {
+  tool_title?: string
+  tool_input?: string
+  command_grantable?: string
+  base_derivable?: string
+  base_command?: string
 }
 
 interface Channel {
@@ -71,6 +86,7 @@ const mapMsg = (m: any): ChannelMessage => ({
   timestamp: m.timestamp ? m.timestamp * 1000 : Date.now(),
   threadId: m.thread_id || m.threadId, replyTo: m.reply_to || m.replyTo,
   replyCount: m.reply_count || m.replyCount || 0,
+  meta: m.meta && typeof m.meta === 'object' ? m.meta : undefined,
 })
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const mapChannel = (c: any): Channel => ({
@@ -143,7 +159,45 @@ export function approvalToolTitle(content: string): string {
   return /^⚠️ Approval needed: \*\*([\s\S]*)\*\*\n```/.exec(content)?.[1] || ''
 }
 
-function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
+/** What the approval card renders and which trust tiers it offers, from the
+ *  message. With `meta` the answers are the SERVER's: it alone can refuse a
+ *  per-command tier, and it posted its verdict beside the prose, so the card
+ *  never offers a tier the endpoint would answer with `pattern_underivable`
+ *  (a compound `cat f | wc -l` has no base to trust; a non-shell tool has no
+ *  command). Without `meta` -- a message persisted before the field existed --
+ *  the prose is parsed as before, unchanged, so those cards render as they
+ *  did. Exported for the capture entries and the coverage tests. */
+export function approvalCardProps(msg: Pick<ChannelMessage, 'content' | 'fromRole' | 'meta'>): {
+  title: string; toolInput: string; hasCommand: boolean; baseCommand?: string; baseDerivable?: boolean
+} {
+  const meta = msg.meta
+  if (meta) {
+    return {
+      title: meta.tool_title || msg.fromRole,
+      toolInput: meta.tool_input ?? '',
+      hasCommand: meta.command_grantable === '1',
+      baseCommand: meta.base_command || undefined,
+      baseDerivable: meta.base_derivable === '1',
+    }
+  }
+  const title = approvalToolTitle(msg.content)
+  const toolInput = msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')
+  const hasCommand = title.startsWith('Running: ') && !/\[REDACTED/.test(toolInput)
+  return { title: title || msg.fromRole, toolInput, hasCommand }
+}
+
+/** Scope-accurate confirmations for the channel tiers: what a click just
+ *  granted, in the words of the tier the reader chose. */
+const CHANNEL_TRUSTED_LABEL_KEYS = {
+  trust: 'components.approvalCard.trusted_channel_all',
+  trust_command: 'components.approvalCard.trusted_channel_command',
+  trust_base: 'components.approvalCard.trusted_channel_base',
+} as const
+
+/** Exported for the capture entries only, alongside `approvalToolTitle`: an
+ *  approval's posted TEXT is rendered here, above the card, so a frame that
+ *  mounts the card alone cannot show what a channel reader actually reads. */
+export function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
   msg: ChannelMessage; agents: ChannelAgent[]
   onReply?: () => void; onOpenThread?: () => void; onApprove?: (action: string, pattern?: string) => Promise<unknown>
 }) {
@@ -168,22 +222,30 @@ function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
           )}
           <span className="text-[13px] text-muted ml-auto">{time}</span>
         </div>
-        <div className="text-sm text-text">{msg.msgType === 'approval' ? <span className="whitespace-pre-wrap">{msg.content}</span> : <MarkdownRenderer content={msg.content} />}</div>
+        {/* Per-message boundary, as the chat transcript has: a markdown render
+            crash (an unmodeled nesting spelling past the depth bound, an
+            unknown HTML element) degrades this one message instead of
+            escalating to the app-level ErrorBoundary and replacing the view. */}
+        <div className="text-sm text-text">{msg.msgType === 'approval' ? <span className="whitespace-pre-wrap">{msg.content}</span> : <MessageErrorBoundary rawContent={msg.content}><MarkdownRenderer content={msg.content} /></MessageErrorBoundary>}</div>
         {/* Approval card. The title is the tool name the backend embedded in
             the message — the TrustDropdown derives its trust_command /
             trust_base patterns from it, so the agent ROLE (fromRole) is only
             a fallback for legacy messages without a name. Per-command tiers
             are shell-only on channels (the endpoint refuses them for
             non-shell tools with pattern_underivable), so a non-shell card
-            offers just Approve / blanket Trust / Reject. */}
+            offers just Approve / blanket Trust / Reject. The channel tiers
+            grant agent-scoped, until-restart trust (blanket trust is
+            channel-wide and persisted), and their labels and confirmations
+            say so: the chat keys would understate or overstate the grant. */}
         {msg.msgType === 'approval' && onApprove && (
           <div className="mt-2">
-            {(() => {
-              const title = approvalToolTitle(msg.content)
-              const toolInput = msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')
-              const hasCommand = title.startsWith('Running: ') && !/\[REDACTED/.test(toolInput)
-              return <ApprovalCard title={title || msg.fromRole} hasCommand={hasCommand} toolInput={toolInput} showButtons={approvalMode === 'normal'} trustAllLabelKey="components.trustDropdown.trust_all_tools_channel" onApprove={onApprove} />
-            })()}
+            <ApprovalCard {...approvalCardProps(msg)} showButtons={approvalMode === 'normal'}
+              trustAllLabelKey="components.trustDropdown.trust_all_tools_channel"
+              trustCommandLabelKey="components.trustDropdown.trust_this_command_channel"
+              trustBaseLabelKey="components.trustDropdown.trust_all_base_channel"
+              trustedLabelKeys={CHANNEL_TRUSTED_LABEL_KEYS}
+              labelValues={{ role: msg.fromRole }}
+              onApprove={onApprove} />
           </div>
         )}
         {/* Thread badge + reply */}
@@ -454,7 +516,7 @@ function MentionInput({ agents, value, onChange, onSend }: {
       <textarea ref={ref} value={value} onChange={handleChange}
         rows={1}
         aria-label={i18nT('pages.channelPage.message_the_channel')}
-        className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-none flex-1 transition-colors focus-ring resize-none"
+        className="w-full bg-bg-elevated border border-border rounded-md px-3 py-2 text-text text-sm font-body outline-hidden flex-1 transition-colors focus-ring resize-none"
         placeholder={i18nT('pages.channelPage.message_the_channel_type_to_mention')}
         {...ime.bindComposition()}
         onKeyDown={e => {

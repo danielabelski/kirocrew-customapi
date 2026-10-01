@@ -143,6 +143,11 @@ def test_set_model_falls_back_to_default_when_unadvertised():
         return None
 
     client._send_request = _fake_send
+    # opencode takes the model over session/set_config_option (upstream's
+    # channel), which waits for the response frame.
+    client._wait_for_response = AsyncMock(return_value={})
+    client._acp_config_options = []
+    client._last_substitution_model = None
 
     asyncio.get_event_loop().run_until_complete(client.set_model("cmc/deepseek-v4-pro"))
     assert client._model == "deepseek-v4-flash:0731", client._model

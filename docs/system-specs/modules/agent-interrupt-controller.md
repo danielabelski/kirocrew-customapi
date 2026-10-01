@@ -28,21 +28,24 @@ delivered:
   kernel's bounds are deliberately not forwarded through `poll`: a probe already
   declares what it needs through `Probe.tuning`.
 
-The in-tree consumer is `PrWatchProbe`. It reads a pull request through `gh`,
-classifies pull-request state and checks, and hands its result to the kernel.
-The probe lives in the package rather than beside a driver because it outlives
-its drivers -- it is now driven by both the script cron adapter
-(`builtin_skills/kirocrew-dev/babysit/scripts/pr_watch.py:watch`, via `irq.run`)
-and the scheduler (via `irq.poll`), and a hyphenated skill directory is not
-importable, so a copy per driver would have meant two copies of one classifier.
-See `probes.gh_pr.PrWatchProbe.observe`.
+The in-tree consumer is `PrWatchProbe`. It FETCHES a pull request through `gh` and
+classifies nothing: it publishes the reading on itself and returns a tick carrying
+only what the kernel needs of its own -- an epoch, a pending count, and whether the
+subject was reachable. The driver (`irq.poll`, from `autonudge.py`) reads the
+published reading and the wake judge decides on it.
+
+So the kernel serves this consumer for two things a stateless reading cannot hold:
+the epoch, so dedupe memory resets on a new head, and the consecutive-failure
+backstop, which turns a run of unreadable ticks into one report that the watch is
+blind. See `probes.gh_pr.fetch` and `probes.gh_pr.PrWatchProbe.observe`.
 
 ## Authoring contract
 
 `Observation` carries a stable key, a severity, a delivery brief, and whether
 its identity belongs to the current epoch. `Tick` carries the current epoch,
 observations, pending work, fetch status, and a quiet-tick detail. The public
-surface is `irq.__all__`; `test_probe_tuning_overrides_a_bound` and
+**probe-authoring** surface is `irq.__all__`; the qualified `irq.poll` entry point
+is the in-process driver's internal seam. `test_probe_tuning_overrides_a_bound` and
 `test_probe_tuning_cannot_hand_the_kernel_a_fatal_bound` pin the exercised
 probe-tuning contract.
 
@@ -65,11 +68,11 @@ A probe implements:
   `irq.run`, `test_probe_tuning_raising_does_not_kill_the_tick`, and
   `test_the_wake_footer_is_emitted_once_not_once_per_observation`.
 
-`Severity.TERMINAL` ends the watch with `Done`. `Severity.NMI` reports
+`Severity.TERMINAL` ends the watch with `Done`. `Severity.IMMEDIATE` reports
 immediately but still participates in deduplication. `Severity.WAKE` enters
-the regular coalescing path. Terminal handling precedes NMI and coalescing in
-`irq.run`; `test_terminal_wins_over_an_open_window` and
-`test_nmi_bypasses_the_coalescing_window` pin the ordering.
+the regular coalescing path. Terminal handling precedes `IMMEDIATE` and coalescing
+in `irq.run`; `test_terminal_wins_over_an_open_window` and
+`test_immediate_bypasses_the_coalescing_window` pin the ordering.
 
 ## State identity and recovery
 
@@ -95,12 +98,12 @@ fire condition. See `irq.save_state`, `irq.run`,
 
 ## Dedupe and epochs
 
-`irq.run` stores epoch-scoped and epoch-independent keys in separate sentinel
+`irq.run` stores `REVISION` and `NEVER` keys in separate sentinel
 spaces. The same probe key in both spaces remains two signals; see
 `test_the_two_key_spaces_do_not_collide`.
 
-When a nonempty `Tick.epoch` changes, `irq.run` removes epoch-scoped alerts and
-open-window entries, then retains epoch-independent alerts and open-window
+When a nonempty `Tick.epoch` changes, `irq.run` removes `REVISION` alerts and
+open-window entries, then retains `NEVER` alerts and open-window
 entries. Check-derived observations must not survive a head change, or an old
 head can be reported as current. Conversation-derived observations must survive,
 or a head change replays already-reported discussion. Each carried entry keeps
@@ -109,7 +112,7 @@ the floor again. A fresh head observation is a separate entry with a fresh open
 time, so it still receives the full settling floor; on the transition tick it
 cannot ride on a carried entry that is already ready to fire.
 These invariants are pinned by
-`test_an_open_epoch_scoped_window_is_dropped_by_an_epoch_change`,
+`test_an_open_revision_window_is_dropped_by_an_epoch_change`,
 `test_a_sticky_key_survives_an_epoch_change`,
 `test_a_fresh_epoch_anomaly_still_gets_a_full_settling_floor`, and
 `test_a_carried_sticky_entry_keeps_its_served_floor_across_epoch_change`.
@@ -125,9 +128,10 @@ the only reporting value. See `irq.run`,
 
 ## Coalescing
 
-A non-NMI `WAKE` observation opens a persisted window, and each entry records its
+A `WAKE` observation that is not `IMMEDIATE` opens a persisted window, and each
+entry records its
 own open time. An entry triggers delivery when its own age has passed the
-convergence floor and `Tick.pending` is zero, or, for an epoch-independent entry,
+convergence floor and `Tick.pending` is zero, or, for a `NEVER` entry,
 when its own age has passed the floor alone. Separately, when the oldest entry's
 age passes the hard cap the whole window flushes; the hard cap is independent of
 the floor and remains window level. The floor prevents a newly changed subject
@@ -161,57 +165,57 @@ survivor. That is a bound rather than a reset: an entry is flushed no later than
 the cap measured from its own arrival. See
 `test_an_entry_left_by_a_partial_fire_still_reaches_the_cap`.
 
-While pending work remains after the floor, epoch-independent entries fire and
-epoch-scoped entries remain in the window. The remaining entries keep their own
+While pending work remains after the floor, `NEVER` entries fire and
+`REVISION` entries remain in the window. The remaining entries keep their own
 open times, so repeated discussion cannot keep postponing a check-derived
 observation. See
 `test_a_sticky_wake_fires_at_the_floor_while_checks_are_still_pending` and
-`test_the_sticky_half_fires_while_the_epoch_scoped_half_keeps_waiting`.
+`test_the_sticky_half_fires_while_the_revision_half_keeps_waiting`.
 
-`irq.run` prunes an epoch-scoped entry when the probe no longer observes it,
-which prevents a cleared check from appearing in a later wake. It retains an
-epoch-independent entry that the probe stops observing, because a conversation
+`irq.run` prunes a `REVISION` entry when the probe no longer observes it,
+which prevents a cleared check from appearing in a later wake. It retains a
+`NEVER` entry that the probe stops observing, because a conversation
 horizon means "not currently inspected," not "cleared." See
 `test_cleared_anomaly_is_pruned_from_an_open_window`,
 `test_an_open_sticky_wake_is_not_pruned_when_the_probe_stops_reporting_it`, and
-`test_an_open_epoch_scoped_wake_is_still_pruned_when_it_clears`.
+`test_an_open_revision_wake_is_still_pruned_when_it_clears`.
 
 A zero coalescing floor uses immediate `WAKE` delivery. The behavior is pinned
 by `test_coalesce_secs_zero_restores_fire_on_first_anomaly`.
 
-## GitHub pull-request probe
+## GitHub pull-request fetcher
 
-`PrWatchProbe.identity` validates the message's repository, pull-request
-identifier, inherited-failure list, and coalescing value before returning the
-watch identity. `PrWatchProbe.tuning` supplies the message-derived coalescing
-override. `watch` constructs the probe and calls `irq.run`.
+`PrWatchProbe.identity` validates the message's repository, pull request, and
+optional pinnable host before returning the watch identity. `PrWatchProbe.observe`
+calls `probes.gh_pr.fetch`, stores the result on `PrWatchProbe.observation`, and
+returns `Tick(observations=[])` -- the fetcher raises no wake, so nothing here is
+deduped or coalesced.
 
-`PrWatchProbe.observe`:
+`fetch` reads, in one bounded tick budget: the pull request's state, mergeability,
+merge state, review decision, draft flag and head; its check runs, paginated
+against the API's own `total_count`; its commit statuses, which are a separate
+sequence a required gate can be published in; and its comments and reviews WITH
+bodies, clipped per item and in total, inside a fetch horizon, skipping the bot's
+own comments.
 
-* returns terminal observations for merged and closed pull requests;
-* emits an NMI observation for conflicting or dirty pull requests;
-* collapses duplicate check rows, filters known inherited failures, and emits
-  `WAKE` observations for unexpected failures;
-* emits a review-ready observation only when checks are present, no checks are
-  pending, and no unexpected failures remain; and
-* emits epoch-independent observations for recent comments and submitted
-  reviews, without including their bodies in a wake brief.
+Every call goes through `_Transport`: `github_runner.run_gh` with the validated
+absolute path, the restricted environment, an SEL audit record and the pinned
+host; a per-call timeout under the tick budget; bounded retry with jittered
+exponential backoff; and rate limits read off the response headers so a call backs
+off on a nearly-spent window rather than being refused by it.
 
-`_collapse`, `_conversation`, and `observe` implement those classifications.
-The comment horizon has an import-time assertion that it expires before the
-controller's re-alert interval, so expired sticky dedupe state cannot replay an
-old comment. See `pr_watch.DEFAULT_COMMENT_HORIZON_SECS` and
-`PrWatchProbe._conversation`.
-
-`PrWatchProbe._fetch` returns `None` for an unavailable or malformed `gh`
-response. `PrWatchProbe.observe` converts that result to an unreadable tick,
-feeding the controller's error backstop rather than raising from the cron entry
-point. `pr_watch._run_gh` routes the command through `github_runner.run_gh`.
+One `status` per reading says how complete it is: `ok`, `partial`, or
+`unavailable`. A forge refusal becomes a status, never an exception; only
+`unavailable` reaches the kernel as `Tick(fetch_ok=False)` and feeds the error
+backstop. `PrObservation.as_facts` is the durable half and carries no prose;
+`PrObservation.bodies` is a separate call, and what it returns stays in the process
+that fetched it.
 
 ## Non-goals
 
-The controller runs a single tick; cron cadence, retries, and job registration
-belong to the cron service. The pull-request probe detects comment and review
-metadata, not their prose. The woken agent reads and judges discussion after a
-wake; `PrWatchProbe._conversation` deliberately keeps body text out of the
-probe's observations.
+The controller runs a single tick; cadence, retries and job registration belong to
+its driver. The pull-request fetcher makes no wake decision at all: it reports what
+it read, including comment and review bodies, and the wake judge decides against
+the loop's own criteria. The one deterministic mapping -- a merged or closed pull
+request ends the watch -- belongs to the auto-nudge core, not to this controller
+and not to the fetcher.

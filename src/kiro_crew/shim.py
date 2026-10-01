@@ -53,6 +53,40 @@ def _openai_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | 
     ]
 
 
+def _openai_tool_choice(choice: Any) -> Any:
+    """Anthropic ``tool_choice`` → OpenAI's. ``None`` leaves the backend default."""
+    if not isinstance(choice, dict):
+        return None
+    kind = choice.get("type")
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool" and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return None  # "auto" is the OpenAI default too
+
+
+# Anthropic error ``type`` for a backend HTTP status the shim passes through.
+# Request errors pass through so Claude Code does not pointlessly retry a 400
+# (e.g. context too long) and backs off properly on a 429. Everything else --
+# 5xx, and also 401/403, which concern the SHIM's backend key rather than the
+# client's credentials (passing them through makes Claude Code tell the user
+# to run /login) -- stays a 502 upstream failure.
+_PASSTHROUGH_ERROR_TYPES = {
+    400: "invalid_request_error",
+    404: "not_found_error",
+    413: "request_too_large",
+    429: "rate_limit_error",
+}
+
+
+def _error_status_and_type(backend_status: int) -> tuple[int, str]:
+    if backend_status in _PASSTHROUGH_ERROR_TYPES:
+        return backend_status, _PASSTHROUGH_ERROR_TYPES[backend_status]
+    return 502, "api_error"
+
+
 def _flatten_content(content: Any) -> tuple[str, list[dict[str, Any]], list[Any]]:
     """Anthropic message content → (text, image_parts, tool_results).
 
@@ -86,6 +120,9 @@ def _flatten_content(content: Any) -> tuple[str, list[dict[str, Any]], list[Any]
                 if isinstance(inner, list)
                 else str(inner or "")
             )
+            if block.get("is_error"):
+                # OpenAI tool messages have no error flag; keep the signal.
+                inner_text = f"[tool error] {inner_text}"
             tool_results.append(
                 {"tool_call_id": block.get("tool_use_id", ""), "content": inner_text}
             )
@@ -100,6 +137,13 @@ def anthropic_to_openai(body: dict[str, Any]) -> dict[str, Any]:
     }
     if body.get("temperature") is not None:
         out["temperature"] = body["temperature"]
+    if body.get("top_p") is not None:
+        out["top_p"] = body["top_p"]
+    if body.get("stop_sequences"):
+        out["stop"] = list(body["stop_sequences"])[:4]  # OpenAI caps stop at 4
+    tool_choice = _openai_tool_choice(body.get("tool_choice"))
+    if tool_choice is not None:
+        out["tool_choice"] = tool_choice
 
     messages: list[dict[str, Any]] = []
     system = body.get("system")
@@ -185,7 +229,7 @@ def openai_to_anthropic(payload: dict[str, Any], model: str) -> dict[str, Any]:
     usage = payload.get("usage", {}) or {}
     return {
         "id": payload.get("id", "msg_shim"),
-        "type": "response",
+        "type": "message",
         "role": "assistant",
         "model": model,
         "content": content or [{"type": "text", "text": ""}],
@@ -237,16 +281,17 @@ async def handle_messages(request: web.Request) -> web.StreamResponse:
                         if isinstance(data, dict)
                         else str(data)[:300]
                     )
+                    status, err_type = _error_status_and_type(resp.status)
                     return web.json_response(
                         {
                             "code": "backend_error",
                             "type": "error",
                             "error": {
-                                "type": "api_error",
+                                "type": err_type,
                                 "message": f"backend {resp.status}: {detail}",
                             },
                         },
-                        status=502,
+                        status=status,
                     )
                 return web.json_response(openai_to_anthropic(data, model))
             return await _stream_translation(resp, request, model)
@@ -288,8 +333,9 @@ async def _stream_translation(
             except Exception:
                 detail = f"status {resp.status}"
         err_msg = f"backend {resp.status}: {detail}"
+        status, err_type = _error_status_and_type(resp.status)
         out = web.StreamResponse(
-            status=502,
+            status=status,
             headers={
                 "content-type": "text/event-stream",
                 "cache-control": "no-cache",
@@ -297,7 +343,7 @@ async def _stream_translation(
             },
         )
         await out.prepare(request)
-        payload = {"type": "error", "error": {"type": "api_error", "message": err_msg}}
+        payload = {"type": "error", "error": {"type": err_type, "message": err_msg}}
         await out.write(f"event: error\ndata: {json.dumps(payload)}\n\n".encode())
         await out.write_eof()
         return out
@@ -446,7 +492,10 @@ async def _stream_translation(
         "_t": "message_delta", "type": "message_delta",
         "delta": {"stop_reason": STOP_REASON_MAP.get(finish_reason, "end_turn"),
                   "stop_sequence": None},
-        "usage": {"output_tokens": usage_out},
+        # input_tokens is unknown at message_start (the backend reports usage
+        # only in its final chunk), so it is delivered here; Claude Code's
+        # context accounting reads it from message_delta when present.
+        "usage": {"input_tokens": usage_in, "output_tokens": usage_out},
     }))
     await out.write(send({"_t": "message_stop", "type": "message_stop"}))
     await out.write_eof()

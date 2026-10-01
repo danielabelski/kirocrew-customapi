@@ -73,7 +73,7 @@ _REFRESH_RATE_MAX_CALLS = 60
 # map. A hard cap (``_REFRESH_RATE_MAX_BUCKETS``) then fails CLOSED: once the
 # map is full, previously-unseen source IPs are rate-limited outright rather
 # than admitted by evicting an existing bucket. We deliberately do NOT evict a
-# live bucket to make room — evicting the "least-recently-active" victim was
+# live bucket to make room — evicting the "least-recently-active" victim is
 # abusable (see ``_rate_limited``): a saturated attacker never appends a
 # timestamp on denied calls, so their bucket freezes at exhaustion time and
 # becomes the eviction target under an XFF/botnet pump, letting them drop their
@@ -157,9 +157,9 @@ def _rate_limited(client_ip: str, now: float | None = None) -> bool:
         if bucket is None:
             # New source IP. Enforce the hard cap by failing CLOSED: once the
             # map is full, reject previously-unseen IPs rather than evicting a
-            # live bucket to admit them. Eviction-to-admit was abusable — a
+            # live bucket to admit them. Eviction-to-admit is abusable — a
             # saturated attacker's bucket freezes at exhaustion (denied calls
-            # append no timestamp), so under an XFF/botnet pump it became the
+            # append no timestamp), so under an XFF/botnet pump it becomes the
             # "least-recently-active" eviction victim, letting the attacker
             # drop their own exhausted bucket and re-create a fresh full
             # allowance. Rejecting unseen IPs at the cap removes that reset
@@ -340,6 +340,17 @@ async def api_auth_me(request: web.Request) -> web.Response:
     The frontend scheduler reads ``session_exp`` to schedule the next
     refresh. ``refresh_exp`` is included so the UI can warn the user of
     pending re-auth (e.g., 'session expires in 2 days').
+
+    ``token_accepted`` reports whether the request's own ``?token=`` is the
+    credential that authenticated it. This endpoint is not owner-gated, so an
+    owner-denied session answers 200 here on its cookie alone and an invalid
+    query token is silently replaced by that cookie; a caller exchanging a
+    pasted token needs the difference, and 200 does not carry it.
+
+    ``owner_ok`` reports whether that caller also clears the owner gate. A token
+    minted before the owner was configured is perfectly valid, so it can be
+    accepted and still be denied everywhere the gate fronts; the two fields
+    answer different questions and a caller recovering a session needs both.
     """
     user_id = request.get("user", "")
     if not user_id:
@@ -347,19 +358,18 @@ async def api_auth_me(request: web.Request) -> web.Response:
 
     # Read the credential the MIDDLEWARE VALIDATED, published as
     # ``request["auth_token"]`` — the same contract ``_caller_bounds`` and the
-    # frame-ancestors reader follow. Re-extracting the cookie here was only ever
-    # correct because extraction order was guaranteed to match the middleware's;
-    # it does not hold when a valid ``?token=`` won (pre-existing) and, now that
-    # an invalid query token falls back to the cookie, the order is not fixed at
-    # all. Reading the wrong credential mis-reports ``session_exp``, which is
-    # what drives the frontend's proactive-refresh scheduler.
+    # frame-ancestors reader follow. Re-extracting the cookie here is correct only
+    # while extraction order matches the middleware's, and it does not: a valid
+    # ``?token=`` wins, and an invalid query token falls back to the cookie, so
+    # the order is not fixed at all. Reading the wrong credential mis-reports
+    # ``session_exp``, which is what drives the frontend's proactive-refresh
+    # scheduler.
     #
     # The re-extraction stays as a FALLBACK rather than being deleted. On the
     # first request of a link exchange the published credential is the link
     # token, whose nonce this very request added to the cookie denylist, so the
-    # numeric read yields nothing — exactly the case where the old path already
-    # reported 0.0. Falling back keeps this strictly better than before instead
-    # of trading one blind spot for another.
+    # numeric read yields nothing — the one case where the fallback also reports
+    # 0.0, so keeping it trades no blind spot for another.
     port = request.app.get("port", 7777)
     cookie_name = f"mc_token_{_cookie_port_from_host(request, port)}"
     published = request.get("auth_token", "")
@@ -386,11 +396,43 @@ async def api_auth_me(request: web.Request) -> web.Response:
         if valid:
             refresh_exp = exp
 
+    # Whether this caller clears the owner gate, from the predicate the
+    # owner-gated routes themselves use -- not a second copy of the rule. A
+    # pre-owner token is a VALID token (validity is signature, expiry and nonce;
+    # the owner decision happens later), so ``token_accepted`` alone says a
+    # pasted token authenticated while the owner gate keeps denying it. Imported
+    # inside the function because this module sits on the auth path and its
+    # owner is a 7900-line handler module; the name is the one
+    # ``aws_control`` and ``meetings`` already gate on.
+    owner_ok = False
+    try:
+        from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+        owner_ok = bool(is_owner_dashboard_request(request))
+    except Exception:  # pragma: no cover - defensive
+        # The predicate reads ``request.app["state"]``; an app without it cannot
+        # answer, and unknown must read as not-authorized so a caller waiting on
+        # this keeps its prompt rather than dropping one on no evidence.
+        owner_ok = False
+
     return web.json_response(
         {
             "user_id": user_id,
             "session_exp": session_exp,
             "refresh_exp": refresh_exp,
+            # Whether the ``?token=`` on THIS request is what authenticated it,
+            # published by the middleware from the same decision that mints a
+            # fresh session cookie. False when the caller sent no query token,
+            # and false when it sent an invalid one the middleware replaced with
+            # the session cookie -- the case the status code cannot express,
+            # because this endpoint is not owner-gated and an owner-denied
+            # session still answers 200 on its cookie. A bare boolean about a
+            # credential the caller itself supplied, so it discloses nothing.
+            "token_accepted": bool(request.get("auth_from_query_token", False)),
+            # Whether that caller also clears the owner gate. Neither field
+            # carries a token, a subject or an expiry -- both are one bit about
+            # the request the caller just made.
+            "owner_ok": owner_ok,
         }
     )
 
@@ -403,7 +445,7 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     Reuse outside the multi-tab grace window auto-revokes the chain.
 
     A chain opened by a daemon-verified tailnet peer may only be rotated FOR
-    THAT PEER (issue #2417). The binding is read from two independent
+    THAT PEER. The binding is read from two independent
     authorities -- the HMAC-signed ``peer_key`` claim on the presented token and
     the server-side record in ``refresh_chains.json`` -- and the request must
     satisfy every key either of them names. A chain with neither is unbound,
@@ -455,14 +497,14 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # An identity-bound chain may only be USED while a daemon-verified tailnet
     # peer can be established -- and while it matches the one that OPENED the
     # chain. Two shapes are bound: the persistent QR session, whose credential is
-    # bounded by identity rather than by this process's lifetime, and (since issue
-    # #2417) any ordinary Phase-3 session whose chain was opened by a verified
-    # peer. Placed here, ahead
+    # bounded by identity rather than by this process's lifetime, and any
+    # ordinary Phase-3 session whose chain was opened by a verified peer.
+    # Placed here, ahead
     # of BOTH the reuse branch and the mint, because every path below this line
     # hands the caller a live credential: the grace-replay branch re-serves the
     # cached pair and re-sets both cookies without minting anything, so a check
     # sited at the mint leaves a 60-second window in which a replayed token is
-    # honoured with no identity check at all. That window was the review finding.
+    # honoured with no identity check at all.
     #
     # Ordering it BEFORE reuse detection is deliberate, not incidental. Reuse
     # detection revokes the chain, so letting it run first would let any
@@ -481,11 +523,10 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     carried_require_peer = refresh_token_requires_peer(refresh_token)
     carried_peer_key = refresh_token_peer_key(refresh_token) if carried_require_peer else ""
     # Second authority: the server-side chain record in refresh_chains.json
-    # (issue #2417). The signed claim above cannot be forged, but it only binds a
-    # chain whose MINT path remembered to set it -- and this gap existed because
-    # one mint path did and every other one did not. A record the presented token
-    # cannot influence is what makes the next forgetful mint path fail closed
-    # rather than silently unbound.
+    # The signed claim above cannot be forged, but it only binds a chain whose
+    # MINT path remembered to set it. A record the presented token cannot
+    # influence is what makes a forgetful mint path fail closed rather than
+    # silently unbound.
     #
     # Absent means unbound, which is both "this chain had no verified peer" and
     # "this chain predates the record" -- the migration rule: an upgrade must not
@@ -567,7 +608,31 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         # Wrap in to_thread: revoke_chain does sync file I/O (mode=0o600
         # atomic-rename writes to refresh_chains.json) — must not block
         # the event loop.
-        await asyncio.to_thread(state.revoke_chain, chain_id, now + MAX_REFRESH_TTL_SECS)
+        revoked_durably = await asyncio.to_thread(
+            state.revoke_chain, chain_id, now + MAX_REFRESH_TTL_SECS
+        )
+        if not revoked_durably:
+            # The revocation is in memory and not on disk. Reporting the chain revoked here
+            # would be the one claim this endpoint must not make on a lost write: reuse
+            # detection is what turns a stolen refresh token into a dead chain, and a restart
+            # loads a store that never saw this record while the chain's current token is
+            # still valid. The presented token is refused either way -- the degraded mark makes
+            # every validation fail closed for the life of this process -- so the difference is
+            # only in what the caller is told, and an operator reading the audit trail must not
+            # see a revocation that did not happen.
+            _audit(user_id, "refresh_token_use", "reuse_revocation_not_persisted", chain_id)
+            resp = web.json_response(
+                {
+                    "error": "Refresh-token reuse was detected for this chain, but the "
+                    "revocation could not be stored, so it is not guaranteed to outlive a "
+                    "gateway restart. Repair the gateway's storage and restart, then treat "
+                    "every session on this chain as compromised.",
+                    "code": "refresh_state_unavailable",
+                },
+                status=503,
+            )
+            _clear_refresh_cookie(resp, request)
+            return resp
         _audit(user_id, "refresh_token_use", "reuse_detected", chain_id)
         resp = web.json_response({"error": "refresh_chain_revoked"}, status=401)
         _clear_refresh_cookie(resp, request)
@@ -609,8 +674,8 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     if require_peer:
         # Carried onto BOTH halves of the rotated pair. Dropping it on either one
         # would make the FIRST rotation silently downgrade an identity-bound
-        # session to an ordinary one — the same shape of defect as the review
-        # finding this check answers, one rotation later.
+        # session to an ordinary one — the same defect this check prevents,
+        # arriving one rotation later.
         _carried_claims["require_peer"] = "1"
     new_access_token = generate_token(
         user_id,
@@ -645,7 +710,7 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # Wrap mark_consumed in to_thread: it does sync file I/O
     # (atomic-rename write to ~/.kiro/crew/refresh_chains.json) — must
     # not block the event loop.
-    await asyncio.to_thread(
+    persisted = await asyncio.to_thread(
         state.mark_consumed,
         jti,
         chain_id=chain_id,
@@ -659,6 +724,36 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         # blank -- absent must stay distinguishable from bound-but-lost.
         peer_key=bound_peer_key,
     )
+
+    if not persisted:
+        # The consumption is in memory only. Publishing the pair here would retire this jti
+        # for the running process while leaving it spendable on disk, so the next start --
+        # which is what the store's own warning tells the operator to do -- would accept the
+        # token this request was supposed to burn, with the replacement pair already in the
+        # client's hands. Refusing costs the client one retry; publishing costs the guarantee
+        # that a rotated refresh token is single-use.
+        logger.error(
+            "auth_refresh: refusing to publish a rotated pair for chain %s because the "
+            "consumption did not persist; the in-memory record is rolled back, so the "
+            "presented token is not burned -- but the store is now degraded and its reader "
+            "fails closed, so every refresh is refused until the storage fault is fixed and "
+            "the gateway restarted.",
+            chain_id[:8],
+        )
+        # Every other outcome of this endpoint writes a row, including the reuse path's
+        # own unpersisted case. Without one here an owner reading the audit trail sees
+        # nothing at all for a refused rotation -- the one outcome whose cause is a
+        # storage fault they have to go and fix.
+        _audit(user_id, "refresh_token_use", "rotation_not_persisted", chain_id)
+        return web.json_response(
+            {
+                "error": "The refresh state could not be persisted, so this token was not "
+                "rotated. Sessions cannot be refreshed until the gateway's storage is "
+                "repaired; retrying will not clear it.",
+                "code": "refresh_state_unavailable",
+            },
+            status=503,
+        )
 
     if require_peer:
         # The signed claim, not a second whois result, is authoritative. The
@@ -711,18 +806,16 @@ async def _rebind_rotated_token_to_peer(
     node-scoped identity pin into an any-peer token. When the refresh request
     itself resolves a verified peer, the fresh token is pinned to that peer's
     key; when no peer resolves (non-tailnet setups or daemon down) the
-    token stays unbound, which is byte-for-byte the pre-identity behaviour.
+    token stays unbound.
     The middleware's early allowlist deny already covers this route (it runs
     before the bypass list), so a verified-but-unallowlisted peer never
     reaches this mint in the first place.
 
     ``boot_bound`` additionally preserves the ADDRESS pin when tailnet identity
-    trust is off. That case previously could not arise for the session type that
-    needs it most: a phone-access QR session was minted ``no_refresh``, so it
-    never rotated and the ``ip:`` pin the middleware set at the exchange held for
-    its whole life. Letting such a session rotate without this would drop the pin
-    on the first rotation, so a stolen rotated cookie would authenticate from any
-    reachable peer — a real regression, not a theoretical one.
+    trust is off. The session type that needs it most is a phone-access QR
+    session, whose ``ip:`` pin the middleware sets at the exchange: letting such
+    a session rotate without this drops the pin on the first rotation, so a
+    stolen rotated cookie authenticates from any reachable peer.
 
     Scoped to boot-bound sessions on purpose. Pinning EVERY rotation would change
     roaming behaviour for ordinary browser sessions, which today survive an
@@ -772,6 +865,7 @@ async def api_auth_logout(request: web.Request) -> web.Response:
 
     user_id = ""
     chain_id = ""
+    revocation_persisted = True
     if refresh_cookie:
         valid, user_id, _reason, chain_id, _jti, _exp = validate_refresh_token(refresh_cookie)
         if valid and chain_id:
@@ -780,14 +874,41 @@ async def api_auth_logout(request: web.Request) -> web.Response:
             # network truncation, attacker holds a copy already).
             # `revoke_chain` does sync file I/O — wrap in to_thread so it
             # doesn't block the event loop.
-            await asyncio.to_thread(
+            revocation_persisted = await asyncio.to_thread(
                 _get_state().revoke_chain,
                 chain_id,
                 time.time() + MAX_REFRESH_TTL_SECS,
             )
-            _audit(user_id, "refresh_token_logout", "ok", chain_id)
+            _audit(
+                user_id,
+                "refresh_token_logout",
+                "ok" if revocation_persisted else "not_persisted",
+                chain_id,
+            )
         else:
-            _audit(user_id or "", "refresh_token_logout", "invalid_refresh")
+            # A degraded store makes `validate_refresh_token` fail closed, and skipping the
+            # revocation on that arm revoked the chain neither on disk NOR in memory -- worse
+            # than before this change, where the in-memory revocation at least held for the
+            # life of the process. The endpoint then answered 200, and the next write to
+            # succeed cleared the degraded mark, after which the un-revoked cookie validated
+            # again for the rest of its TTL: exactly the replay this revocation exists to
+            # stop. The HMAC and every claim were verified BEFORE that early return, so the
+            # chain id here is authentic and revoking it cannot be driven by a forged token.
+            degraded = _get_state().degraded_reason()
+            if degraded and chain_id:
+                revocation_persisted = await asyncio.to_thread(
+                    _get_state().revoke_chain,
+                    chain_id,
+                    time.time() + MAX_REFRESH_TTL_SECS,
+                )
+                _audit(
+                    user_id or "",
+                    "refresh_token_logout",
+                    "ok" if revocation_persisted else "degraded_not_persisted",
+                    chain_id,
+                )
+            else:
+                _audit(user_id or "", "refresh_token_logout", "invalid_refresh")
     else:
         _audit("", "refresh_token_logout", "no_cookie")
 
@@ -806,7 +927,25 @@ async def api_auth_logout(request: web.Request) -> web.Response:
     # Always clear both cookies on the response, even when no refresh
     # cookie was present — the caller's intent is "log me out", and
     # leaving a stale access cookie behind would defeat that intent.
-    resp = web.json_response({"logged_out": True})
+    # The revocation record is a different matter: reporting success for one that never
+    # reached disk tells the caller its chain is dead when the next restart will accept it
+    # again, and the degraded mark this store sets gates the very writes that would
+    # re-persist it. The cookies are still cleared -- that part did happen -- and the body
+    # says what did not, so a client that discards the token anyway is not stranded while
+    # one that cares can see the chain is still live somewhere.
+    if revocation_persisted:
+        resp = web.json_response({"logged_out": True})
+    else:
+        resp = web.json_response(
+            {
+                "logged_out": False,
+                "error": "This session's cookies are cleared, but the revocation record "
+                "could not be stored, so the refresh token is not guaranteed dead after a "
+                "gateway restart. Repair the gateway's storage, then log out again.",
+                "code": "refresh_state_unavailable",
+            },
+            status=503,
+        )
     _clear_refresh_cookie(resp, request)
     # Mirror the access cookie name + path used in token_auth's middleware
     # so this clear actually overrides the existing cookie.

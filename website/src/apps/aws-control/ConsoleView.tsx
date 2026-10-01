@@ -12,12 +12,17 @@
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+// By path, not from the app-sdk barrel: that barrel is published to third-party
+// apps through the vendor stub, and a host-namespaced cache client is not part
+// of that contract.
+import { useAppQuery, useAppQueryKey } from '../../app-sdk/appQuery'
 import {
   ChevronDown, RefreshCw, Copy, Check, HardDrive, Star, KeyRound, ShieldCheck, Wallet, Receipt, Cloud,
 } from 'lucide-react'
 import { Btn, Badge, Card, CardTitle, StatCard, Skeleton } from '../../components/ui'
 import AwsConsentGate from '../../components/AwsConsentGate'
 import { i18nT } from '../../i18n/t'
+import { copyCode } from '../../utils/clipboard'
 import { CopyBtn, PaneHeader, AwsErrorNotice } from './shared'
 import { StorageMeter } from './DrivePage'
 import { fmtBytes, fmtCurrency, fmtDate, fmtNumber } from '../../i18n/format'
@@ -55,19 +60,18 @@ const RECONNECT_HINT_KEY: Record<ProfileKind, string> = {
 export function ReconnectAction({ profile, askAgent }: { profile: AwsProfile; askAgent: boolean }) {
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
-  const planQ = useQuery<ReconnectPlan>({
-    queryKey: ['aws-control', 'reconnect-plan', profile.name],
+  const planQ = useAppQuery<ReconnectPlan>(['reconnect-plan', profile.name], {
     queryFn: () => awsControlApi.reconnectPlan(profile.name),
     enabled: open,
   })
 
   const copy = async () => {
     if (!planQ.data) return
-    try {
-      await navigator.clipboard.writeText(planQ.data.command)
+    const ok = await copyCode(planQ.data.command)
+    if (ok) {
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
-    } catch { /* clipboard unavailable — the command is still visible to copy by hand */ }
+    }
   }
 
   return (
@@ -198,16 +202,16 @@ export function ConnectionsSection({ account, askAgent }: { account: AwsAccount;
 
 export function SetupCard({ account, region }: { account: string; region: string }) {
   const qc = useQueryClient()
+  const appKey = useAppQueryKey()
   const [showPolicy, setShowPolicy] = useState(false)
   const previewMut = useMutation({
     mutationFn: () => awsControlApi.driveBootstrapPreview(account),
   })
   const confirmMut = useMutation({
     mutationFn: () => awsControlApi.driveBootstrapConfirm(account),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['aws-control', 'drive', account] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: appKey(['drive', account]) }),
   })
-  const policyQ = useQuery({
-    queryKey: ['aws-control', 'iam-policy'],
+  const policyQ = useAppQuery(['iam-policy'], {
     queryFn: () => awsControlApi.iamPolicy(),
     enabled: showPolicy,
   })
@@ -317,13 +321,15 @@ export function SetupCard({ account, region }: { account: string; region: string
 export default function UsagePane({ account }: { account: AwsAccount }) {
   const id = account.account
   const qcTop = useQueryClient()
+  // Host-authored prefix for this app's namespace, for the cache APIs that take a
+  // key rather than being a query hook. Same resolver `useAppQuery` uses, so the
+  // two cannot drift.
+  const appKey = useAppQueryKey()
 
-  const driveQ = useQuery({
-    queryKey: ['aws-control', 'drive', id],
+  const driveQ = useAppQuery(['drive', id], {
     queryFn: () => awsControlApi.drive(id),
   })
-  const costsQ = useQuery({
-    queryKey: ['aws-control', 'costs', id],
+  const costsQ = useAppQuery(['costs', id], {
     queryFn: () => awsControlApi.costs(id),
     // A dead bill read (CE not enabled, throttled) should settle to the
     // quiet em-dash in seconds, not skeleton through three backoffs.
@@ -376,9 +382,14 @@ export default function UsagePane({ account }: { account: AwsAccount }) {
   // Both surfaces whose content a grant decides. The ask reads a cached refusal
   // and the meter reads a cached listing, so a grant change has to reach them
   // or the pane keeps rendering the previous answer.
+  //
+  // Both keys come out of the same resolver the queries above are keyed by, so
+  // a grant refreshes exactly what it changed. That agreement is structural
+  // here rather than a rule two call sites have to remember: there is one place
+  // the prefix is written, and it is not this file.
   const refetchGated = () => {
-    qcTop.invalidateQueries({ queryKey: ['aws-control', 'drive', id] })
-    qcTop.invalidateQueries({ queryKey: ['aws-control', 'costs', id] })
+    qcTop.invalidateQueries({ queryKey: appKey(['drive', id]) })
+    qcTop.invalidateQueries({ queryKey: appKey(['costs', id]) })
   }
 
   // The three figures this pane states. Each is `undefined` while its read is
