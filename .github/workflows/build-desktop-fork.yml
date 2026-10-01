@@ -20,6 +20,7 @@ name: Build Desktop (fork, all platforms)
 # build still succeeds. The artifact is for the fork's GitHub Releases, not
 # the upstream notarized feed.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
   workflow_dispatch:
     inputs:
@@ -32,8 +33,6 @@ on:
   # Also rebuild when a release is published, so the desktop app always lands
   # on GitHub Releases alongside the wheel/CLI packages. Matches the fork's
   # tag convention (v<ver>-customapi.<N>).
-  release:
-    types: [published]
 
 permissions:
   contents: read

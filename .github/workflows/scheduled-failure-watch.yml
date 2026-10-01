@@ -71,22 +71,9 @@ name: Scheduled Failure Watch
 # actor for the AWS webhook allowlist to check, so it cannot route to the
 # CodeBuild fleet -- the same reason every `schedule:` job here stays hosted.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  workflow_run:
-    workflows:
-      - "CI Runner Watchdog"
-      - "Connections L0 Static Metadata Probe"
-      - "Connections L1 Authorized-Grant Smoke"
-      - "Crew Image Build"
-      - "Deferred Findings Audit"
-      - "Fork PR Label"
-      - "Memory Benchmark (nightly)"
-      - "Nightly Build"
-      - "OTA Update Test (macOS)"
-      - "PR Merge-Conflict Label"
-      - "PR Readiness Self-Heal Sweep"
-      - "Ship Report"
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   issues: write

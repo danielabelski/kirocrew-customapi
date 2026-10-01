@@ -32,15 +32,9 @@ name: Security Scope Review
 # the model name that gap in an UNADJUDICATED section and forbids reporting PASS
 # over an empty adjudicated set.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    # No `paths:` filter on the trigger, deliberately. A path filter applies to
-    # EVERY activity type, so a `labeled` event on a pull request outside the
-    # security surface is dropped before any job can read the label -- the escape
-    # below would parse but never fire. The surface list therefore lives in the
-    # "Resolve review scope" step, which is the only place both inputs (the touched
-    # paths and the label) are readable at once.
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
 
 # Declared PER JOB below, never workflow-wide. The adjudication stage runs the pull
 # request's OWN classifier code, and a workflow-level `id-token: write` would hand that

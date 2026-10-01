@@ -50,11 +50,8 @@ name: Add Contributor
 # scanning everything is cheap in effect: only genuinely-new contributors ever
 # change the file.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    # Daily: credit the previous day's merged-PR authors and the reporters of the
-    # issues those PRs closed.
-    - cron: "37 6 * * *"
   workflow_dispatch: {}
 
 permissions:

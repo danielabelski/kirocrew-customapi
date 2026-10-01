@@ -100,15 +100,8 @@ name: PR Readiness Self-Heal Sweep
 #      place on every push, so the dispatch would be spent per bot edit, per PR,
 #      repo-wide. Deleting the record with no replacement leaves nothing
 #      observable and waits for a push or a manual dispatch.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    # Every 5 minutes, which is the shortest cadence GitHub schedules. This is
-    # the verdict's delivery latency: a lane that completes waits at most one
-    # tick plus the publish lag below before its recompute is dispatched. The
-    # cost is bounded by the heads that CHANGED, not by the open set -- the
-    # GraphQL scan is a handful of requests on its own pool, and a recompute is
-    # dispatched only where a monitored check completed after the verdict.
-    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:

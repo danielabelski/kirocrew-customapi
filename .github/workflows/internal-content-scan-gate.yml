@@ -26,12 +26,9 @@ name: Internal Content Scan Gate
 # same pattern the `fork-*-review.yml` lanes use. Fork PRs are therefore gated
 # too; `pr-readiness.yml` reads whichever of the two paths produced the verdict.
 # See docs/system-specs/oss-fork-boundaries.md.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  merge_group:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   scan:

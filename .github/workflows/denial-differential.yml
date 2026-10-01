@@ -60,17 +60,9 @@ name: Denial Differential
 # Honest red, no continue-on-error: a failing leg shows as failing, and branch
 # protection decides whether that blocks a merge.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    paths:
-      - "src/kiro_crew/security/**"
-      - "src/kiro_crew/deny_guidance.py"
-      - "src/kiro_crew/platform/security_authority.py"
-      - "src/kiro_crew/hooks.py"
-      - "src/kiro_crew/builtin_skills/security-conductor/rules-of-engagement.json"
-      - "scripts/deny_diff.py"
-      - "src/kiro_crew/builtin_skills/security-conductor/golden-paths.json"
-      - ".github/workflows/denial-differential.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read

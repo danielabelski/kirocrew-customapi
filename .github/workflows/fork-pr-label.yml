@@ -9,15 +9,8 @@ name: Fork PR Label
 # executes PR code -- it only reads the PR's fork flag and adds a label. Fork
 # status is immutable for a given PR, so the label is only ever ADDED, never
 # removed.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request_target:
-    # Runs in the trusted base context (write token) even for fork PRs, which a
-    # fork `pull_request` run could not do. No fork code is checked out.
-    types: [opened, reopened]
-  schedule:
-    # Backstop sweep: labels any pre-existing open fork PR and catches a PR the
-    # event path missed (e.g. opened while this workflow was briefly failing).
-    - cron: "23 * * * *"
   workflow_dispatch: {}
 
 permissions:

@@ -16,9 +16,9 @@ name: Dependency License Gate
 # never ride in on a stale override. Re-apply the label to re-approve after a
 # push; removing it (`unlabeled`) likewise re-runs the gate.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_dispatch:
 
 # Read-only for the graph; PR-write lets the action post its failure summary
 # on same-repo PRs. No id-token / contents:write — this job runs no untrusted

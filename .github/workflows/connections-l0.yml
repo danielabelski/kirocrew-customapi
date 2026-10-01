@@ -63,9 +63,8 @@ name: Connections L0 Static Metadata Probe
 #   failed. A genuine first run reports null instead. If artifact_missing repeats,
 #   the artifact plumbing is broken, not the providers.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    - cron: "20 7 * * *" # 07:20 UTC, clear of the 06:00 nightly build
   workflow_dispatch: {}
 
 permissions:

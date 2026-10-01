@@ -12,9 +12,8 @@
 # themselves, where the assignee is already subscribed.
 name: Deferred Findings Audit
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    - cron: "0 16 * * 1" # Mondays 16:00 UTC
   workflow_dispatch: {}
 
 permissions:

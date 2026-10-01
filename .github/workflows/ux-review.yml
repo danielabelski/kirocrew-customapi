@@ -47,9 +47,9 @@ name: UX Review
 # committed screenshots). Backend-only PRs stay fast and the check
 # completes green so pr-readiness.yml never wedges on it.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

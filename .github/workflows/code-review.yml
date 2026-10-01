@@ -1,8 +1,8 @@
 name: Code Review
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
 
 permissions:
   contents: read

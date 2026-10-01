@@ -7,16 +7,8 @@ name: Python Client Tests
 # run. Path-scoped: a change that touches neither the package nor this file
 # cannot change its result.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    paths:
-      - "packages/kirocrew-client-py/**"
-      - ".github/workflows/client-py.yml"
-  push:
-    branches: [main]
-    paths:
-      - "packages/kirocrew-client-py/**"
-      - ".github/workflows/client-py.yml"
   workflow_dispatch: {}
 
 permissions:

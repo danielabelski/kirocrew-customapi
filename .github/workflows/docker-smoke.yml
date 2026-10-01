@@ -18,20 +18,8 @@ name: Docker Smoke Test
 # image CONTRACT. Paths-filtered to the container surface so it costs
 # nothing on unrelated PRs.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    paths:
-      - "docker/**"
-      - ".dockerignore"
-      - ".github/workflows/docker-smoke.yml"
-      - ".github/workflows/publish-docker.yml"
-      # The container contract spans three source files: the bind override
-      # (origin.py), the probe Host-barrier exemption in both server chains
-      # (server.py), and the liveness payload the HEALTHCHECK consumes
-      # (handlers/core.py). A regression in ANY of them must fire this gate.
-      - "src/kiro_crew/dashboard/origin.py"
-      - "src/kiro_crew/dashboard/server.py"
-      - "src/kiro_crew/dashboard/handlers/core.py"
   workflow_dispatch:
 
 permissions:

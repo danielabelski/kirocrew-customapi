@@ -29,15 +29,9 @@ name: Fork Internal Content Scan
 # FAILURE, never `neutral`: "the scan did not reach a verdict" must never read as
 # "the scan found nothing", which is the fail-open this whole gate replaced.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  # Fast Gate, not CI: this lane may not start until a trusted workflow has
-  # vouched for the head commit, and Fast Gate carries the cheap blocking gates
-  # and finishes in about a minute. The trust boundary does not depend on it --
-  # the steps below never materialize fork code -- so waiting for the full CI
-  # matrix would only delay the verdict.
-  workflow_run:
-    workflows: ["Fast Gate"]
-    types: [completed]
+  workflow_dispatch:
 
 permissions:
   actions: read

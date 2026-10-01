@@ -38,6 +38,7 @@ name: GUI User Test
 # retried once. The per-token prices passed to the harness are Opus list prices
 # so the budget gate measures real dollars, not Sonnet-priced ones.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
   workflow_dispatch:
     inputs:
@@ -58,8 +59,6 @@ on:
         description: "Stop the run once estimated spend reaches this many USD"
         type: string
         default: "60"
-  schedule:
-    - cron: "20 9 * * *" # 09:20 UTC, clear of the 06:00 nightly build and the 08:xx benchmarks
 
 permissions:
   contents: read

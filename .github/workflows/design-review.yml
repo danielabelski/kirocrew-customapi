@@ -11,9 +11,9 @@ name: Design Review
 # as claude-review.yml: OIDC → Amazon Bedrock; Fable 5 runs through
 # anthropics/claude-code-action with use_bedrock.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  workflow_dispatch:
 
 permissions:
   contents: read

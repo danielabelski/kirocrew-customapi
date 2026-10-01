@@ -24,18 +24,8 @@ name: Publish Installer
 # published, so `--channel insider` died on an opaque CDN 403 (#978). The
 # obligation this creates is real and belongs in review: the installer must
 # stay backward-compatible with every live channel.
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'cli.sh'
-      - '.github/workflows/publish-installer.yml'
-  # Manual re-publish. Restricted to main by the ref guard in the first step:
-  # the Actions UI lets a maintainer pick any ref, and `environment: prod` does
-  # not constrain that, so the guard is what keeps this main-only. Needed
-  # because the path filter above only fires when cli.sh itself changes -- a
-  # republish after an infrastructure fix (e.g. the bucket grant landing) would
-  # otherwise require a no-op commit to the installer.
   workflow_dispatch: {}
 
 # Never let two publishes race the same key. cancel-in-progress stays FALSE:

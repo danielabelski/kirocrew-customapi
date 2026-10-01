@@ -268,11 +268,8 @@ name: CI Runner Watchdog
 # This job runs on `ubuntu-latest` and must never be routed to CodeBuild: a
 # watchdog for the CodeBuild path cannot depend on the CodeBuild path.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    # Every 10 minutes. The orphan threshold is 15 minutes, so a stuck job is
-    # healed within roughly 15-25 minutes of being orphaned.
-    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:

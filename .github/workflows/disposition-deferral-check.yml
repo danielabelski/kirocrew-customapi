@@ -20,9 +20,9 @@
 # and replies.
 name: Disposition Deferral Check
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  issue_comment:
-    types: [created]
+  workflow_dispatch:
 
 permissions:
   issues: write

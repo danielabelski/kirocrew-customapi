@@ -29,23 +29,9 @@ name: macOS Tests (on demand)
 # hand-maintained subset here would be a second copy of those steps that could
 # drift from the nightly's without any test noticing.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request:
-    branches: [main]
-    # `labeled` is on the list because the `decide` job is cheap enough to afford
-    # it: the label is meant to act the moment it is applied, and re-running a
-    # ~1-minute Linux job on every bot label costs nothing. ci.yml cannot make
-    # the same choice (its comment on `ci-full-run` says why: every label would
-    # re-run the whole matrix), which is why its two label switches take effect
-    # only on the next push.
-    #
-    # There is deliberately NO `paths:` filter here. A `paths:` filter applies to
-    # EVERY event type, so it would silently discard the `labeled` event on any
-    # pull request that does not touch a darwin-sensitive file -- and a PR that
-    # touches a shared helper the path list cannot foresee is precisely the one
-    # someone reaches for the label on. The path test lives in `decide` instead,
-    # where it is one of three switches rather than a gate in front of them.
-    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
 
 permissions:
   contents: read

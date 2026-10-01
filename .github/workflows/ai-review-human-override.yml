@@ -10,9 +10,9 @@ name: AI Review Human Override
 # bot-authored decision that reviewer workflows can trust, then re-runs the
 # affected line reviewer.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  issue_comment:
-    types: [created, edited]
+  workflow_dispatch:
 
 # Re-run completed Fable / GPT workflows and record the trusted decision.
 # PR-write is required because the trusted

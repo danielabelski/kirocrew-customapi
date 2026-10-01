@@ -1,8 +1,7 @@
 name: Nightly Build
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  schedule:
-    - cron: "0 6 * * *" # 06:00 UTC = 11pm PDT
   workflow_dispatch: {} # manual trigger for testing
 
 # All build/sign/notarize/publish logic lives in reusable workflows shared

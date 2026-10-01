@@ -41,19 +41,9 @@ name: Fork PR Description
 # the change is the AI reviewers' job; this gate only catches the description
 # that was replaced wholesale or never written.
 
+# Automatic triggers disabled on this fork (manual build only); see build-desktop-fork.yml.
 on:
-  pull_request_target:
-    types:
-      # `edited` is the one the cron structurally cannot see: it fires when the
-      # author fixes the description WITHOUT pushing, which is exactly the
-      # remedy this check asks for. `synchronize` re-publishes against the new
-      # head SHA, since a check-run belongs to one commit.
-      - opened
-      - reopened
-      - edited
-      - ready_for_review
-      - converted_to_draft
-      - synchronize
+  workflow_dispatch:
 
 permissions:
   checks: write
